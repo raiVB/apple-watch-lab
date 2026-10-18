@@ -111,6 +111,65 @@ def health():
 
 
 @app.get("/stats")
+
+@app.get("/api/records")
+def get_records(
+    request: Request,
+    page: int = 1,
+    limit: int = 100,
+    metric: str = "",
+    start: str = "",
+    end: str = "",
+):
+    check_token(request)
+
+    page = max(1, page)
+    limit = min(max(1, limit), 500)
+
+    query = {}
+    if metric:
+        query["metric"] = metric
+    if start:
+        query["date"] = {"$gte": start}
+    if end:
+        query.setdefault("date", {})["$lte"] = end
+
+    total = db.records.count_documents(query)
+    skip = (page - 1) * limit
+
+    rows = list(
+        db.records.find(query, {"_id": 0})
+        .sort([("timestamp", -1), ("metric", 1)])
+        .skip(skip)
+        .limit(limit)
+    )
+
+    # Summarize the time gaps for each metric in the returned page.
+    previous = {}
+    for row in reversed(rows):
+        metric_name = row.get("metric", "Unknown")
+        ts = row.get("timestamp", "")
+        if metric_name in previous:
+            row["gap_minutes"] = round(
+                (datetime.strptime(previous[metric_name], "%Y-%m-%d %H:%M:%S")
+                 - datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                ).total_seconds() / 60, 1
+            )
+        else:
+            row["gap_minutes"] = None
+        previous[metric_name] = ts
+
+    metrics = db.records.distinct("metric")
+    return {
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "pages": (total + limit - 1) // limit,
+        "metrics": sorted(metrics),
+        "rows": rows,
+        "data_type": "stored_5_minute_bins",
+    }
+
 def stats(request: Request):
     check_token(request)
     db_stats = db.command("dbstats")
