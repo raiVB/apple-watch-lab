@@ -1481,13 +1481,20 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
     }
 
 # ==============================================================================
-# BIO LAB DASHBOARD BUILDER (Oura / Whoop-style redesign with Hypnogram)
+# BIO LAB DASHBOARD BUILDER (Hypnogram & 1970-Axis Fix)
 # Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
 # ==============================================================================
 
 def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle):
     print("[5/6] Building Bio Lab dashboard (Home + Stress + Energy + Sleep)...")
     import json
+
+    # --- 0. DATA PURIFIER ----------------------------------------------------
+    # Filter out fake aggregated "summary" blocks injected by Apple Health.
+    # Real chronological intervals have epoch spans that match their stated duration.
+    if not df_sleep.empty:
+        df_sleep['epoch_dur_hrs'] = (df_sleep['end_epoch'] - df_sleep['start_epoch']) * 300 / 3600.0
+        df_sleep = df_sleep[abs(df_sleep['hours'] - df_sleep['epoch_dur_hrs']) < 0.5].copy()
 
     # --- 1. SLEEP TIMELINE + STAGE BAR ---------------------------------------
     def stage_style(stage):
@@ -1501,10 +1508,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     
     if not df_sleep.empty:
         latest_sleep_date = df_sleep['date'].max()
-        # Sort chronologically by start epoch
         recent_sleep = df_sleep[df_sleep['date'] == latest_sleep_date].sort_values("start_epoch")
         totals = {}
-        
         for _, r in recent_sleep.iterrows():
             st_str = hour_to_clock_str(r["onset_hr"])
             en_str = hour_to_clock_str(r["wake_hr"])
@@ -1512,12 +1517,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
             col, desc = stage_style(r['stage'])
             totals[r['stage']] = totals.get(r['stage'], 0) + r['hours']
             
-            # Save blocks for the JS Hypnogram chart
             stage_blocks.append({
-                "stage": r["stage"],
-                "start": r["onset_hr"],
-                "end": r["wake_hr"],
-                "dur": mins
+                "stage": r["stage"], "start": r["onset_hr"], 
+                "end": r["wake_hr"], "dur": mins
             })
 
             sleep_log_html += f"""
@@ -1527,14 +1529,12 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
               <div class="d"><b>{r['stage']}</b><span class="mins">{mins} min</span><p>{desc}</p></div>
             </div>"""
             
-        total_h = sum(r['hours'] for _, r in recent_sleep.iterrows()) or 1
-        
-        # Build chronological visual progress bar instead of grouped totals
-        seg = "".join(f"<i style='width:{r['hours'] / total_h * 100:.2f}%;--c:{stage_style(r['stage'])[0]}' title='{r['stage']} ({int(round(r['hours']*60))} min)'></i>" for _, r in recent_sleep.iterrows())
+        total_h = sum(totals.values()) or 1
+        seg = "".join(f"<i style='width:{h / total_h * 100:.1f}%;--c:{stage_style(s)[0]}' title='{s}'></i>" for s, h in totals.items())
         leg = "".join(f"<span><span class='dot' style='--c:{stage_style(s)[0]}'></span>{s} <b>{int(round(h * 60))} min</b></span>" for s, h in totals.items())
         stage_bar_html = f"<div class='stagebar'>{seg}</div><div class='legend'>{leg}</div>"
     else:
-        sleep_log_html = "<div class='empty'>No sleep stages recorded for last night. Wear your watch to bed to see them here.</div>"
+        sleep_log_html = "<div class='empty'>No chronological stages recorded last night. Ensure Sleep Focus is active.</div>"
 
     # --- 2. DATA TABLE + STRESS EPISODES -------------------------------------
     table_html = ""
@@ -1559,7 +1559,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
           <div class="hyp">{ep['hypothesis']}</div>
         </div>"""
     if not ep_rows_html:
-        ep_rows_html = "<div class='empty good'>No unusual stress episodes. Your heart rate only rose when you were moving.</div>"
+        ep_rows_html = "<div class='empty good'>No unusual stress episodes. Your heart rate only rose when moving.</div>"
 
     # --- 3. JSON PAYLOAD FOR PLOTLY ------------------------------------------
     all_dates = sorted(df_raw["date"].unique()) if not df_raw.empty else []
@@ -1571,6 +1571,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     quad_hrv, quad_hr, quad_labels, quad_colors = [], [], [], []
     mean_hrv = float(hrv_df["value"].mean()) if not hrv_df.empty else 60.0
     mean_hr = float(hr_df["value"].mean()) if not hr_df.empty else 72.0
+    
     for _, row in hrv_df.iterrows():
         h_val = round(float(row["value"]), 1)
         paired_hr = round(float(hr_df[(hr_df["date"] == row["date"]) & ((hr_df["hour"] - row["hour"]).abs() <= 1.5)]["value"].mean()), 1) if not hr_df.empty else round(mean_hr, 1)
@@ -1812,12 +1813,10 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     <section id="tab-sleep" class="tab">
       <header class="ph"><h1>Sleep lab</h1><p>Precise mapping of your sleep architecture and recovery.</p></header>
       
-      <!-- New Hypnogram Row -->
+      <!-- Hypnogram Row -->
       <div class="row">
         <div class="panel">
-          <div class="pt">
-            <div><h3>Hypnogram (Sleep Cycle Timeline)</h3><p>The exact chronological flow of your sleep stages throughout the night.</p></div>
-          </div>
+          <div class="pt"><div><h3>Hypnogram (Sleep Cycle Timeline)</h3><p>The exact chronological flow of your sleep stages throughout the night.</p></div></div>
           <div id="c_hypno" class="chart" style="height:280px;"></div>
         </div>
       </div>
@@ -1843,6 +1842,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   const CIRC = 326.73;
   const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
   
+  // FIX 1: Deep clone to stop axis settings bleeding across charts
   const getBase = () => JSON.parse(JSON.stringify({{
     paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
     font:{{ color:C.dim, family:'Manrope, -apple-system, sans-serif', size:12 }},
@@ -1863,10 +1863,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   
   function chip(id, text, color) {{
     const el = document.getElementById(id);
-    if (!el) return;
-    el.style.setProperty('--c', color);
-    el.innerHTML = '<span class="dot"></span>' + text;
-    el.hidden = false;
+    if (!el) return; el.style.setProperty('--c', color); el.innerHTML = '<span class="dot"></span>' + text; el.hidden = false;
   }}
   
   function setRing(el, pct, color) {{
@@ -1876,9 +1873,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     el.querySelector('.val').style.strokeDashoffset = CIRC * (1 - p / 100);
   }}
   
-  function fill(el) {{
-    el.style.setProperty('--p', ((el.value - el.min) / (el.max - el.min) * 100) + '%');
-  }}
+  function fill(el) {{ el.style.setProperty('--p', ((el.value - el.min) / (el.max - el.min) * 100) + '%'); }}
 
   // ---------- HOME ----------
   function renderHome() {{
@@ -1889,8 +1884,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       hovertemplate:'%{{text}}<br>HRV <b>%{{x}} ms</b> &middot; HR <b>%{{y}} bpm</b><extra></extra>'
     }}], {{
       ...base,
-      xaxis:{{ ...base.xaxis, title:{{ text:'HRV (ms): higher is more recovered' }} }},
-      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm): lower is calmer' }} }}
+      // FIX 2: Explicitly force linear types so 1970 never shows up
+      xaxis:{{ ...base.xaxis, title:{{ text:'HRV (ms): higher is more recovered' }}, type:'linear' }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm): lower is calmer' }}, type:'linear' }}
     }}, cfg);
   }}
 
@@ -1903,7 +1899,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       {{ x:D.in_ts, y:D.in_hr_raw, mode:'lines', line:{{ color:C.tx, width:2 }}, name:'Actual heart rate', hovertemplate:'%{{y:.0f}} bpm<extra>Actual</extra>' }}
     ], {{
       ...base, hovermode:'x unified', margin:{{ ...base.margin, r:44 }},
-      yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }} }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }}, type:'linear' }},
       yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
     }}, cfg);
     updateStressSim();
@@ -1943,7 +1939,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       traces.push({{ x:[D.b_hours[pi]], y:[D.b_alert[pi]], mode:'markers', marker:{{ size:13, color:C.energy, line:{{ width:3, color:'#11141a' }} }}, name:'Best focus', hoverinfo:'skip' }});
       chip('chip_peak', 'Best focus around ' + clock(D.b_hours[pi]), C.energy);
     }}
-    Plotly.newPlot('c_borbely', traces, {{ ...base, hovermode:'x unified', xaxis:{{ ...base.xaxis, title:{{ text:'Hour of day' }}, dtick:2 }} }}, cfg);
+    // FIX 2: Explicitly force linear types so 1970 never shows up
+    Plotly.newPlot('c_borbely', traces, {{ ...base, hovermode:'x unified', xaxis:{{ ...base.xaxis, title:{{ text:'Hour of day' }}, dtick:2, type:'linear' }}, yaxis:{{ ...base.yaxis, type:'linear' }} }}, cfg);
     updateEnergySim();
   }}
 
@@ -1978,7 +1975,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       {{ x:D.slp_tau, y:D.slp_hr_mean, mode:'markers', marker:{{ size:6, color:'rgba(255,255,255,.28)' }}, name:'Sleeping heart rate', hovertemplate:'%{{y:.0f}} bpm<extra></extra>' }},
       {{ x:D.slp_tau, y:D.slp_hr_fit, mode:'lines', line:{{ color:C.sleep, width:3, shape:'spline' }}, name:'Hammock curve', hoverinfo:'skip' }},
       {{ x:D.slp_tau, y:D.slp_hrv_mean, yaxis:'y2', mode:'lines+markers', marker:{{ size:5 }}, line:{{ color:C.hr, width:2 }}, name:'HRV', connectgaps:true, hovertemplate:'%{{y:.0f}} ms<extra>HRV</extra>' }}
-    ], {{ ...base, margin:{{ ...base.margin, r:44 }}, yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }} }}, yaxis2:{{ overlaying:'y', side:'right', showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }} }}, cfg);
+    ], {{ ...base, margin:{{ ...base.margin, r:44 }}, xaxis:{{ ...base.xaxis, type:'linear' }}, yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }}, type:'linear' }}, yaxis2:{{ overlaying:'y', side:'right', showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }} }}, cfg);
 
     // 2. Render Chronological Hypnogram
     if (D.stage_blocks && D.stage_blocks.length > 0) {{
@@ -2006,8 +2003,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
           fill: 'tozeroy', fillcolor: 'rgba(143,155,255,0.1)', hoverinfo: 'text'
       }}], {{
           ...base, margin: {{...base.margin, l: 50, t: 20, b: 30}},
-          xaxis: {{ ...base.xaxis, tickvals: ticks, ticktext: ticktext }},
-          yaxis: {{ ...base.yaxis, tickvals: [0, 1, 2, 3], ticktext: ['Deep', 'Core', 'REM', 'Awake'], range: [-0.5, 3.5] }}
+          // FIX 2: Explicitly lock the axes so it treats the hours as literal numbers, not dates
+          xaxis: {{ ...base.xaxis, tickvals: ticks, ticktext: ticktext, type: 'linear' }},
+          yaxis: {{ ...base.yaxis, tickvals: [0, 1, 2, 3], ticktext: ['Deep', 'Core', 'REM', 'Awake'], range: [-0.5, 3.5], type: 'linear' }}
       }}, cfg);
     }}
   }}
