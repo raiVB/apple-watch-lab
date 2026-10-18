@@ -2022,6 +2022,17 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       </div>
     </section>
 
+<!-- DATA EXPLORER -->
+<section id="tab-data" class="tab">
+  <header class="ph">
+    <div>
+      <h1>Data Explorer</h1>
+      <p>Inspect stored Apple Health records and check timestamp continuity.</p>
+    </div>
+  </header>
+  <div id="dataExplorerContent"></div>
+</section>
+
   </main>
 </div>
 
@@ -2315,8 +2326,93 @@ function renderHome() {{
     }}, cfg);
   }}
 
+  async function renderData() {{
+    const container = document.getElementById('dataExplorerContent');
+    if (!container) return;
+
+    container.innerHTML = `
+      <div class="panel" style="padding:20px;">
+        <h2>Data Explorer</h2>
+        <p>Stored 5-minute bins from MongoDB. These are not individual raw sensor samples.</p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin:16px 0;">
+          <select id="dataMetric" style="padding:9px;min-width:220px;">
+            <option value="">All metrics</option>
+          </select>
+          <label>Start <input id="dataStart" type="date"></label>
+          <label>End <input id="dataEnd" type="date"></label>
+          <button onclick="loadDataPage(1)">Apply filters</button>
+        </div>
+        <p id="dataSummary">Loading records…</p>
+        <div style="overflow:auto;">
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <thead><tr>
+              <th>Timestamp</th><th>Metric</th><th>Value</th>
+              <th>Unit</th><th>Gap (min)</th>
+            </tr></thead>
+            <tbody id="dataRows"></tbody>
+          </table>
+        </div>
+        <div style="display:flex;gap:12px;align-items:center;margin-top:16px;">
+          <button id="dataPrev" onclick="loadDataPage(dataPage-1)">Previous</button>
+          <span id="dataPageLabel">Page 1</span>
+          <button id="dataNext" onclick="loadDataPage(dataPage+1)">Next</button>
+        </div>
+      </div>`;
+
+    window.dataPage = 1;
+    window.loadDataPage = async function(page) {
+      const metric = document.getElementById('dataMetric').value;
+      const start = document.getElementById('dataStart').value;
+      const end = document.getElementById('dataEnd').value;
+      const params = new URLSearchParams({page, limit:100});
+      if (metric) params.set('metric', metric);
+      if (start) params.set('start', start);
+      if (end) params.set('end', end);
+
+      const summary = document.getElementById('dataSummary');
+      summary.textContent = 'Loading…';
+
+      try {
+        const response = await fetch('/api/records?' + params.toString());
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const result = await response.json();
+
+        const metricSelect = document.getElementById('dataMetric');
+        if (metricSelect.options.length === 1) {
+          result.metrics.forEach(m => {
+            const option = document.createElement('option');
+            option.value = m;
+            option.textContent = m;
+            metricSelect.appendChild(option);
+          });
+        }
+
+        window.dataPage = result.page;
+        document.getElementById('dataRows').innerHTML = result.rows.map(r => `
+          <tr>
+            <td>${r.timestamp ?? ''}</td>
+            <td>${r.metric ?? ''}</td>
+            <td>${r.value ?? ''}</td>
+            <td>${r.unit ?? ''}</td>
+            <td>${r.gap_minutes == null ? '—' : r.gap_minutes}</td>
+          </tr>`).join('');
+
+        document.getElementById('dataPageLabel').textContent =
+          `Page ${result.page} of ${result.pages}`;
+        summary.textContent = `${result.total.toLocaleString()} stored records`;
+        document.getElementById('dataPrev').disabled = result.page <= 1;
+        document.getElementById('dataNext').disabled =
+          result.page >= result.pages;
+      } catch (error) {
+        summary.textContent = 'Could not load records: ' + error.message;
+      }
+    };
+
+    await loadDataPage(1);
+  }
+
   // ---------- NAVIGATION ----------
-  const RENDER = {{ home:renderHome, stress:renderStress, energy:renderEnergy, sleep:renderSleep }};
+  const RENDER = {{ home:renderHome, stress:renderStress, energy:renderEnergy, sleep:renderSleep, data:renderData }};
   const RENDERED = {{}};
   function openTab(name) {{
     if (!RENDER[name]) name = 'home';
