@@ -2083,24 +2083,96 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   function fill(el) {{ el.style.setProperty('--p', ((el.value - el.min) / (el.max - el.min) * 100) + '%'); }}
 
   // ---------- HOME ----------
-  function renderHome() {{
+ 
+function renderHome() {{
     const base = getBase();
-    const good = D.quad_colors.filter(c => c === '#10b981').length;
-    if (D.quad_colors.length) chip('chip_quad', Math.round(100 * good / D.quad_colors.length) + '% of readings in your recovered zone', C.energy);
-    Plotly.newPlot('c_quad', [{{
-      x:D.quad_hrv, y:D.quad_hr, text:D.quad_labels, mode:'markers',
-      marker:{{ size:9, color:D.quad_colors, opacity:.85, line:{{ width:1, color:'#11141a' }} }},
-      hovertemplate:'%{{text}}<br>HRV <b>%{{x}} ms</b> &middot; HR <b>%{{y}} bpm</b><extra></extra>'
-    }}], {{
-      ...base, margin:{{ ...base.margin, t:16 }},
-      xaxis:{{ ...base.xaxis, title:{{ text:'Heart rate variability (ms)  →  more recovered' }}, type:'linear' }},
-      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm)  ↓  calmer' }}, type:'linear' }},
-      shapes:[
-        {{ type:'rect', xref:'x', yref:'y', x0:D.mean_hrv, x1:1e5, y0:-1e5, y1:D.mean_hr, fillcolor:'rgba(61,219,176,.06)', line:{{ width:0 }}, layer:'below' }},
-        {{ type:'line', x0:D.mean_hrv, x1:D.mean_hrv, y0:0, y1:1, yref:'paper', line:{{ color:'rgba(255,255,255,.14)', dash:'dash', width:1 }} }},
-        {{ type:'line', x0:0, x1:1, xref:'paper', y0:D.mean_hr, y1:D.mean_hr, line:{{ color:'rgba(255,255,255,.14)', dash:'dash', width:1 }} }}
+
+    const hrv = Array.isArray(D.quad_hrv) ? D.quad_hrv : [];
+    const hr = Array.isArray(D.quad_hr) ? D.quad_hr : [];
+    const labels = Array.isArray(D.quad_labels) ? D.quad_labels : [];
+    const colors = Array.isArray(D.quad_colors) ? D.quad_colors : [];
+
+    const points = hrv
+      .map((x, i) => ({
+        x: Number(x),
+        y: Number(hr[i]),
+        label: labels[i] ?? '',
+        color: colors[i] ?? '#64748b'
+      }))
+      .filter(p =>
+        Number.isFinite(p.x) &&
+        Number.isFinite(p.y)
+      );
+
+    const good = colors.filter(c => c === '#10b981').length;
+
+    if (colors.length) {
+      chip(
+        'chip_quad',
+        Math.round(100 * good / colors.length) +
+          '% of readings in your recovered zone',
+        C.energy
+      );
+    }
+
+    Plotly.newPlot('c_quad', [{
+      x: points.map(p => p.x),
+      y: points.map(p => p.y),
+      text: points.map(p => p.label),
+      mode: 'markers',
+      marker: {
+        size: 9,
+        color: points.map(p => p.color),
+        opacity: 0.85,
+        line: { width: 1, color: '#11141a' }
+      },
+      hovertemplate:
+        '%{text}<br>HRV <b>%{x} ms</b> &middot; HR <b>%{y} bpm</b><extra></extra>'
+    }], {
+      ...base,
+      margin: { ...base.margin, t: 16 },
+      xaxis: {
+        ...base.xaxis,
+        title: { text: 'Heart rate variability (ms) → more recovered' },
+        type: 'linear'
+      },
+      yaxis: {
+        ...base.yaxis,
+        title: { text: 'Heart rate (bpm) ↓ calmer' },
+        type: 'linear'
+      },
+      shapes: [
+        {
+          type: 'rect',
+          xref: 'x', yref: 'y',
+          x0: D.mean_hrv, x1: 1e5,
+          y0: -1e5, y1: D.mean_hr,
+          fillcolor: 'rgba(61,219,176,.06)',
+          line: { width: 0 },
+          layer: 'below'
+        },
+        {
+          type: 'line',
+          x0: D.mean_hrv, x1: D.mean_hrv,
+          y0: 0, y1: 1, yref: 'paper',
+          line: {
+            color: 'rgba(255,255,255,.14)',
+            dash: 'dash',
+            width: 1
+          }
+        },
+        {
+          type: 'line',
+          x0: 0, x1: 1, xref: 'paper',
+          y0: D.mean_hr, y1: D.mean_hr,
+          line: {
+            color: 'rgba(255,255,255,.14)',
+            dash: 'dash',
+            width: 1
+          }
+        }
       ]
-    }}, cfg);
+    }, cfg);
   }}
 
   // ---------- STRESS ----------
