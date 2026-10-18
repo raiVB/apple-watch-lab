@@ -1481,81 +1481,173 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
     }
 
 # ==============================================================================
-# BIO LAB DASHBOARD BUILDER (Hypnogram Fix: Night-Grouping & Duration Rebuild)
+# BIO LAB DASHBOARD BUILDER (final: robust sleep-stage ingestion + hypnogram)
 # Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
+#
+# Sleep data can come from either place (raw_sleep wins if given):
+#   raw_sleep = path to your Health Auto Export .json, a list of dicts, or a DataFrame
+#               with the raw records: {"start", "end", "value": Core/Deep/REM/Awake, "qty"}
+#   df_sleep  = your existing DataFrame (columns date, stage, hours, onset_hr, wake_hr ...)
 # ==============================================================================
 
-def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle):
+def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=None):
     print("[5/6] Building Bio Lab dashboard (Home + Stress + Energy + Sleep)...")
-    import json
+    import json, os
     import numpy as np
     import pandas as pd
 
-    # --- 0. DATA RECONSTRUCTION & PURIFIER -----------------------------------
-    if not df_sleep.empty:
-        df_sleep = df_sleep.copy()
-        
-        # FIX 1: Rebuild missing End Times. 
-        # The parser missed the "end" key and set start == end. 
-        # We mathematically reconstruct the chronological end time using the 'hours' (qty) field.
-        invalid_ends = (df_sleep['wake_hr'] == df_sleep['onset_hr'])
-        df_sleep.loc[invalid_ends, 'wake_hr'] = df_sleep.loc[invalid_ends, 'onset_hr'] + df_sleep.loc[invalid_ends, 'hours']
-        df_sleep.loc[invalid_ends, 'end_epoch'] = df_sleep.loc[invalid_ends, 'start_epoch'] + (df_sleep.loc[invalid_ends, 'hours'] * 3600).astype(int)
+    # --- 0. SLEEP INGEST -------------------------------------------------------
+    STAGES = {
+        "Deep":  ("#5b6cff", "Deep sleep", "Body repairs muscle and clears waste from the brain."),
+        "Core":  ("#7cc4ff", "Core sleep", "Light sleep that links deep and REM cycles."),
+        "REM":   ("#c4a1ff", "REM sleep",  "Brain sorts memories and learning."),
+        "Awake": ("#ff7a6b", "Awake",      "Brief awakenings, often not remembered."),
+    }
+    ORDER = ["Deep", "Core", "REM", "Awake"]
 
-        # FIX 2: Unify Split Nights.
-        # Apple assigns date="10-18" to 1AM and date="10-17" to 11PM. 
-        # We shift all timestamps back by 12 hours so the whole night shares one logical date.
-        shifted_epochs = df_sleep['start_epoch'] - 43200
-        df_sleep['night_date'] = pd.to_datetime(shifted_epochs, unit='s').dt.strftime('%Y-%m-%d')
+    def stage_key(v):
+        s = str(v).lower()
+        if "deep" in s: return "Deep"
+        if "rem" in s: return "REM"
+        if "awake" in s or "wake" in s: return "Awake"
+        if "core" in s or "light" in s or "unspecified" in s or s.strip() in ("asleep", "sleep"): return "Core"
+        return None  # "In Bed" and anything else is ignored
 
-        # FIX 3: Merciless Purifier for Apple Summary Blocks.
-        # Fake summaries span the whole night, sharing the exact same start/end times.
-        df_sleep['span_id'] = df_sleep['onset_hr'].round(2).astype(str) + "_" + df_sleep['wake_hr'].round(2).astype(str)
-        span_counts = df_sleep['span_id'].value_counts()
-        valid_spans = span_counts[span_counts < 3].index
-        df_sleep = df_sleep[df_sleep['span_id'].isin(valid_spans)].copy()
+    def clk(h):
+        h = h % 24
+        hh, mm = int(h), int(round((h - int(h)) * 60))
+        if mm == 60: hh, mm = (hh + 1) % 24, 0
+        return f"{(hh % 12) or 12}:{mm:02d} {'AM' if hh < 12 else 'PM'}"
 
-    # --- 1. SLEEP TIMELINE + STAGE BAR ---------------------------------------
-    def stage_style(stage):
-        if "Deep" in stage:  return "#5b6cff", "Body repairs muscle and clears waste from the brain."
-        if "REM" in stage:   return "#c4a1ff", "Brain sorts memories and learning."
-        if "Awake" in stage: return "#ff7a6b", "Brief awakenings, often not remembered."
-        return "#7cc4ff", "Light sleep that links deep and REM cycles."
+    def hm(m):
+        m = int(round(m))
+        return f"{m // 60}h {m % 60:02d}m"
 
-    sleep_log_html, stage_bar_html = "", ""
-    stage_blocks = []
-    
-    if not df_sleep.empty:
-        # Group by our newly unified 'night_date' instead of the split calendar 'date'
-        latest_sleep_date = df_sleep['night_date'].max()
-        recent_sleep = df_sleep[df_sleep['night_date'] == latest_sleep_date].sort_values("start_epoch")
-        
-        totals = {}
-        for _, r in recent_sleep.iterrows():
-            st_str = hour_to_clock_str(r["onset_hr"])
-            en_str = hour_to_clock_str(r["wake_hr"])
-            mins = int(round(r['hours'] * 60))
-            col, desc = stage_style(r['stage'])
-            totals[r['stage']] = totals.get(r['stage'], 0) + r['hours']
-            
-            stage_blocks.append({
-                "stage": r["stage"], "start": r["onset_hr"], 
-                "end": r["wake_hr"], "dur": mins
-            })
+    def load_records(src):
+        if src is None: return None
+        if isinstance(src, (str, os.PathLike)):
+            with open(src, encoding="utf-8") as f:
+                data = json.load(f)
+            def find(o):
+                if isinstance(o, list):
+                    if o and isinstance(o[0], dict) and ("start" in o[0] or "startDate" in o[0]) and ("value" in o[0] or "stage" in o[0]):
+                        return o
+                    for v in o:
+                        r = find(v)
+                        if r: return r
+                elif isinstance(o, dict):
+                    for v in o.values():
+                        r = find(v)
+                        if r: return r
+                return None
+            src = find(data)
+            if src is None: return None
+        if isinstance(src, list): src = pd.DataFrame(src)
+        return src if isinstance(src, pd.DataFrame) and not src.empty else None
 
+    def finish(out):
+        if out is None: return None
+        out = out.dropna(subset=["key", "start", "end"])
+        out = out[out["end"] > out["start"]].drop_duplicates(["key", "start", "end"]).copy()
+        out["mins"] = (out["end"] - out["start"]).dt.total_seconds() / 60.0
+        return out if not out.empty else None
+
+    def to_segments(d):  # raw records: start / end / value
+        cols = {str(c).lower(): c for c in d.columns}
+        pick = lambda *names: next((cols[n.lower()] for n in names if n.lower() in cols), None)
+        c_s, c_e, c_v = pick("start", "startDate"), pick("end", "endDate"), pick("value", "stage", "category")
+        if not (c_s and c_e and c_v): return None
+        out = pd.DataFrame({
+            "key": d[c_v].map(stage_key),
+            "start": pd.to_datetime(d[c_s].astype(str).str[:19], errors="coerce"),
+            "end": pd.to_datetime(d[c_e].astype(str).str[:19], errors="coerce"),
+        })
+        out["summary"] = False
+        return out
+
+    def from_nightly(d):  # your pipeline's df_sleep: date / stage / hours / onset_hr / wake_hr
+        if not {"date", "onset_hr", "wake_hr", "hours", "stage"} <= set(d.columns): return None
+        d = d.sort_values("start_epoch") if "start_epoch" in d.columns else d.copy()
+        on = d["onset_hr"].astype(float)
+        day = pd.to_datetime(d["date"].astype(str).str[:10], errors="coerce")
+        wrap = on.groupby(d["date"]).transform(lambda s: (s.diff() < -12).cumsum())
+        start = day + pd.to_timedelta(on + wrap * 24.0, unit="h")
+        gap = d["wake_hr"].astype(float) - on
+        dur = np.where(gap < 0, gap + 24.0, gap)
+        out = pd.DataFrame({"key": d["stage"].map(stage_key), "start": start,
+                            "end": start + pd.to_timedelta(d["hours"].astype(float), unit="h")})
+        out["summary"] = (d["hours"].astype(float) - dur).abs().values > 0.75
+        return out
+
+    def pick_night(seg):
+        real = seg[~seg["summary"]]
+        seg = (real if not real.empty else seg).sort_values("start").reset_index(drop=True)
+        prev_end = seg["end"].cummax().shift(1)
+        seg["sess"] = ((seg["start"] - prev_end) > pd.Timedelta(hours=2.5)).cumsum()
+        asleep = seg[seg["key"] != "Awake"].groupby("sess")["mins"].sum()
+        ok = asleep[asleep >= 120]
+        sid = ok.index.max() if len(ok) else seg["sess"].max()
+        return seg[seg["sess"] == sid].copy()
+
+    night, src_label = None, ""
+    try:
+        seg = None
+        for label, cand in (("raw_sleep", load_records(raw_sleep)), ("df_sleep", df_sleep)):
+            if seg is not None or cand is None or len(cand) == 0: continue
+            seg = finish(to_segments(cand))
+            if seg is None: seg = finish(from_nightly(cand))
+            if seg is not None: src_label = label
+        if seg is not None: night = pick_night(seg)
+    except Exception as e:
+        print(f"      sleep ingest failed: {e!r}")
+
+    # --- 1. SLEEP TIMELINE, STAT TILES, STAGE BAR ------------------------------
+    sleep_log_html, stage_bar_html, sleep_stats_html = "", "", ""
+    stage_blocks, is_summary_night = [], False
+
+    if night is not None and not night.empty:
+        is_summary_night = bool(night["summary"].all())
+        night = night.sort_values("start")
+        base_day = night["start"].min().normalize()
+        night["x0"] = (night["start"] - base_day).dt.total_seconds() / 3600
+        night["x1"] = (night["end"] - base_day).dt.total_seconds() / 3600
+        mins_by = {k: float(night.loc[night["key"] == k, "mins"].sum()) for k in ORDER}
+        total_min = sum(mins_by.values()) or 1.0
+        asleep_min = total_min - mins_by["Awake"]
+
+        if is_summary_night:
+            rows = [(k, None, None, mins_by[k]) for k in ORDER if mins_by[k] > 0]
+        else:
+            rows = [(r.key, float(r.x0), float(r.x1), float(r.mins)) for r in night.itertuples()]
+            stage_blocks = [{"key": k, "stage": STAGES[k][1], "x0": round(a, 4), "x1": round(b, 4), "mins": int(round(m))} for k, a, b, m in rows]
+
+        for k, a, b, m in rows:
+            col, name, desc = STAGES[k]
+            label = "Nightly total" if a is None else f"{clk(a)} &ndash; {clk(b)}"
             sleep_log_html += f"""
             <div class="tl" style="--c:{col}">
-              <div class="t" style="font-weight: 600;">{st_str} &ndash; {en_str}</div>
+              <div class="t">{label}</div>
               <div class="ln"><span class="nd"></span></div>
-              <div class="d"><b>{r['stage']}</b><span class="mins">{mins} min</span><p>{desc}</p></div>
+              <div class="d"><b>{name}</b><span class="mins">{int(round(m))} min</span><p>{desc}</p></div>
             </div>"""
-            
-        total_h = sum(totals.values()) or 1
-        seg = "".join(f"<i style='width:{h / total_h * 100:.1f}%;--c:{stage_style(s)[0]}' title='{s}'></i>" for s, h in totals.items())
-        leg = "".join(f"<span><span class='dot' style='--c:{stage_style(s)[0]}'></span>{s} <b>{int(round(h * 60))} min</b></span>" for s, h in totals.items())
-        stage_bar_html = f"<div class='stagebar'>{seg}</div><div class='legend'>{leg}</div>"
+
+        seg_html = "".join(f"<i style='width:{mins_by[k] / total_min * 100:.1f}%;--c:{STAGES[k][0]}' title='{STAGES[k][1]}'></i>" for k in ORDER if mins_by[k] > 0)
+        leg_html = "".join(f"<span><span class='dot' style='--c:{STAGES[k][0]}'></span>{STAGES[k][1]} <b>{hm(mins_by[k])}</b></span>" for k in ORDER if mins_by[k] > 0)
+        stage_bar_html = f"<div class='stagebar'>{seg_html}</div><div class='legend'>{leg_html}</div>"
+
+        deep_rem_pct = (mins_by["Deep"] + mins_by["REM"]) / asleep_min * 100 if asleep_min else 0
+        tiles = []
+        if not is_summary_night:
+            tiles += [("Bedtime", clk(night["x0"].min())), ("Wake-up", clk(night["x1"].max()))]
+        tiles += [("Time asleep", hm(asleep_min)), ("Deep + REM", f"{deep_rem_pct:.0f}% of sleep")]
+        sleep_stats_html = "<div class='row'><div class='stats'>" + "".join(f"<div class='stat'><span>{t}</span><b>{v}</b></div>" for t, v in tiles) + "</div></div>"
+
+        print(f"      sleep: {src_label} | {night['start'].min():%d %b %H:%M} to {night['end'].max():%H:%M} | "
+              + ", ".join(f"{k} {int(round(mins_by[k]))}m" for k in ORDER)
+              + (" | NIGHTLY TOTALS ONLY: pass raw_sleep=<json path or records> for the full hypnogram" if is_summary_night else ""))
     else:
-        sleep_log_html = "<div class='empty'>No detailed stages found. Ensure Sleep Focus is active.</div>"
+        sleep_log_html = "<div class='empty'>No sleep stages found for your latest night. Make sure your watch recorded sleep, and that raw_sleep or df_sleep is passed in.</div>"
+        print("      sleep: no usable stage data found (check df_sleep / raw_sleep)")
 
     # --- 2. DATA TABLE + STRESS EPISODES -------------------------------------
     table_html = ""
@@ -1592,7 +1684,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     quad_hrv, quad_hr, quad_labels, quad_colors = [], [], [], []
     mean_hrv = float(hrv_df["value"].mean()) if not hrv_df.empty else 60.0
     mean_hr = float(hr_df["value"].mean()) if not hr_df.empty else 72.0
-    
+
     for _, row in hrv_df.iterrows():
         h_val = round(float(row["value"]), 1)
         paired_hr = round(float(hr_df[(hr_df["date"] == row["date"]) & ((hr_df["hour"] - row["hour"]).abs() <= 1.5)]["value"].mean()), 1) if not hr_df.empty else round(mean_hr, 1)
@@ -1607,13 +1699,16 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         "b_hours": pred_bundle["hours_grid"], "b_alert": pred_bundle["alertness_curve"],
         "b_adeno": pred_bundle["adenosine_curve"], "b_circ": pred_bundle["circadian_curve"],
         "st_dates": stress_bundle["daily_dates"], "st_like": stress_bundle["daily_likelihood"],
+        "st_ci_up": stress_bundle["daily_ci_upper"], "st_ci_dn": stress_bundle["daily_ci_lower"],
+        "st_anom": stress_bundle["daily_anomaly"],
         "in_ts": stress_bundle["intraday_ts"], "in_hr_raw": stress_bundle["intraday_hr_raw"],
         "in_hr_exp": stress_bundle["intraday_hr_exp"], "in_stress": stress_bundle["intraday_stress"],
         "in_state": stress_bundle["intraday_state"],
         "slp_tau": sleep_bundle["hammock_tau_x"], "slp_hr_mean": sleep_bundle["hammock_hr_mean"],
         "slp_hr_fit": sleep_bundle["hammock_hr_fitted"], "slp_hrv_mean": sleep_bundle["hammock_hrv_mean"],
         "f_weights": pred_bundle["feature_weights"],
-        "stage_blocks": stage_blocks
+        "stage_blocks": stage_blocks,
+        "is_summary_night": is_summary_night,
     }
 
     # --- 4. HTML CONSTRUCTION --------------------------------------------------
@@ -1637,13 +1732,13 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   html {{ color-scheme:dark; }}
   body {{ margin:0; background:var(--bg); color:var(--tx); font-family:'Manrope',-apple-system,sans-serif; line-height:1.55; font-variant-numeric:tabular-nums; }}
   button, input {{ font-family:inherit; }}
-  button:focus-visible, input:focus-visible, summary:focus-visible {{ outline:2px solid var(--hr); outline-offset:3px; }}
+  button:focus-visible, input:focus-visible {{ outline:2px solid var(--hr); outline-offset:3px; }}
 
   .shell {{ display:grid; grid-template-columns:232px minmax(0,1fr); min-height:100vh; }}
   .nav {{ position:sticky; top:0; height:100vh; padding:28px 14px; border-right:1px solid var(--line); display:flex; flex-direction:column; gap:4px; }}
   .brand {{ display:flex; align-items:center; gap:10px; font-weight:800; font-size:17px; padding:0 12px 28px; }}
   .nav-btn {{ display:flex; align-items:center; gap:12px; width:100%; background:none; border:0; color:var(--dim); font-size:14px; font-weight:600; padding:11px 12px; border-radius:12px; cursor:pointer; text-align:left; }}
-  .nav-btn svg {{ width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:1.8; flex:none; }}
+  .nav-btn svg {{ width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; flex:none; }}
   .nav-btn:hover {{ color:var(--tx); }}
   .nav-btn.active {{ background:var(--s2); color:var(--tx); }}
   .nav-btn[data-tab=home].active svg {{ stroke:var(--hr); }}
@@ -1654,7 +1749,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .main {{ padding:44px 48px 72px; max-width:1240px; width:100%; }}
   .tab {{ display:none; }}
   .tab.active {{ display:block; }}
-  .ph h1 {{ font-size:32px; font-weight:800; margin:0 0 6px; }}
+  .ph h1 {{ font-size:32px; font-weight:800; margin:0 0 6px; letter-spacing:-.025em; }}
   .ph p {{ color:var(--dim); margin:0; max-width:60ch; }}
 
   .hero {{ display:grid; grid-template-columns:repeat(3,1fr); margin-top:28px; padding:40px 12px; background:var(--s1); border:1px solid var(--line); border-radius:28px; }}
@@ -1667,8 +1762,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .ring svg {{ width:100%; height:100%; transform:rotate(-90deg); }}
   .ring circle {{ fill:none; stroke-width:8; }}
   .ring .trk {{ stroke:rgba(255,255,255,.07); }}
-  .ring .val {{ stroke:var(--c); stroke-linecap:round; stroke-dasharray:326.73; stroke-dashoffset:326.73; transition:stroke-dashoffset 1.3s cubic-bezier(.2,.8,.2,1); filter:drop-shadow(0 0 6px color-mix(in srgb, var(--c) 45%, transparent)); }}
-  .ring .ctr {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:46px; font-weight:800; }}
+  .ring .val {{ stroke:var(--c); stroke-linecap:round; stroke-dasharray:326.73; stroke-dashoffset:326.73; transition:stroke-dashoffset 1.3s cubic-bezier(.2,.8,.2,1), stroke .4s; filter:drop-shadow(0 0 6px color-mix(in srgb, var(--c) 45%, transparent)); }}
+  .ring .ctr {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:46px; font-weight:800; letter-spacing:-.03em; }}
   .ring .ctr small {{ font-size:18px; font-weight:600; color:var(--dim); margin-left:2px; }}
   .ring.sm {{ width:104px; height:104px; }}
   .ring.sm .ctr {{ font-size:28px; }}
@@ -1679,6 +1774,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .chip {{ display:inline-flex; align-items:center; gap:8px; padding:6px 12px; border-radius:99px; font-size:12.5px; font-weight:600; color:var(--c); background:color-mix(in srgb, var(--c) 14%, transparent); }}
   .chip[hidden] {{ display:none; }}
   .dot {{ display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--c); margin-right:6px; flex:none; }}
+  .chip .dot {{ margin:0; }}
 
   .row {{ display:grid; gap:20px; margin-top:20px; }}
   .r2 {{ grid-template-columns:minmax(0,1.55fr) minmax(0,1fr); }}
@@ -1688,33 +1784,42 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .pt p {{ margin:2px 0 0; font-size:13px; color:var(--dim); max-width:56ch; }}
   .chart {{ width:100%; height:360px; }}
 
-  details.how {{ margin-top:22px; background:var(--s1); border:1px solid var(--line); border-radius:16px; padding:0 22px; }}
-  .how summary {{ cursor:pointer; padding:15px 0; font-weight:700; font-size:14px; display:flex; justify-content:space-between; align-items:center; }}
-  .how p {{ color:var(--dim); font-size:14.5px; max-width:75ch; margin:0 0 14px; }}
+  .stats {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:14px; }}
+  .stat {{ background:var(--s1); border:1px solid var(--line); border-radius:18px; padding:18px 20px; }}
+  .stat span {{ display:block; font-size:13px; color:var(--dim); margin-bottom:2px; }}
+  .stat b {{ font-size:24px; font-weight:800; letter-spacing:-.02em; }}
 
-  .search {{ background:var(--s2); border:1px solid var(--line); border-radius:12px; color:var(--tx); padding:9px 14px; font-size:13px; width:240px; }}
   .scroll {{ overflow:auto; max-height:460px; }}
   .tbl {{ width:100%; border-collapse:collapse; font-size:13.5px; min-width:720px; }}
   .tbl th {{ position:sticky; top:0; background:var(--s1); text-align:left; font-weight:600; color:var(--faint); font-size:12px; padding:10px 14px; border-bottom:1px solid var(--line); }}
-  .tbl td {{ padding:15px 14px; border-bottom:1px solid var(--line); }}
+  .tbl td {{ padding:15px 14px; border-bottom:1px solid var(--line); vertical-align:top; }}
+  .tbl tr:last-child td {{ border-bottom:0; }}
   .tbl .cat {{ font-size:12px; color:var(--hr); }}
+  .tbl .rng {{ color:var(--hr); white-space:nowrap; }}
+  .tbl .mean {{ color:var(--dim); font-size:13px; max-width:360px; }}
 
   .ctl {{ margin-bottom:22px; }}
   .ctl .top {{ display:flex; justify-content:space-between; font-size:13.5px; color:var(--dim); margin-bottom:10px; }}
   .ctl .top b {{ color:var(--tx); font-weight:700; }}
-  input[type=range] {{ -webkit-appearance:none; width:100%; height:6px; border-radius:99px; background:linear-gradient(to right, var(--ac,var(--energy)) var(--p,50%), rgba(255,255,255,.09) var(--p,50%)); }}
-  input[type=range]::-webkit-slider-thumb {{ -webkit-appearance:none; width:20px; height:20px; border-radius:50%; background:#fff; cursor:pointer; }}
-  
-  .ep {{ display:grid; grid-template-columns:180px 84px 1fr 1fr; gap:18px; padding:18px 0; border-top:1px solid var(--line); font-size:13.5px; }}
+  input[type=range] {{ -webkit-appearance:none; appearance:none; width:100%; height:6px; border-radius:99px; margin:0; background:linear-gradient(to right, var(--ac,var(--energy)) var(--p,50%), rgba(255,255,255,.09) var(--p,50%)); }}
+  input[type=range]::-webkit-slider-thumb {{ -webkit-appearance:none; width:20px; height:20px; border-radius:50%; background:#fff; border:0; box-shadow:0 2px 8px rgba(0,0,0,.5); cursor:pointer; }}
+  input[type=range]::-moz-range-thumb {{ width:20px; height:20px; border-radius:50%; background:#fff; border:0; cursor:pointer; }}
+  .res {{ display:flex; align-items:center; gap:20px; padding-top:22px; border-top:1px solid var(--line); }}
+  .res .state {{ font-size:13.5px; color:var(--dim); margin-top:6px; }}
+
+  .ep {{ display:grid; grid-template-columns:180px 84px 1fr 1fr; gap:18px; padding:18px 0; border-top:1px solid var(--line); font-size:13.5px; align-items:start; }}
+  .ep:first-child {{ border-top:0; }}
   .ep .sub {{ font-size:12px; color:var(--dim); margin-top:2px; }}
   .ep .hyp {{ color:var(--sleep); }}
   .empty {{ padding:28px 0; color:var(--dim); font-size:14px; }}
+  .empty.good {{ color:var(--energy); }}
 
   .stagebar {{ display:flex; gap:3px; height:14px; border-radius:99px; overflow:hidden; }}
   .stagebar i {{ display:block; background:var(--c); }}
   .legend {{ display:flex; flex-wrap:wrap; gap:6px 20px; margin:14px 0 26px; font-size:12.5px; color:var(--dim); }}
-  
-  .tl {{ display:grid; grid-template-columns:118px 14px 1fr; gap:14px; }}
+  .legend b {{ color:var(--tx); }}
+
+  .tl {{ display:grid; grid-template-columns:130px 14px 1fr; gap:14px; }}
   .tl .t {{ text-align:right; font-size:12px; color:var(--dim); padding-top:2px; }}
   .tl .ln {{ position:relative; display:flex; justify-content:center; }}
   .tl .ln::after {{ content:''; position:absolute; top:20px; bottom:-6px; width:2px; background:var(--line); }}
@@ -1725,14 +1830,37 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .tl .mins {{ color:var(--dim); font-size:12px; margin-left:8px; }}
   .tl .d p {{ margin:2px 0 0; font-size:12.5px; color:var(--faint); }}
   .tl-list {{ max-height:420px; overflow-y:auto; padding-right:8px; }}
+
+  @media (max-width:980px) {{ .r2 {{ grid-template-columns:1fr; }} .ep {{ grid-template-columns:1fr; gap:6px; }} }}
+  @media (max-width:860px) {{
+    .shell {{ grid-template-columns:1fr; }}
+    .nav {{ position:fixed; top:auto; bottom:0; left:0; right:0; height:auto; flex-direction:row; justify-content:space-around; gap:0; padding:8px 8px calc(8px + env(safe-area-inset-bottom,0px)); background:rgba(10,12,16,.92); backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px); border-right:0; border-top:1px solid var(--line); z-index:50; }}
+    .brand {{ display:none; }}
+    .nav-btn {{ flex-direction:column; gap:4px; font-size:11px; padding:8px 4px; justify-content:center; align-items:center; text-align:center; background:none !important; }}
+    .main {{ padding:calc(24px + env(safe-area-inset-top,0px)) 16px 110px; }}
+    .ph h1 {{ font-size:26px; }}
+    .hero {{ padding:26px 4px; border-radius:22px; }}
+    .hero .m {{ padding:0 6px; gap:10px; }}
+    .hero .m p {{ display:none; }}
+    .hero h2 {{ font-size:13px; }}
+    .ring {{ width:92px; height:92px; }}
+    .ring .ctr {{ font-size:25px; }}
+    .ring .ctr small {{ font-size:11px; }}
+    .ring.sm {{ width:92px; height:92px; }}
+    .badge {{ font-size:11px; padding:3px 9px; }}
+    .panel {{ padding:20px 16px; border-radius:18px; }}
+    .chart {{ height:300px; }}
+    .tl {{ grid-template-columns:104px 14px 1fr; gap:10px; }}
+  }}
+  @media (prefers-reduced-motion:reduce) {{ * {{ transition:none !important; animation:none !important; }} }}
 </style>
 </head>
 <body>
 <div class="shell">
 
-  <nav class="nav">
+  <nav class="nav" aria-label="Sections">
     <div class="brand">
-      <svg width="26" height="26" viewBox="0 0 26 26"><circle cx="13" cy="13" r="10" fill="none" stroke="#252b38" stroke-width="3"/><circle cx="13" cy="13" r="10" fill="none" stroke="#3ddbb0" stroke-width="3" stroke-dasharray="44 63" transform="rotate(-90 13 13)"/></svg>
+      <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><circle cx="13" cy="13" r="10" fill="none" stroke="#252b38" stroke-width="3"/><circle cx="13" cy="13" r="10" fill="none" stroke="#3ddbb0" stroke-width="3" stroke-linecap="round" stroke-dasharray="44 63" transform="rotate(-90 13 13)"/></svg>
       Bio Lab
     </div>
     <button class="nav-btn active" data-tab="home" onclick="openTab('home')"><svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>Today</button>
@@ -1777,7 +1905,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     <!-- STRESS -->
     <section id="tab-stress" class="tab">
-      <header class="ph"><h1>Stress detective</h1><p>Tells stress apart from exercise mathematically.</p></header>
+      <header class="ph"><h1>Stress detective</h1><p>Tells stress apart from exercise by checking what your heart rate should be for how much you moved.</p></header>
       <div class="row r2">
         <div class="panel">
           <div class="pt"><div><h3>Heart rate in context</h3><p>Actual vs. expected heart rate, with the stress score behind it.</p></div></div>
@@ -1785,9 +1913,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         </div>
         <div class="panel" style="--ac:var(--stress)">
           <div class="pt"><div><h3>Try a scenario</h3><p>See how the math works.</p></div></div>
-          <div class="ctl"><div class="top"><span>Heart rate</span><b id="st_lbl_hr">112 bpm</b></div><input type="range" id="st_sl_hr" min="55" max="165" step="1" value="112" oninput="updateStressSim()"></div>
-          <div class="ctl"><div class="top"><span>Steps in 5 minutes</span><b id="st_lbl_stp">20 steps</b></div><input type="range" id="st_sl_stp" min="0" max="600" step="20" value="20" oninput="updateStressSim()"></div>
-          <div class="ctl"><div class="top"><span>HRV</span><b id="st_lbl_hrv">34 ms</b></div><input type="range" id="st_sl_hrv" min="15" max="110" step="1" value="34" oninput="updateStressSim()"></div>
+          <div class="ctl"><div class="top"><span>Heart rate</span><b id="st_lbl_hr">112 bpm</b></div><input type="range" id="st_sl_hr" min="55" max="165" step="1" value="112" oninput="updateStressSim()" aria-label="Heart rate"></div>
+          <div class="ctl"><div class="top"><span>Steps in 5 minutes</span><b id="st_lbl_stp">20 steps</b></div><input type="range" id="st_sl_stp" min="0" max="600" step="20" value="20" oninput="updateStressSim()" aria-label="Steps in 5 minutes"></div>
+          <div class="ctl"><div class="top"><span>HRV</span><b id="st_lbl_hrv">34 ms</b></div><input type="range" id="st_sl_hrv" min="15" max="110" step="1" value="34" oninput="updateStressSim()" aria-label="HRV"></div>
           <div class="res">
             <div class="ring sm" id="st_ring" style="--c:var(--stress)"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span id="st_ring_n">84</span><small>%</small></div></div>
             <div><span id="st_sim_tag" class="badge" style="--c:var(--stress)">High strain</span><div id="st_sim_state" class="state"></div></div>
@@ -1812,10 +1940,10 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         </div>
         <div class="panel" style="--ac:var(--energy)">
           <div class="pt"><div><h3>Tomorrow's readiness</h3><p>Simulate tonight's habits.</p></div></div>
-          <div class="ctl"><div class="top"><span>Tonight's sleep</span><b id="lbl_slp">7.5 hrs</b></div><input type="range" id="sl_slp" min="4.5" max="10.0" step="0.5" value="7.5" oninput="updateEnergySim()"></div>
-          <div class="ctl"><div class="top"><span>Morning resting heart rate</span><b id="lbl_rhr">62 bpm</b></div><input type="range" id="sl_rhr" min="48" max="85" step="1" value="62" oninput="updateEnergySim()"></div>
-          <div class="ctl"><div class="top"><span>Morning HRV</span><b id="lbl_hrv">65 ms</b></div><input type="range" id="sl_hrv" min="25" max="120" step="5" value="65" oninput="updateEnergySim()"></div>
-          <div class="ctl"><div class="top"><span>Walking today</span><b id="lbl_wlk">60 mins</b></div><input type="range" id="sl_wlk" min="0" max="150" step="10" value="60" oninput="updateEnergySim()"></div>
+          <div class="ctl"><div class="top"><span>Tonight's sleep</span><b id="lbl_slp">7.5 hrs</b></div><input type="range" id="sl_slp" min="4.5" max="10.0" step="0.5" value="7.5" oninput="updateEnergySim()" aria-label="Tonight's sleep"></div>
+          <div class="ctl"><div class="top"><span>Morning resting heart rate</span><b id="lbl_rhr">62 bpm</b></div><input type="range" id="sl_rhr" min="48" max="85" step="1" value="62" oninput="updateEnergySim()" aria-label="Morning resting heart rate"></div>
+          <div class="ctl"><div class="top"><span>Morning HRV</span><b id="lbl_hrv">65 ms</b></div><input type="range" id="sl_hrv" min="25" max="120" step="5" value="65" oninput="updateEnergySim()" aria-label="Morning HRV"></div>
+          <div class="ctl"><div class="top"><span>Walking today</span><b id="lbl_wlk">60 mins</b></div><input type="range" id="sl_wlk" min="0" max="150" step="10" value="60" oninput="updateEnergySim()" aria-label="Walking today"></div>
           <div class="res">
             <div class="ring sm" id="en_ring" style="--c:var(--energy)"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span id="sim_out">78</span><small>%</small></div></div>
             <div><span id="en_tag" class="badge" style="--c:var(--energy)">Primed</span><div class="state">Simulated energy for tomorrow</div></div>
@@ -1826,11 +1954,13 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     <!-- SLEEP -->
     <section id="tab-sleep" class="tab">
-      <header class="ph"><h1>Sleep lab</h1><p>Precise mapping of your sleep architecture and recovery.</p></header>
-      
+      <header class="ph"><h1>Sleep lab</h1><p>Your sleep stages, minute by minute, and how your heart recovered overnight.</p></header>
+
+      {sleep_stats_html}
+
       <div class="row">
         <div class="panel">
-          <div class="pt"><div><h3>Hypnogram (Sleep Cycle Timeline)</h3><p>The exact chronological flow of your sleep stages throughout the night.</p></div></div>
+          <div class="pt"><div><h3>Hypnogram</h3><p>Last night's sleep stages in order. Deeper stages sit lower on the chart.</p></div></div>
           <div id="c_hypno" class="chart" style="height:280px;"></div>
         </div>
       </div>
@@ -1841,7 +1971,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
           <div id="c_slp_hammock" class="chart"></div>
         </div>
         <div class="panel">
-          <div class="pt"><div><h3>Last night's stages</h3><p>Exact timeline of transitions.</p></div></div>
+          <div class="pt"><div><h3>Stage breakdown</h3><p>Time in each stage and every transition.</p></div></div>
           {stage_bar_html}
           <div class="tl-list">{sleep_log_html}</div>
         </div>
@@ -1855,7 +1985,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   const D = {json.dumps(payload)};
   const CIRC = 326.73;
   const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
-  
+
   const getBase = () => JSON.parse(JSON.stringify({{
     paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
     font:{{ color:C.dim, family:'Manrope, -apple-system, sans-serif', size:12 }},
@@ -1873,32 +2003,36 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     if (mm === 60) {{ hh = (hh + 1) % 24; mm = 0; }}
     return ((hh % 12) || 12) + ':' + String(mm).padStart(2, '0') + ' ' + (hh >= 12 ? 'PM' : 'AM');
   }}
-  
   function chip(id, text, color) {{
     const el = document.getElementById(id);
     if (!el) return; el.style.setProperty('--c', color); el.innerHTML = '<span class="dot"></span>' + text; el.hidden = false;
   }}
-  
   function setRing(el, pct, color) {{
     if (!el) return;
     if (color) el.style.setProperty('--c', color);
     const p = isNaN(pct) ? 0 : Math.max(0, Math.min(100, pct));
     el.querySelector('.val').style.strokeDashoffset = CIRC * (1 - p / 100);
   }}
-  
   function fill(el) {{ el.style.setProperty('--p', ((el.value - el.min) / (el.max - el.min) * 100) + '%'); }}
 
   // ---------- HOME ----------
   function renderHome() {{
     const base = getBase();
+    const good = D.quad_colors.filter(c => c === '#10b981').length;
+    if (D.quad_colors.length) chip('chip_quad', Math.round(100 * good / D.quad_colors.length) + '% of readings in your recovered zone', C.energy);
     Plotly.newPlot('c_quad', [{{
       x:D.quad_hrv, y:D.quad_hr, text:D.quad_labels, mode:'markers',
       marker:{{ size:9, color:D.quad_colors, opacity:.85, line:{{ width:1, color:'#11141a' }} }},
       hovertemplate:'%{{text}}<br>HRV <b>%{{x}} ms</b> &middot; HR <b>%{{y}} bpm</b><extra></extra>'
     }}], {{
-      ...base,
-      xaxis:{{ ...base.xaxis, title:{{ text:'Heart Rate Variability (ms) &rarr; Battery Charge' }}, type:'linear' }},
-      yaxis:{{ ...base.yaxis, title:{{ text:'Resting Heart Rate (bpm) &darr; Engine Speed' }}, type:'linear' }}
+      ...base, margin:{{ ...base.margin, t:16 }},
+      xaxis:{{ ...base.xaxis, title:{{ text:'Heart rate variability (ms)  →  more recovered' }}, type:'linear' }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm)  ↓  calmer' }}, type:'linear' }},
+      shapes:[
+        {{ type:'rect', xref:'x', yref:'y', x0:D.mean_hrv, x1:1e5, y0:-1e5, y1:D.mean_hr, fillcolor:'rgba(61,219,176,.06)', line:{{ width:0 }}, layer:'below' }},
+        {{ type:'line', x0:D.mean_hrv, x1:D.mean_hrv, y0:0, y1:1, yref:'paper', line:{{ color:'rgba(255,255,255,.14)', dash:'dash', width:1 }} }},
+        {{ type:'line', x0:0, x1:1, xref:'paper', y0:D.mean_hr, y1:D.mean_hr, line:{{ color:'rgba(255,255,255,.14)', dash:'dash', width:1 }} }}
+      ]
     }}, cfg);
   }}
 
@@ -1910,10 +2044,10 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       {{ x:D.in_ts, y:D.in_hr_exp, mode:'lines', line:{{ color:C.hr, width:2, dash:'dot' }}, name:'Expected for your activity', hovertemplate:'%{{y:.0f}} bpm<extra>Expected</extra>' }},
       {{ x:D.in_ts, y:D.in_hr_raw, mode:'lines', line:{{ color:C.tx, width:2 }}, name:'Actual heart rate', hovertemplate:'%{{y:.0f}} bpm<extra>Actual</extra>' }}
     ], {{
-      ...base, hovermode:'x unified', margin:{{ ...base.margin, r:44 }},
-      xaxis:{{ ...base.xaxis, title:{{ text:'Time of Day' }} }},
-      yaxis:{{ ...base.yaxis, title:{{ text:'Heart Rate (bpm)' }}, type:'linear' }},
-      yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], title:{{ text:'Stress (%)', font:{{color:C.stress, size:11}} }}, showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
+      ...base, hovermode:'x unified', margin:{{ ...base.margin, r:56 }},
+      xaxis:{{ ...base.xaxis, title:{{ text:'Time of day' }} }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm)' }} }},
+      yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], title:{{ text:'Stress (%)', font:{{ color:C.stress, size:11 }} }}, showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
     }}, cfg);
     updateStressSim();
   }}
@@ -1932,9 +2066,16 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     const z_hr = res_hr / 7.5;
     const z_hrv = (Math.log(Math.max(D.mean_hrv, 45)) - Math.log(hrv)) / 0.25;
 
-    let pct = stp >= 180 ? Math.min(35, Math.max(12, 18 + 4 * Math.max(0, z_hr))) : Math.min(98, Math.max(6, 100 / (1 + Math.exp(-1.25 * ((0.6 * z_hr + 0.45 * z_hrv) - 0.35)))));
-    const col = pct >= 68 ? C.stress : (pct >= 42 ? C.warn : C.energy);
+    const moving = stp >= 180;
+    const pct = moving ? Math.min(35, Math.max(12, 18 + 4 * Math.max(0, z_hr))) : Math.min(98, Math.max(6, 100 / (1 + Math.exp(-1.25 * ((0.6 * z_hr + 0.45 * z_hrv) - 0.35)))));
+    const col = moving ? C.hr : (pct >= 68 ? C.stress : (pct >= 42 ? C.warn : C.energy));
+    const tag = moving ? 'Exercise' : (pct >= 68 ? 'High strain' : (pct >= 42 ? 'Moderate arousal' : 'Calm'));
+    const state = moving ? 'You are moving, so a high heart rate is expected and is not counted as stress.'
+      : 'Sitting still. Your heart rate is ' + Math.abs(res_hr).toFixed(0) + ' bpm ' + (res_hr >= 0 ? 'above' : 'below') + ' what your activity explains.';
     document.getElementById('st_ring_n').innerText = Math.round(pct);
+    const t = document.getElementById('st_sim_tag');
+    t.innerText = tag; t.style.setProperty('--c', col);
+    document.getElementById('st_sim_state').innerText = state;
     setRing(document.getElementById('st_ring'), pct, col);
   }}
 
@@ -1952,10 +2093,10 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       traces.push({{ x:[D.b_hours[pi]], y:[D.b_alert[pi]], mode:'markers', marker:{{ size:13, color:C.energy, line:{{ width:3, color:'#11141a' }} }}, name:'Best focus', hoverinfo:'skip' }});
       chip('chip_peak', 'Best focus around ' + clock(D.b_hours[pi]), C.energy);
     }}
-    Plotly.newPlot('c_borbely', traces, {{ 
-      ...base, hovermode:'x unified', 
-      xaxis:{{ ...base.xaxis, title:{{ text:'Hour of Day (24h Clock)' }}, dtick:2, type:'linear' }}, 
-      yaxis:{{ ...base.yaxis, title:{{ text:'Biological Intensity (Scale 1-5)' }}, type:'linear' }} 
+    Plotly.newPlot('c_borbely', traces, {{
+      ...base, hovermode:'x unified',
+      xaxis:{{ ...base.xaxis, title:{{ text:'Hour of day (24h clock)' }}, dtick:2, type:'linear' }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'Biological intensity (scale 1-5)' }}, type:'linear' }}
     }}, cfg);
     updateEnergySim();
   }}
@@ -1966,7 +2107,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     const rhr = parseFloat(document.getElementById('sl_rhr').value);
     const hrv = parseFloat(document.getElementById('sl_hrv').value);
     const wlk = parseFloat(document.getElementById('sl_wlk').value);
-    
+
     document.getElementById('lbl_slp').innerText = slp.toFixed(1) + ' hrs';
     document.getElementById('lbl_rhr').innerText = rhr + ' bpm';
     document.getElementById('lbl_hrv').innerText = hrv + ' ms';
@@ -1975,61 +2116,61 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     const z_vec = [(slp - 7.5)/0.85, 0, (rhr - D.mean_hr + 8)/4.0, (Math.log(hrv) - Math.log(Math.max(D.mean_hrv, 30)))/0.22, (wlk - 50)/25, ((wlk - 50)/25) - 0.25*(((wlk - 50)/25)**2)];
     let dot = 0;
     for (let i = 0; i < D.f_weights.length; i++) dot += z_vec[i] * D.f_weights[i];
-    
+
     const pred_pct = Math.min(99.0, Math.max(10.0, 100.0 / (1.0 + Math.exp(-1.45 * (dot + 1.35)))));
     const col = pred_pct >= 70 ? C.energy : (pred_pct >= 48 ? C.warn : C.stress);
     document.getElementById('sim_out').innerText = Math.round(pred_pct);
+    const t = document.getElementById('en_tag');
+    t.innerText = pred_pct >= 70 ? 'Primed' : (pred_pct >= 48 ? 'Steady' : 'Low reserves');
+    t.style.setProperty('--c', col);
     setRing(document.getElementById('en_ring'), pred_pct, col);
   }}
 
   // ---------- SLEEP ----------
   function renderSleep() {{
     const base = getBase();
-    
+
     Plotly.newPlot('c_slp_hammock', [
       {{ x:D.slp_tau, y:D.slp_hr_mean, mode:'markers', marker:{{ size:6, color:'rgba(255,255,255,.28)' }}, name:'Sleeping heart rate', hovertemplate:'%{{y:.0f}} bpm<extra></extra>' }},
       {{ x:D.slp_tau, y:D.slp_hr_fit, mode:'lines', line:{{ color:C.sleep, width:3, shape:'spline' }}, name:'Hammock curve', hoverinfo:'skip' }},
       {{ x:D.slp_tau, y:D.slp_hrv_mean, yaxis:'y2', mode:'lines+markers', marker:{{ size:5 }}, line:{{ color:C.hr, width:2 }}, name:'HRV', connectgaps:true, hovertemplate:'%{{y:.0f}} ms<extra>HRV</extra>' }}
-    ], {{ 
-      ...base, margin:{{ ...base.margin, r:44 }}, 
-      xaxis:{{ ...base.xaxis, title:{{ text:'Percentage of Night Completed (0.0 to 1.0)' }}, type:'linear' }}, 
-      yaxis:{{ ...base.yaxis, title:{{ text:'Heart Rate (bpm)' }}, type:'linear' }}, 
-      yaxis2:{{ overlaying:'y', side:'right', title:{{ text:'HRV (ms)', font:{{color:C.hr, size:11}} }}, showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }} 
+    ], {{
+      ...base, margin:{{ ...base.margin, r:56 }},
+      xaxis:{{ ...base.xaxis, title:{{ text:'Share of the night completed (0 = bedtime, 1 = wake-up)' }}, type:'linear' }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm)' }}, type:'linear' }},
+      yaxis2:{{ overlaying:'y', side:'right', title:{{ text:'HRV (ms)', font:{{ color:C.hr, size:11 }} }}, showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }}
     }}, cfg);
 
+    const hy = document.getElementById('c_hypno');
     if (!D.stage_blocks || D.stage_blocks.length === 0) {{
-      document.getElementById('c_hypno').innerHTML = `<div style="display:flex; height:100%; align-items:center; justify-content:center; color:#8c95a6; font-size:13.5px; text-align:center; padding:20px;">
-        <div><b style="color:#ef4444; font-size: 15px;">No chronological data found.</b><br><br>Ensure Apple Watch Sleep Focus is tracking stages.</div>
-      </div>`;
-    }} else {{
-      const px = [], py = [], pt = [];
-      const y_map = {{"Awake in Bed": 3, "REM Sleep (Brain & Memory)": 2, "Core Sleep (Light)": 1, "Deep Sleep (Body Repair)": 0}};
-      
-      D.stage_blocks.sort((a, b) => a.start - b.start);
-
-      D.stage_blocks.forEach(b => {{
-          px.push(b.start, b.end);
-          py.push(y_map[b.stage], y_map[b.stage]);
-          const text = `<b>${{b.stage}}</b><br>${{clock(b.start)}} - ${{clock(b.end)}}<br>${{b.dur}} mins`;
-          pt.push(text, text);
-      }});
-
-      const minX = Math.floor(Math.min(...px));
-      const maxX = Math.ceil(Math.max(...px));
-      const ticks = [], ticktext = [];
-      for(let i = minX; i <= maxX; i++) {{
-          ticks.push(i); ticktext.push(clock(i));
-      }}
-
-      Plotly.newPlot('c_hypno', [{{
-          x: px, y: py, text: pt, mode: 'lines', line: {{shape: 'hv', color: '#8f9bff', width: 2.5}},
-          fill: 'tozeroy', fillcolor: 'rgba(143,155,255,0.1)', hoverinfo: 'text'
-      }}], {{
-          ...base, margin: {{...base.margin, l: 50, t: 20, b: 30}},
-          xaxis: {{ ...base.xaxis, title:{{ text:'Exact Time of Night' }}, tickvals: ticks, ticktext: ticktext, type: 'linear' }},
-          yaxis: {{ ...base.yaxis, title:{{ text:'Sleep Depth' }}, tickvals: [0, 1, 2, 3], ticktext: ['Deep', 'Core', 'REM', 'Awake'], range: [-0.5, 3.5], type: 'linear' }}
-      }}, cfg);
+      hy.innerHTML = '<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#8c95a6;font-size:13.5px;text-align:center;padding:20px;"><div><b style="color:#eef1f6;font-size:15px;">' +
+        (D.is_summary_night ? 'Only nightly totals were available.' : 'No sleep stages found.') +
+        '</b><br><br>' + (D.is_summary_night ? 'Pass your raw sleep records (raw_sleep=...) to see the minute-by-minute hypnogram.' : 'Check that your watch recorded sleep and that the sleep data is passed in.') + '</div></div>';
+      return;
     }}
+
+    const order = ['Deep', 'Core', 'REM', 'Awake'];
+    const colors = {{ Deep:'#5b6cff', Core:'#7cc4ff', REM:'#c4a1ff', Awake:'#ff7a6b' }};
+    const traces = order.map(k => {{
+      const bl = D.stage_blocks.filter(b => b.key === k);
+      return {{
+        type:'bar', orientation:'h', name:k, x:bl.map(b => b.x1 - b.x0), base:bl.map(b => b.x0), y:bl.map(() => k),
+        width:0.78, marker:{{ color:colors[k], line:{{ width:0 }} }}, textposition:'none',
+        text:bl.map(b => '<b>' + b.stage + '</b><br>' + clock(b.x0) + ' – ' + clock(b.x1) + '<br>' + b.mins + ' min'),
+        hovertemplate:'%{{text}}<extra></extra>'
+      }};
+    }});
+    const xs0 = D.stage_blocks.map(b => b.x0), xs1 = D.stage_blocks.map(b => b.x1);
+    const minX = Math.floor(Math.min(...xs0)), maxX = Math.ceil(Math.max(...xs1));
+    const step = (maxX - minX) > 10 ? 2 : 1;
+    const ticks = [], ticktext = [];
+    for (let i = minX; i <= maxX; i += step) {{ ticks.push(i); ticktext.push(clock(i)); }}
+
+    Plotly.newPlot('c_hypno', traces, {{
+      ...base, barmode:'overlay', bargap:0, showlegend:false, margin:{{ ...base.margin, t:16, b:40, l:60 }},
+      xaxis:{{ ...base.xaxis, type:'linear', tickvals:ticks, ticktext:ticktext, range:[minX - 0.1, maxX + 0.1], title:{{ text:'Time of night' }} }},
+      yaxis:{{ ...base.yaxis, type:'category', categoryorder:'array', categoryarray:order, title:{{ text:'Sleep stage' }} }}
+    }}, cfg);
   }}
 
   // ---------- NAVIGATION ----------
@@ -2038,12 +2179,11 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   function openTab(name) {{
     if (!RENDER[name]) name = 'home';
     document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.id === 'tab-' + name));
-    document.querySelectorAll('.nav-btn').forEach(el => {{
-      const on = el.dataset.tab === name;
-      el.classList.toggle('active', on);
-    }});
+    document.querySelectorAll('.nav-btn').forEach(el => el.classList.toggle('active', el.dataset.tab === name));
     if (!RENDERED[name]) {{ RENDERED[name] = true; RENDER[name](); }}
     else {{ document.querySelectorAll('#tab-' + name + ' .chart').forEach(el => Plotly.Plots.resize(el)); }}
+    try {{ history.replaceState(null, '', '#' + name); }} catch (e) {{}}
+    window.scrollTo(0, 0);
   }}
 
   document.querySelectorAll('.ring[data-v]').forEach(r => {{
@@ -2057,7 +2197,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     with open("biometric_science_lab.html", "w", encoding="utf-8") as f:
         f.write(html)
-
     abs_path = os.path.abspath(HTML_DASHBOARD)
     print(f"[6/6] Launching Unified 3-Activity Biometric Science Lab: {abs_path}")
     try:
