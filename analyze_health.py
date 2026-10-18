@@ -1481,28 +1481,25 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
     }
 
 # ==============================================================================
-# BIO LAB DASHBOARD BUILDER (Explicit Axis Labels & Hypnogram Fix)
+# BIO LAB DASHBOARD BUILDER (Merciless Purifier + Explicit Axes)
 # Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
 # ==============================================================================
 
 def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle):
     print("[5/6] Building Bio Lab dashboard (Home + Stress + Energy + Sleep)...")
     import json
+    import numpy as np
 
-    # --- 0. MERCILESS DATA PURIFIER ------------------------------------------
+    # --- 0. MERCILESS DATA PURIFIER (NO FAILSAFE) ----------------------------
     if not df_sleep.empty:
         df_sleep = df_sleep.copy()
-        calc_dur = df_sleep['wake_hr'] - df_sleep['onset_hr']
-        calc_dur = np.where(calc_dur < 0, calc_dur + 24.0, calc_dur)
-        df_sleep['is_summary'] = abs(df_sleep['hours'] - calc_dur) > 0.75
+        # Summary blocks falsely share the exact same start and end time across multiple stages.
+        df_sleep['span_id'] = df_sleep['onset_hr'].astype(str) + "_" + df_sleep['wake_hr'].astype(str)
+        span_counts = df_sleep['span_id'].value_counts()
         
-        filtered_dfs = []
-        for d, grp in df_sleep.groupby('date'):
-            if not grp[~grp['is_summary']].empty:
-                filtered_dfs.append(grp[~grp['is_summary']])
-            else:
-                filtered_dfs.append(grp)
-        df_sleep = pd.concat(filtered_dfs) if filtered_dfs else df_sleep
+        # If 3 or more stages (Deep, REM, Core) share the identical time span, destroy them.
+        valid_spans = span_counts[span_counts < 3].index
+        df_sleep = df_sleep[df_sleep['span_id'].isin(valid_spans)].copy()
 
     # --- 1. SLEEP TIMELINE + STAGE BAR ---------------------------------------
     def stage_style(stage):
@@ -1513,12 +1510,10 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     sleep_log_html, stage_bar_html = "", ""
     stage_blocks = []
-    is_summary_night = False
     
     if not df_sleep.empty:
         latest_sleep_date = df_sleep['date'].max()
         recent_sleep = df_sleep[df_sleep['date'] == latest_sleep_date].sort_values("start_epoch")
-        is_summary_night = bool(recent_sleep['is_summary'].all())
         
         totals = {}
         for _, r in recent_sleep.iterrows():
@@ -1533,11 +1528,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
                 "end": r["wake_hr"], "dur": mins
             })
 
-            time_label = "Daily Summary Total" if is_summary_night else f"{st_str} &ndash; {en_str}"
-
             sleep_log_html += f"""
             <div class="tl" style="--c:{col}">
-              <div class="t" style="font-weight: 600;">{time_label}</div>
+              <div class="t" style="font-weight: 600;">{st_str} &ndash; {en_str}</div>
               <div class="ln"><span class="nd"></span></div>
               <div class="d"><b>{r['stage']}</b><span class="mins">{mins} min</span><p>{desc}</p></div>
             </div>"""
@@ -1547,7 +1540,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         leg = "".join(f"<span><span class='dot' style='--c:{stage_style(s)[0]}'></span>{s} <b>{int(round(h * 60))} min</b></span>" for s, h in totals.items())
         stage_bar_html = f"<div class='stagebar'>{seg}</div><div class='legend'>{leg}</div>"
     else:
-        sleep_log_html = "<div class='empty'>No sleep stages recorded last night. Ensure Sleep Focus is active.</div>"
+        sleep_log_html = "<div class='empty'>No chronological data survived the Purifier.</div>"
 
     # --- 2. DATA TABLE + STRESS EPISODES -------------------------------------
     table_html = ""
@@ -1599,16 +1592,13 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         "b_hours": pred_bundle["hours_grid"], "b_alert": pred_bundle["alertness_curve"],
         "b_adeno": pred_bundle["adenosine_curve"], "b_circ": pred_bundle["circadian_curve"],
         "st_dates": stress_bundle["daily_dates"], "st_like": stress_bundle["daily_likelihood"],
-        "st_ci_up": stress_bundle["daily_ci_upper"], "st_ci_dn": stress_bundle["daily_ci_lower"],
-        "st_anom": stress_bundle["daily_anomaly"],
         "in_ts": stress_bundle["intraday_ts"], "in_hr_raw": stress_bundle["intraday_hr_raw"],
         "in_hr_exp": stress_bundle["intraday_hr_exp"], "in_stress": stress_bundle["intraday_stress"],
         "in_state": stress_bundle["intraday_state"],
         "slp_tau": sleep_bundle["hammock_tau_x"], "slp_hr_mean": sleep_bundle["hammock_hr_mean"],
         "slp_hr_fit": sleep_bundle["hammock_hr_fitted"], "slp_hrv_mean": sleep_bundle["hammock_hrv_mean"],
         "f_weights": pred_bundle["feature_weights"],
-        "stage_blocks": stage_blocks,
-        "is_summary_night": is_summary_night
+        "stage_blocks": stage_blocks
     }
 
     # --- 4. HTML CONSTRUCTION --------------------------------------------------
@@ -1823,6 +1813,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     <section id="tab-sleep" class="tab">
       <header class="ph"><h1>Sleep lab</h1><p>Precise mapping of your sleep architecture and recovery.</p></header>
       
+      <!-- Hypnogram Row -->
       <div class="row">
         <div class="panel">
           <div class="pt"><div><h3>Hypnogram (Sleep Cycle Timeline)</h3><p>The exact chronological flow of your sleep stages throughout the night.</p></div></div>
@@ -1992,9 +1983,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       yaxis2:{{ overlaying:'y', side:'right', title:{{ text:'HRV (ms)', font:{{color:C.hr, size:11}} }}, showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }} 
     }}, cfg);
 
-    if (D.is_summary_night || !D.stage_blocks || D.stage_blocks.length === 0) {{
+    if (!D.stage_blocks || D.stage_blocks.length === 0) {{
       document.getElementById('c_hypno').innerHTML = `<div style="display:flex; height:100%; align-items:center; justify-content:center; color:#8c95a6; font-size:13.5px; text-align:center; padding:20px;">
-        <div><b style="color:#eef1f6; font-size: 15px;">Chronological data missing.</b><br><br>The payload only contained total durations (summary mode), not the minute-by-minute breakdown.</div>
+        <div><b style="color:#ef4444; font-size: 15px;">Server Missing Raw Data</b><br><br>The Data Purifier successfully destroyed the fake summary blocks, but your server memory contains no raw blocks to replace them. You likely need to redeploy the updated main.py file.</div>
       </div>`;
     }} else {{
       const px = [], py = [], pt = [];
