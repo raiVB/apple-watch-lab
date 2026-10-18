@@ -1481,7 +1481,7 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
     }
 
 # ==============================================================================
-# BIO LAB DASHBOARD BUILDER (Hypnogram & 1970-Axis Fix)
+# BIO LAB DASHBOARD BUILDER (Hypnogram & Data Purifier Fix)
 # Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
 # ==============================================================================
 
@@ -1490,11 +1490,20 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     import json
 
     # --- 0. DATA PURIFIER ----------------------------------------------------
-    # Filter out fake aggregated "summary" blocks injected by Apple Health.
-    # Real chronological intervals have epoch spans that match their stated duration.
+    # Safely filter out fake aggregated "summary" blocks injected by Apple Health.
+    # Real chronological intervals have an 'hours' value that mathematically matches their timestamps.
     if not df_sleep.empty:
-        df_sleep['epoch_dur_hrs'] = (df_sleep['end_epoch'] - df_sleep['start_epoch']) * 300 / 3600.0
-        df_sleep = df_sleep[abs(df_sleep['hours'] - df_sleep['epoch_dur_hrs']) < 0.5].copy()
+        orig_sleep = df_sleep.copy()
+        calc_dur = df_sleep['wake_hr'] - df_sleep['onset_hr']
+        calc_dur = np.where(calc_dur < 0, calc_dur + 24.0, calc_dur) # Handle midnight wrap
+        
+        # Keep rows where the recorded duration matches the timestamp duration (within 45 mins tolerance)
+        valid_mask = abs(df_sleep['hours'] - calc_dur) <= 0.75
+        df_sleep = df_sleep[valid_mask].copy()
+        
+        # Failsafe: If everything was somehow dropped, revert to original
+        if df_sleep.empty:
+            df_sleep = orig_sleep
 
     # --- 1. SLEEP TIMELINE + STAGE BAR ---------------------------------------
     def stage_style(stage):
@@ -1842,7 +1851,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   const CIRC = 326.73;
   const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
   
-  // FIX 1: Deep clone to stop axis settings bleeding across charts
   const getBase = () => JSON.parse(JSON.stringify({{
     paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
     font:{{ color:C.dim, family:'Manrope, -apple-system, sans-serif', size:12 }},
@@ -1884,7 +1892,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       hovertemplate:'%{{text}}<br>HRV <b>%{{x}} ms</b> &middot; HR <b>%{{y}} bpm</b><extra></extra>'
     }}], {{
       ...base,
-      // FIX 2: Explicitly force linear types so 1970 never shows up
       xaxis:{{ ...base.xaxis, title:{{ text:'HRV (ms): higher is more recovered' }}, type:'linear' }},
       yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm): lower is calmer' }}, type:'linear' }}
     }}, cfg);
@@ -1939,7 +1946,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       traces.push({{ x:[D.b_hours[pi]], y:[D.b_alert[pi]], mode:'markers', marker:{{ size:13, color:C.energy, line:{{ width:3, color:'#11141a' }} }}, name:'Best focus', hoverinfo:'skip' }});
       chip('chip_peak', 'Best focus around ' + clock(D.b_hours[pi]), C.energy);
     }}
-    // FIX 2: Explicitly force linear types so 1970 never shows up
     Plotly.newPlot('c_borbely', traces, {{ ...base, hovermode:'x unified', xaxis:{{ ...base.xaxis, title:{{ text:'Hour of day' }}, dtick:2, type:'linear' }}, yaxis:{{ ...base.yaxis, type:'linear' }} }}, cfg);
     updateEnergySim();
   }}
@@ -1982,10 +1988,16 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       const px = [], py = [], pt = [];
       const y_map = {{"Awake in Bed": 3, "REM Sleep (Brain & Memory)": 2, "Core Sleep (Light)": 1, "Deep Sleep (Body Repair)": 0}};
       
+      // Sort to correctly handle the midnight overlap (before 4 PM = next day logic)
+      D.stage_blocks.sort((a, b) => {{
+          let sa = a.start < 16 ? a.start + 24 : a.start;
+          let sb = b.start < 16 ? b.start + 24 : b.start;
+          return sa - sb;
+      }});
+
       D.stage_blocks.forEach(b => {{
-          let s = b.start; let e = b.end;
-          if (s < 12) s += 24;
-          if (e < 12) e += 24;
+          let s = b.start < 16 ? b.start + 24 : b.start;
+          let e = b.end < 16 ? b.end + 24 : b.end;
           
           px.push(s, e);
           py.push(y_map[b.stage], y_map[b.stage]);
@@ -1993,8 +2005,10 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
           pt.push(text, text);
       }});
 
+      const minX = Math.floor(Math.min(...px));
+      const maxX = Math.ceil(Math.max(...px));
       const ticks = [], ticktext = [];
-      for(let i = Math.floor(px[0]); i <= Math.ceil(px[px.length-1]); i++) {{
+      for(let i = minX; i <= maxX; i++) {{
           ticks.push(i); ticktext.push(clock(i));
       }}
 
@@ -2003,7 +2017,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
           fill: 'tozeroy', fillcolor: 'rgba(143,155,255,0.1)', hoverinfo: 'text'
       }}], {{
           ...base, margin: {{...base.margin, l: 50, t: 20, b: 30}},
-          // FIX 2: Explicitly lock the axes so it treats the hours as literal numbers, not dates
           xaxis: {{ ...base.xaxis, tickvals: ticks, ticktext: ticktext, type: 'linear' }},
           yaxis: {{ ...base.yaxis, tickvals: [0, 1, 2, 3], ticktext: ['Deep', 'Core', 'REM', 'Awake'], range: [-0.5, 3.5], type: 'linear' }}
       }}, cfg);
@@ -2035,7 +2048,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     with open("biometric_science_lab.html", "w", encoding="utf-8") as f:
         f.write(html)
-
 
 
     abs_path = os.path.abspath(HTML_DASHBOARD)
