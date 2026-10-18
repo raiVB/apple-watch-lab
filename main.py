@@ -9,6 +9,7 @@ app = FastAPI()
 
 stored_records = []
 stored_sleep = []
+stored_sleep_raw = []  # Added: Stores pure Apple Watch JSON for the hypnogram
 
 METRIC_MAP = {
     "heart_rate": "HeartRate",
@@ -83,6 +84,10 @@ async def receive_health_data(request: Request):
 
         if "sleep" in clean_key:
             for item in group.get("data", []):
+                # Save pure untouched JSON for the new dashboard builder
+                stored_sleep_raw.append(item)
+                
+                # Maintain the old format for the Stress and Energy backend engines
                 if any(k in item for k in ("deep", "rem", "core", "asleep")):
                     d_str = str(item.get("date") or item.get("sleepEnd") or "")[:10]
                     s_start = str(item.get("sleepStart") or f"{d_str} 00:30:00")[:19]
@@ -212,9 +217,10 @@ async def serve_cockpit():
     if stored_sleep:
         df_sleep = pd.DataFrame(stored_sleep).drop_duplicates()
     else:
-        df_sleep = pd.DataFrame(
-            columns=["date", "stage", "hours", "onset_hr", "wake_hr", "start_epoch", "end_epoch"]
-        )
+        df_sleep = pd.DataFrame(columns=["date", "stage", "hours", "onset_hr", "wake_hr", "start_epoch", "end_epoch"])
+        
+    # Convert pure untouched JSON sleep blocks into a dataframe
+    df_raw_sleep = pd.DataFrame(stored_sleep_raw) if stored_sleep_raw else None
 
     log_df = pd.DataFrame(columns=[
         "date", "energy_morning", "energy_afternoon", "energy_evening",
@@ -232,7 +238,10 @@ async def serve_cockpit():
 
     sleep_bundle["diary_rows"] = clean_nans(sleep_bundle["diary_rows"])
 
-    analyze_health.build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle)
+    # Pass the untouched raw_sleep data directly into the new dashboard builder
+    analyze_health.build_dashboard(
+        df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=df_raw_sleep
+    )
 
     with open("biometric_science_lab.html", "r", encoding="utf-8") as f:
         return f.read()
