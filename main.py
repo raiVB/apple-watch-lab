@@ -1,165 +1,157 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-import pandas as pd
-import numpy as np
-import math
 import os
+import math
+import time
+import secrets
+import tempfile
+import threading
+import traceback
+from datetime import datetime, timedelta
+
 import certifi
-from pymongo import MongoClient, UpdateOne
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi.responses import HTMLResponse
+from pymongo import MongoClient
+
 import analyze_health
+import ingest
 
 app = FastAPI()
 
-# Connect to MongoDB if MONGO_URI is set in Render Environment
+# ------------------------------------------------------------------------------
+# Render environment variables
+#   MONGO_URI       required
+#   WEBHOOK_TOKEN   optional. If set, every URL needs ?token=<value>
+#   DASH_DAYS       optional, default 90. How many days the dashboard loads (keeps RAM low)
+# ------------------------------------------------------------------------------
 MONGO_URI = os.getenv("MONGO_URI")
-if MONGO_URI:
-    # Uses certifi to fix the SSL handshake crash, and a 5s timeout to prevent freezing
-    client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
-    db = client.biolab
-    use_db = True
-else:
-    use_db = False
-    stored_records = []
-    stored_sleep = []
-    stored_sleep_raw = []
+if not MONGO_URI:
+    raise RuntimeError("Set MONGO_URI in the Render Environment tab.")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
+DASH_DAYS = int(os.getenv("DASH_DAYS", "90"))
 
-METRIC_MAP = {
-    "heart_rate": "HeartRate", "heartrate": "HeartRate",
-    "heart_rate_variability": "HeartRateVariabilitySDNN", "heartratevariability": "HeartRateVariabilitySDNN",
-    "resting_heart_rate": "RestingHeartRate", "restingheartrate": "RestingHeartRate",
-    "step_count": "StepCount", "stepcount": "StepCount",
-    "walking_running_distance": "DistanceWalkingRunning", "distance_walking_running": "DistanceWalkingRunning",
-    "apple_exercise_time": "AppleExerciseTime", "exercise_time": "AppleExerciseTime",
-}
+client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=8000)
+db = client.biolab
 
-STAGE_MAP = {
-    "deep": "Deep Sleep (Body Repair)",
-    "rem": "REM Sleep (Brain & Memory)",
-    "core": "Core Sleep (Light)",
-    "asleep": "Core Sleep (Light)",
-    "unspecified": "Core Sleep (Light)",
-    "awake": "Awake in Bed",
-}
+LOCK = threading.Lock()  # only one upload is processed at a time, so RAM never stacks up
+STATUS = {"last_upload": None, "ok": None, "detail": None, "seconds": None}
+INDEXES = {"ready": False, "error": None}
+
+
+def ensure_indexes_once():
+    if INDEXES["ready"]:
+        return
+    try:
+        ingest.ensure_indexes(db)
+        INDEXES.update(ready=True, error=None)
+    except Exception as e:
+        INDEXES["error"] = str(e)
+        print("INDEX PROBLEM:", e)
+
+
+ensure_indexes_once()
+
+
+def check_token(request: Request):
+    if WEBHOOK_TOKEN and not secrets.compare_digest(request.query_params.get("token", ""), WEBHOOK_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 
 def clean_nans(obj):
-    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)): return None
-    if isinstance(obj, dict): return {k: clean_nans(v) for k, v in obj.items()}
-    if isinstance(obj, list): return [clean_nans(x) for x in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: clean_nans(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [clean_nans(x) for x in obj]
     return obj
 
+
+def process_file(path: str, size: int):
+    """Runs after the HTTP response is sent. Streams the saved file, never loads it whole."""
+    with LOCK:
+        t0 = time.time()
+        try:
+            ensure_indexes_once()
+            ing = ingest.Ingestor()
+            ingest.ingest_file(path, ing)
+            detail = ingest.write(db, ing)
+            detail["upload_mb"] = round(size / 1024 / 1024, 1)
+            STATUS.update(ok=True, detail=detail)
+        except Exception as e:
+            traceback.print_exc()
+            STATUS.update(ok=False, detail=repr(e))
+        finally:
+            STATUS.update(last_upload=datetime.utcnow().isoformat(timespec="seconds") + "Z", seconds=round(time.time() - t0, 1))
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 @app.post("/webhook")
-async def receive_health_data(request: Request):
-    payload = await request.json()
-    data_block = payload.get("data", payload)
-    metrics = data_block.get("metrics", [])
+async def receive_health_data(request: Request, background: BackgroundTasks):
+    check_token(request)
+    # 1) Save the upload to disk piece by piece (flat memory, however big it is).
+    fd, path = tempfile.mkstemp(suffix=".json")
+    size = 0
+    with os.fdopen(fd, "wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+            size += len(chunk)
+    # 2) Answer the iPhone right away; the parsing happens in the background.
+    background.add_task(process_file, path, size)
+    return {"status": "accepted", "bytes": size}
 
-    new_records, new_sleep, new_sleep_raw = [], [], []
 
-    for group in metrics:
-        raw_name = str(group.get("name", "")).strip()
-        clean_key = raw_name.lower().replace(" ", "_")
-        unit = str(group.get("units", ""))
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-        if "sleep" in clean_key:
-            for item in group.get("data", []):
-                new_sleep_raw.append(item)
-                
-                if any(k in item for k in ("deep", "rem", "core", "asleep")):
-                    d_str = str(item.get("date") or item.get("sleepEnd") or "")[:10]
-                    s_start = str(item.get("sleepStart") or f"{d_str} 00:30:00")[:19]
-                    s_end = str(item.get("sleepEnd") or f"{d_str} 07:30:00")[:19]
-                    try:
-                        s_dt, e_dt = pd.to_datetime(s_start), pd.to_datetime(s_end)
-                        s_hr = s_dt.hour + s_dt.minute / 60.0
-                        if s_hr < 14.0: s_hr += 24.0
-                        e_hr = e_dt.hour + e_dt.minute / 60.0
-                        s_ep, e_ep = int(s_dt.timestamp() // 300), int(e_dt.timestamp() // 300)
 
-                        for stg_key, stg_label in [("deep", "Deep Sleep (Body Repair)"), ("rem", "REM Sleep (Brain & Memory)"), ("core", "Core Sleep (Light)"), ("awake", "Awake in Bed")]:
-                            hrs = float(item.get(stg_key) or 0.0)
-                            if hrs > 16.0: hrs /= 60.0
-                            if hrs > 0:
-                                new_sleep.append({
-                                    "date": d_str, "stage": stg_label, "hours": hrs,
-                                    "onset_hr": s_hr, "wake_hr": e_hr,
-                                    "start_epoch": s_ep, "end_epoch": e_ep,
-                                })
-                    except Exception:
-                        continue
-                else:
-                    s_str = str(item.get("startDate") or item.get("date") or "")[:19]
-                    e_str = str(item.get("endDate") or s_str)[:19]
-                    raw_stage = str(item.get("value") or item.get("stage") or "core").lower()
-                    stg_label = next((v for k, v in STAGE_MAP.items() if k in raw_stage), "Core Sleep (Light)")
-                    try:
-                        s_dt, e_dt = pd.to_datetime(s_str), pd.to_datetime(e_str)
-                        dur = (e_dt - s_dt).total_seconds() / 3600.0
-                        if dur <= 0: dur = float(item.get("qty") or 0.0)
-                        if 0 < dur < 16:
-                            s_hr = s_dt.hour + s_dt.minute / 60.0
-                            if s_hr < 14.0: s_hr += 24.0
-                            e_hr = e_dt.hour + e_dt.minute / 60.0
-                            new_sleep.append({
-                                "date": e_str[:10], "stage": stg_label, "hours": dur,
-                                "onset_hr": s_hr, "wake_hr": e_hr,
-                                "start_epoch": int(s_dt.timestamp() // 300),
-                                "end_epoch": int(e_dt.timestamp() // 300),
-                            })
-                    except Exception:
-                        continue
-            continue
+@app.get("/stats")
+def stats(request: Request):
+    check_token(request)
+    db_stats = db.command("dbstats")
+    return {
+        "last_ingest": STATUS,
+        "indexes": INDEXES,
+        "records": db.records.estimated_document_count(),
+        "sleep_rows": db.sleep.estimated_document_count(),
+        "sleep_raw_rows": db.sleep_raw.estimated_document_count(),
+        "storage_mb": round(db_stats.get("storageSize", 0) / 1024 / 1024, 1),
+    }
 
-        target_metric = METRIC_MAP.get(clean_key, raw_name)
-        for item in group.get("data", []):
-            val = next((item.get(k) for k in ("qty", "Avg", "avg", "value", "Value", "Min", "min") if item.get(k) is not None), None)
-            date_str = item.get("date") or item.get("startDate")
-            if val is not None and date_str:
-                try:
-                    val = float(val)
-                    dt = pd.to_datetime(str(date_str)[:19])
-                    new_records.append({
-                        "metric": target_metric, "timestamp": dt.strftime("%Y-%m-%d %H:%M:%S"),
-                        "date": dt.strftime("%Y-%m-%d"), "hour": round(dt.hour + dt.minute / 60.0, 2),
-                        "epoch_5m": int(dt.timestamp() // 300), "value": val, "unit": unit,
-                    })
-                except Exception:
-                    continue
 
-    if use_db:
-        if new_records:
-            db.records.bulk_write([UpdateOne({"metric": r["metric"], "timestamp": r["timestamp"]}, {"$set": r}, upsert=True) for r in new_records], ordered=False)
-        if new_sleep:
-            db.sleep.bulk_write([UpdateOne({"date": r["date"], "stage": r["stage"], "start_epoch": r["start_epoch"]}, {"$set": r}, upsert=True) for r in new_sleep], ordered=False)
-        if new_sleep_raw:
-            db.sleep_raw.bulk_write([UpdateOne({"startDate": r.get("startDate", r.get("start")), "value": r.get("value")}, {"$set": r}, upsert=True) for r in new_sleep_raw if r.get("startDate") or r.get("start")], ordered=False)
-    else:
-        stored_records.extend(new_records)
-        stored_sleep.extend(new_sleep)
-        stored_sleep_raw.extend(new_sleep_raw)
+def _waiting_page(msg):
+    return ("<html><body style='background:#0b0f19;color:#38bdf8;font-family:sans-serif;padding:32px;'>"
+            "<h2>Biometric Cloud Engine Ready</h2>"
+            f"<p style='color:#94a3b8;'>{msg}</p>"
+            f"<p style='color:#10b981;'>Last upload: {STATUS['last_upload']} (ok: {STATUS['ok']})</p>"
+            "</body></html>")
 
-    return {"status": "success", "records_processed": len(new_records), "sleep_processed": len(new_sleep)}
 
 @app.get("/", response_class=HTMLResponse)
-def serve_cockpit():  # Removed async to prevent the server from hanging
-    if use_db:
-        all_records = list(db.records.find({}, {"_id": 0}))
-        all_sleep = list(db.sleep.find({}, {"_id": 0}))
-        all_sleep_raw = list(db.sleep_raw.find({}, {"_id": 0}))
-    else:
-        all_records, all_sleep, all_sleep_raw = stored_records, stored_sleep, stored_sleep_raw
+def serve_cockpit(request: Request):
+    check_token(request)
+    latest = db.records.find_one({}, {"date": 1, "_id": 0}, sort=[("date", -1)])
+    if not latest:
+        return _waiting_page("No data yet. Send an export from your iPhone.")
 
-    if len(all_records) < 5:
-        return (
-            "<html><body style='background:#0b0f19;color:#38bdf8;font-family:sans-serif;padding:32px;'>"
-            "<h2>Biometric Cloud Engine Ready</h2>"
-            f"<p style='color:#10b981;'>Database Active: {use_db}</p>"
-            "<p style='color:#94a3b8;'>Please push an initial sync from your iPhone.</p>"
-            "</body></html>"
-        )
+    # Only the most recent DASH_DAYS days are loaded, so RAM stays small however big the database grows.
+    cutoff = (datetime.strptime(latest["date"], "%Y-%m-%d") - timedelta(days=DASH_DAYS)).strftime("%Y-%m-%d")
+    recs = list(db.records.find({"date": {"$gte": cutoff}}, {"_id": 0}))
+    if len(recs) < 5:
+        return _waiting_page(f"Only {len(recs)} records so far.")
+    df_raw = pd.DataFrame(recs).sort_values("timestamp", kind="stable").reset_index(drop=True)
+    del recs
 
-    df_raw = pd.DataFrame(all_records).drop_duplicates(subset=["metric", "timestamp", "value"])
-    df_sleep = pd.DataFrame(all_sleep).drop_duplicates() if all_sleep else pd.DataFrame(columns=["date", "stage", "hours", "onset_hr", "wake_hr", "start_epoch", "end_epoch"])
-    df_raw_sleep = pd.DataFrame(all_sleep_raw) if all_sleep_raw else None
+    sleep_rows = list(db.sleep.find({"date": {"$gte": cutoff}}, {"_id": 0}))
+    df_sleep = pd.DataFrame(sleep_rows).drop_duplicates() if sleep_rows else pd.DataFrame(
+        columns=["date", "stage", "hours", "onset_hr", "wake_hr", "start_epoch", "end_epoch"])
+    raw_rows = list(db.sleep_raw.find({"d": {"$gte": cutoff}}, {"_id": 0}))
+    df_raw_sleep = pd.DataFrame(raw_rows) if raw_rows else None
 
     log_df = pd.DataFrame(columns=[
         "date", "energy_morning", "energy_afternoon", "energy_evening",
@@ -170,7 +162,6 @@ def serve_cockpit():  # Removed async to prevent the server from hanging
     stress_bundle = analyze_health.compute_stress_detective_engine(df_raw, df_sleep, [], log_df)
     pred_bundle = analyze_health.compute_energy_predictor_engine(df_raw, df_sleep, log_df)
     sleep_bundle = analyze_health.compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle, pred_bundle)
-
     sleep_bundle["diary_rows"] = clean_nans(sleep_bundle["diary_rows"])
 
     analyze_health.build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=df_raw_sleep)
