@@ -1547,48 +1547,51 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         out["mins"] = (out["end"] - out["start"]).dt.total_seconds() / 60.0
         return out if not out.empty else None
 
-    def to_segments(d):
+    def to_segments(d):  # raw records: start / end / value
         cols = {str(c).lower(): c for c in d.columns}
         pick = lambda *names: next((cols[n.lower()] for n in names if n.lower() in cols), None)
         c_s, c_e, c_v = pick("start", "startDate"), pick("end", "endDate"), pick("value", "stage", "category")
         if not (c_s and c_e and c_v): return None
+        s_dt = pd.to_datetime(d[c_s].astype(str).str[:19], errors="coerce")
+        e_dt = pd.to_datetime(d[c_e].astype(str).str[:19], errors="coerce")
         out = pd.DataFrame({
             "key": d[c_v].map(stage_key),
-            "start": pd.to_datetime(d[c_s].astype(str).str[:19], errors="coerce"),
-            "end": pd.to_datetime(d[c_e].astype(str).str[:19], errors="coerce"),
+            "start": s_dt,
+            "end": e_dt,
         })
-        out["summary"] = False
+        c_q = pick("qty", "hours")
+        if c_q:
+            span_hrs = (e_dt - s_dt).dt.total_seconds() / 3600.0
+            qty_hrs = pd.to_numeric(d[c_q], errors="coerce").fillna(span_hrs)
+            out["summary"] = (span_hrs - qty_hrs).abs() > 0.75
+        else:
+            out["summary"] = False
         return out
 
-    def from_nightly(d):
+    def from_nightly(d):  # fallback: df_sleep (date / stage / hours / onset_hr / wake_hr)
         if not {"date", "onset_hr", "wake_hr", "hours", "stage"} <= set(d.columns): return None
         d = d.sort_values("start_epoch") if "start_epoch" in d.columns else d.copy()
-        
-        # BULLETPROOF FIX: Use explicit epochs if available to sidestep timezone grouping bugs
-        if "start_epoch" in d.columns and "end_epoch" in d.columns:
-            start = pd.to_datetime(d["start_epoch"], unit="s", utc=True)
-            end = pd.to_datetime(d["end_epoch"], unit="s", utc=True)
-        else:
-            on = d["onset_hr"].astype(float)
-            day = pd.to_datetime(d["date"].astype(str).str[:10], errors="coerce")
-            wrap = on.groupby(d["date"]).transform(lambda s: (s.diff() < -12).cumsum())
-            start = day + pd.to_timedelta(on + wrap * 24.0, unit="h")
-            end = start + pd.to_timedelta(d["hours"].astype(float), unit="h")
-            
-        out = pd.DataFrame({"key": d["stage"].map(stage_key), "start": start, "end": end})
-        
-        # BULLETPROOF FIX: Any block longer than 4.0 hours for a single stage is a fake Apple Summary block
-        out["summary"] = d["hours"].astype(float) > 4.0
+        on = d["onset_hr"].astype(float)
+        day = pd.to_datetime(d["date"].astype(str).str[:10], errors="coerce")
+        # onset_hr in main.py already has +24 added for times after midnight (< 14.0)
+        on_mod = on % 24.0
+        start = day + pd.to_timedelta(on_mod, unit="h")
+        # If onset was before midnight (>= 14.0), shift date back by 1 day relative to wake date
+        start = np.where(on >= 14.0, start, start - pd.Timedelta(days=1))
+        start = pd.to_datetime(start)
+        gap = d["wake_hr"].astype(float) - on_mod
+        dur = np.where(gap < 0, gap + 24.0, gap)
+        out = pd.DataFrame({
+            "key": d["stage"].map(stage_key),
+            "start": start,
+            "end": start + pd.to_timedelta(d["hours"].astype(float), unit="h")
+        })
+        out["summary"] = (d["hours"].astype(float) - dur).abs().values > 0.75
         return out
 
     def pick_night(seg):
-        # Force drop summary blocks if detailed chronological blocks (>4 rows) exist
         real = seg[~seg["summary"]]
-        if not real.empty and len(real) >= 4:
-            seg = real.sort_values("start").reset_index(drop=True)
-        else:
-            seg = seg.sort_values("start").reset_index(drop=True)
-            
+        seg = (real if not real.empty else seg).sort_values("start").reset_index(drop=True)
         prev_end = seg["end"].cummax().shift(1)
         seg["sess"] = ((seg["start"] - prev_end) > pd.Timedelta(hours=2.5)).cumsum()
         asleep = seg[seg["key"] != "Awake"].groupby("sess")["mins"].sum()
@@ -1601,9 +1604,15 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         seg = None
         for label, cand in (("raw_sleep", load_records(raw_sleep)), ("df_sleep", df_sleep)):
             if seg is not None or cand is None or len(cand) == 0: continue
-            seg = finish(to_segments(cand))
-            if seg is None: seg = finish(from_nightly(cand))
-            if seg is not None: src_label = label
+            tmp = finish(to_segments(cand))
+            if tmp is None: tmp = finish(from_nightly(cand))
+            if tmp is not None and not tmp[~tmp["summary"]].empty:
+                seg = tmp
+                src_label = label
+                break
+            elif seg is None and tmp is not None:
+                seg = tmp
+                src_label = label
         if seg is not None: night = pick_night(seg)
     except Exception as e:
         print(f"      sleep ingest failed: {e!r}")
@@ -1648,9 +1657,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
             tiles += [("Bedtime", clk(night["x0"].min())), ("Wake-up", clk(night["x1"].max()))]
         tiles += [("Time asleep", hm(asleep_min)), ("Deep + REM", f"{deep_rem_pct:.0f}% of sleep")]
         sleep_stats_html = "<div class='row'><div class='stats'>" + "".join(f"<div class='stat'><span>{t}</span><b>{v}</b></div>" for t, v in tiles) + "</div></div>"
-
     else:
-        sleep_log_html = "<div class='empty'>No sleep stages found for your latest night. Make sure your watch recorded sleep, and that raw_sleep or df_sleep is passed in.</div>"
+        sleep_log_html = "<div class='empty'>No sleep stages found for your latest night.</div>"
 
     # --- 2. DATA TABLE + STRESS EPISODES -------------------------------------
     table_html = ""
@@ -1702,6 +1710,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         "b_hours": pred_bundle["hours_grid"], "b_alert": pred_bundle["alertness_curve"],
         "b_adeno": pred_bundle["adenosine_curve"], "b_circ": pred_bundle["circadian_curve"],
         "st_dates": stress_bundle["daily_dates"], "st_like": stress_bundle["daily_likelihood"],
+        "st_ci_up": stress_bundle["daily_ci_upper"], "st_ci_dn": stress_bundle["daily_ci_lower"],
+        "st_anom": stress_bundle["daily_anomaly"],
         "in_ts": stress_bundle["intraday_ts"], "in_hr_raw": stress_bundle["intraday_hr_raw"],
         "in_hr_exp": stress_bundle["intraday_hr_exp"], "in_stress": stress_bundle["intraday_stress"],
         "in_state": stress_bundle["intraday_state"],
@@ -1750,8 +1760,12 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .main {{ padding:44px 48px 72px; max-width:1240px; width:100%; }}
   .tab {{ display:none; }}
   .tab.active {{ display:block; }}
+  .ph {{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap; }}
   .ph h1 {{ font-size:32px; font-weight:800; margin:0 0 6px; letter-spacing:-.025em; }}
   .ph p {{ color:var(--dim); margin:0; max-width:60ch; }}
+
+  .up-btn {{ background:var(--s2); border:1px solid var(--line); color:var(--tx); padding:10px 16px; border-radius:12px; font-size:13px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:8px; }}
+  .up-btn:hover {{ border-color:var(--sleep); }}
 
   .hero {{ display:grid; grid-template-columns:repeat(3,1fr); margin-top:28px; padding:40px 12px; background:var(--s1); border:1px solid var(--line); border-radius:28px; }}
   .hero .m {{ display:flex; flex-direction:column; align-items:center; text-align:center; gap:16px; padding:0 20px; }}
@@ -1873,7 +1887,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   <main class="main">
     <!-- HOME -->
     <section id="tab-home" class="tab active">
-      <header class="ph"><h1>Today</h1><p>Your body at a glance, built from your Apple Watch data.</p></header>
+      <header class="ph"><div><h1>Today</h1><p>Your body at a glance, built from your Apple Watch data.</p></div></header>
       <div class="hero">
         <div class="m" style="--c:{pred_bundle['badge_color']}">
           <div class="ring" data-v="{pred_bundle['readiness_score']}"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span>{pred_bundle['readiness_score']}</span><small>%</small></div></div>
@@ -1906,7 +1920,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     <!-- STRESS -->
     <section id="tab-stress" class="tab">
-      <header class="ph"><h1>Stress detective</h1><p>Tells stress apart from exercise by checking what your heart rate should be for how much you moved.</p></header>
+      <header class="ph"><div><h1>Stress detective</h1><p>Tells stress apart from exercise by checking what your heart rate should be for how much you moved.</p></div></header>
       <div class="row r2">
         <div class="panel">
           <div class="pt"><div><h3>Heart rate in context</h3><p>Actual vs. expected heart rate, with the stress score behind it.</p></div></div>
@@ -1933,7 +1947,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     <!-- ENERGY -->
     <section id="tab-energy" class="tab">
-      <header class="ph"><h1>Energy predictor</h1><p>When your focus peaks today.</p></header>
+      <header class="ph"><div><h1>Energy predictor</h1><p>When your focus peaks today.</p></div></header>
       <div class="row r2">
         <div class="panel">
           <div class="pt"><div><h3>Your daily energy curve</h3><p>Focus prediction (1 to 5), plus the two forces behind it.</p></div><span id="chip_peak" class="chip" hidden></span></div>
@@ -1955,7 +1969,13 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     <!-- SLEEP -->
     <section id="tab-sleep" class="tab">
-      <header class="ph"><h1>Sleep lab</h1><p>Your sleep stages, minute by minute, and how your heart recovered overnight.</p></header>
+      <header class="ph">
+        <div><h1>Sleep lab</h1><p>Your sleep stages, minute by minute, and how your heart recovered overnight.</p></div>
+        <label class="up-btn">
+          <span id="up_txt">Upload raw .json file</span>
+          <input type="file" accept=".json,application/json" hidden onchange="uploadJsonFile(this)">
+        </label>
+      </header>
 
       {sleep_stats_html}
 
@@ -1986,6 +2006,30 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   const D = {json.dumps(payload)};
   const CIRC = 326.73;
   const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
+
+  async function uploadJsonFile(input) {{
+    const file = input.files && input.files[0];
+    if (!file) return;
+    const lbl = document.getElementById('up_txt');
+    lbl.innerText = 'Uploading...';
+    try {{
+      const text = await file.text();
+      const res = await fetch('/webhook', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: text
+      }});
+      if (res.ok) {{
+        lbl.innerText = 'Success! Reloading...';
+        location.hash = '#sleep';
+        location.reload();
+      }} else {{
+        lbl.innerText = 'Upload failed';
+      }}
+    }} catch (e) {{
+      lbl.innerText = 'Error uploading JSON';
+    }}
+  }}
 
   const getBase = () => JSON.parse(JSON.stringify({{
     paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
@@ -2145,8 +2189,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     const hy = document.getElementById('c_hypno');
     if (!D.stage_blocks || D.stage_blocks.length === 0) {{
       hy.innerHTML = '<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#8c95a6;font-size:13.5px;text-align:center;padding:20px;"><div><b style="color:#eef1f6;font-size:15px;">' +
-        (D.is_summary_night ? 'Only nightly totals were available.' : 'No sleep stages found.') +
-        '</b><br><br>' + (D.is_summary_night ? 'Pass your raw sleep records (raw_sleep=...) to see the minute-by-minute hypnogram.' : 'Check that your watch recorded sleep and that the sleep data is passed in.') + '</div></div>';
+        (D.is_summary_night ? 'Only nightly totals were sent by your iPhone webhook.' : 'No sleep stages found.') +
+        '</b><br><br>Click <b>"Upload raw .json file"</b> at the top-right of this page and select the .json file on your laptop to load the minute-by-minute hypnogram immediately.</div></div>';
       return;
     }}
 
