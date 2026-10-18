@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import math
 import os
+import certifi
 from pymongo import MongoClient, UpdateOne
 import analyze_health
 
@@ -12,7 +13,8 @@ app = FastAPI()
 # Connect to MongoDB if MONGO_URI is set in Render Environment
 MONGO_URI = os.getenv("MONGO_URI")
 if MONGO_URI:
-    client = MongoClient(MONGO_URI)
+    # Uses certifi to fix the SSL handshake crash, and a 5s timeout to prevent freezing
+    client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
     db = client.biolab
     use_db = True
 else:
@@ -123,9 +125,6 @@ async def receive_health_data(request: Request):
                 except Exception:
                     continue
 
-    # -------------------------------------------------------------------------
-    # BULK UPSERT: Securely stores data in MongoDB and inherently blocks duplicates
-    # -------------------------------------------------------------------------
     if use_db:
         if new_records:
             db.records.bulk_write([UpdateOne({"metric": r["metric"], "timestamp": r["timestamp"]}, {"$set": r}, upsert=True) for r in new_records], ordered=False)
@@ -141,7 +140,7 @@ async def receive_health_data(request: Request):
     return {"status": "success", "records_processed": len(new_records), "sleep_processed": len(new_sleep)}
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_cockpit():
+def serve_cockpit():  # Removed async to prevent the server from hanging
     if use_db:
         all_records = list(db.records.find({}, {"_id": 0}))
         all_sleep = list(db.sleep.find({}, {"_id": 0}))
