@@ -1481,7 +1481,7 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
     }
 
 # ==============================================================================
-# BIO LAB DASHBOARD BUILDER (Hypnogram & Data Purifier Fix)
+# BIO LAB DASHBOARD BUILDER (Intelligent Data Purifier & Hypnogram Fix)
 # Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
 # ==============================================================================
 
@@ -1490,20 +1490,22 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     import json
 
     # --- 0. DATA PURIFIER ----------------------------------------------------
-    # Safely filter out fake aggregated "summary" blocks injected by Apple Health.
-    # Real chronological intervals have an 'hours' value that mathematically matches their timestamps.
+    # Safely separates chronological raw intervals from fake aggregated summary blocks.
     if not df_sleep.empty:
-        orig_sleep = df_sleep.copy()
+        df_sleep = df_sleep.copy()
         calc_dur = df_sleep['wake_hr'] - df_sleep['onset_hr']
-        calc_dur = np.where(calc_dur < 0, calc_dur + 24.0, calc_dur) # Handle midnight wrap
+        calc_dur = np.where(calc_dur < 0, calc_dur + 24.0, calc_dur)
+        # If the duration of the stage doesn't match the start/end timestamps, it's a summary block
+        df_sleep['is_summary'] = abs(df_sleep['hours'] - calc_dur) > 0.75
         
-        # Keep rows where the recorded duration matches the timestamp duration (within 45 mins tolerance)
-        valid_mask = abs(df_sleep['hours'] - calc_dur) <= 0.75
-        df_sleep = df_sleep[valid_mask].copy()
-        
-        # Failsafe: If everything was somehow dropped, revert to original
-        if df_sleep.empty:
-            df_sleep = orig_sleep
+        filtered_dfs = []
+        for d, grp in df_sleep.groupby('date'):
+            # Prefer chronological intervals. Only fall back to summaries if no intervals exist.
+            if not grp[~grp['is_summary']].empty:
+                filtered_dfs.append(grp[~grp['is_summary']])
+            else:
+                filtered_dfs.append(grp)
+        df_sleep = pd.concat(filtered_dfs) if filtered_dfs else df_sleep
 
     # --- 1. SLEEP TIMELINE + STAGE BAR ---------------------------------------
     def stage_style(stage):
@@ -1514,10 +1516,13 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     sleep_log_html, stage_bar_html = "", ""
     stage_blocks = []
+    is_summary_night = False
     
     if not df_sleep.empty:
         latest_sleep_date = df_sleep['date'].max()
         recent_sleep = df_sleep[df_sleep['date'] == latest_sleep_date].sort_values("start_epoch")
+        is_summary_night = bool(recent_sleep['is_summary'].all())
+        
         totals = {}
         for _, r in recent_sleep.iterrows():
             st_str = hour_to_clock_str(r["onset_hr"])
@@ -1531,9 +1536,11 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
                 "end": r["wake_hr"], "dur": mins
             })
 
+            time_label = "Daily Summary Total" if is_summary_night else f"{st_str} &ndash; {en_str}"
+
             sleep_log_html += f"""
             <div class="tl" style="--c:{col}">
-              <div class="t">{st_str} &ndash; {en_str}</div>
+              <div class="t" style="font-weight: 600;">{time_label}</div>
               <div class="ln"><span class="nd"></span></div>
               <div class="d"><b>{r['stage']}</b><span class="mins">{mins} min</span><p>{desc}</p></div>
             </div>"""
@@ -1543,7 +1550,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         leg = "".join(f"<span><span class='dot' style='--c:{stage_style(s)[0]}'></span>{s} <b>{int(round(h * 60))} min</b></span>" for s, h in totals.items())
         stage_bar_html = f"<div class='stagebar'>{seg}</div><div class='legend'>{leg}</div>"
     else:
-        sleep_log_html = "<div class='empty'>No chronological stages recorded last night. Ensure Sleep Focus is active.</div>"
+        sleep_log_html = "<div class='empty'>No sleep stages recorded last night. Ensure Sleep Focus is active.</div>"
 
     # --- 2. DATA TABLE + STRESS EPISODES -------------------------------------
     table_html = ""
@@ -1600,14 +1607,11 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         "in_ts": stress_bundle["intraday_ts"], "in_hr_raw": stress_bundle["intraday_hr_raw"],
         "in_hr_exp": stress_bundle["intraday_hr_exp"], "in_stress": stress_bundle["intraday_stress"],
         "in_state": stress_bundle["intraday_state"],
-        "c_names": stress_bundle["contrib_names"], "c_z": stress_bundle["contrib_z"],
-        "c_colors": stress_bundle["contrib_colors"], "c_roles": stress_bundle["contrib_roles"],
         "slp_tau": sleep_bundle["hammock_tau_x"], "slp_hr_mean": sleep_bundle["hammock_hr_mean"],
         "slp_hr_fit": sleep_bundle["hammock_hr_fitted"], "slp_hrv_mean": sleep_bundle["hammock_hrv_mean"],
-        "eff_names": sleep_bundle["effect_names"], "eff_g_slp": sleep_bundle["effect_g_sleep"],
-        "eff_g_eng": sleep_bundle["effect_g_energy"], "eff_cols": sleep_bundle["effect_colors"],
         "f_weights": pred_bundle["feature_weights"],
         "stage_blocks": stage_blocks,
+        "is_summary_night": is_summary_night
     }
 
     # --- 4. HTML CONSTRUCTION --------------------------------------------------
@@ -1851,6 +1855,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   const CIRC = 326.73;
   const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
   
+  // Safe deep clone to stop axis settings from mutating across charts
   const getBase = () => JSON.parse(JSON.stringify({{
     paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
     font:{{ color:C.dim, family:'Manrope, -apple-system, sans-serif', size:12 }},
@@ -1983,12 +1988,15 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       {{ x:D.slp_tau, y:D.slp_hrv_mean, yaxis:'y2', mode:'lines+markers', marker:{{ size:5 }}, line:{{ color:C.hr, width:2 }}, name:'HRV', connectgaps:true, hovertemplate:'%{{y:.0f}} ms<extra>HRV</extra>' }}
     ], {{ ...base, margin:{{ ...base.margin, r:44 }}, xaxis:{{ ...base.xaxis, type:'linear' }}, yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }}, type:'linear' }}, yaxis2:{{ overlaying:'y', side:'right', showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }} }}, cfg);
 
-    // 2. Render Chronological Hypnogram
-    if (D.stage_blocks && D.stage_blocks.length > 0) {{
+    // 2. Safely Render Hypnogram or Fallback Message
+    if (D.is_summary_night || !D.stage_blocks || D.stage_blocks.length === 0) {{
+      document.getElementById('c_hypno').innerHTML = `<div style="display:flex; height:100%; align-items:center; justify-content:center; color:#8c95a6; font-size:13.5px; text-align:center; padding:20px;">
+        <div><b style="color:#eef1f6; font-size: 15px;">Chronological data missing.</b><br><br>The payload only contained total durations (summary mode), not the minute-by-minute breakdown.</div>
+      </div>`;
+    }} else {{
       const px = [], py = [], pt = [];
       const y_map = {{"Awake in Bed": 3, "REM Sleep (Brain & Memory)": 2, "Core Sleep (Light)": 1, "Deep Sleep (Body Repair)": 0}};
       
-      // Sort to correctly handle the midnight overlap (before 4 PM = next day logic)
       D.stage_blocks.sort((a, b) => {{
           let sa = a.start < 16 ? a.start + 24 : a.start;
           let sb = b.start < 16 ? b.start + 24 : b.start;
