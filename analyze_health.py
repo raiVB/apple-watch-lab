@@ -926,7 +926,7 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
     else:
         valid_train = pd.DataFrame()
 
-    if len(valid_train) >= 2:
+ if len(valid_train) >= 2:
         X = valid_train[feature_cols].to_numpy(dtype=float)
         y = valid_train["mean_energy"].to_numpy(dtype=float) - 3.2
         I_mat = np.eye(len(beta_0))
@@ -936,7 +936,7 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
         beta_map = beta_0.copy()
         model_mode = f"Biophysical Prior Mode (Log 2+ days in {LOG_CSV} to adapt personal ML weights)"
 
- X_all = df_feat[feature_cols].to_numpy(dtype=float)
+    X_all = df_feat[feature_cols].to_numpy(dtype=float)
     raw_pred_centered = X_all @ beta_map
     
     # SCIENTIFIC REFINEMENT: The Homeostatic Intercept
