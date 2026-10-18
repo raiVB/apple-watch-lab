@@ -1481,7 +1481,7 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
     }
 
 # ==============================================================================
-# BIO LAB DASHBOARD BUILDER (Oura / Whoop-style redesign)
+# BIO LAB DASHBOARD BUILDER (Oura / Whoop-style redesign with Hypnogram)
 # Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
 # ==============================================================================
 
@@ -1497,24 +1497,40 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         return "#7cc4ff", "Light sleep that links deep and REM cycles."
 
     sleep_log_html, stage_bar_html = "", ""
+    stage_blocks = []
+    
     if not df_sleep.empty:
         latest_sleep_date = df_sleep['date'].max()
+        # Sort chronologically by start epoch
         recent_sleep = df_sleep[df_sleep['date'] == latest_sleep_date].sort_values("start_epoch")
         totals = {}
+        
         for _, r in recent_sleep.iterrows():
             st_str = hour_to_clock_str(r["onset_hr"])
             en_str = hour_to_clock_str(r["wake_hr"])
             mins = int(round(r['hours'] * 60))
             col, desc = stage_style(r['stage'])
             totals[r['stage']] = totals.get(r['stage'], 0) + r['hours']
+            
+            # Save blocks for the JS Hypnogram chart
+            stage_blocks.append({
+                "stage": r["stage"],
+                "start": r["onset_hr"],
+                "end": r["wake_hr"],
+                "dur": mins
+            })
+
             sleep_log_html += f"""
             <div class="tl" style="--c:{col}">
               <div class="t">{st_str} &ndash; {en_str}</div>
               <div class="ln"><span class="nd"></span></div>
               <div class="d"><b>{r['stage']}</b><span class="mins">{mins} min</span><p>{desc}</p></div>
             </div>"""
-        total_h = sum(totals.values()) or 1
-        seg = "".join(f"<i style='width:{h / total_h * 100:.1f}%;--c:{stage_style(s)[0]}' title='{s}'></i>" for s, h in totals.items())
+            
+        total_h = sum(r['hours'] for _, r in recent_sleep.iterrows()) or 1
+        
+        # Build chronological visual progress bar instead of grouped totals
+        seg = "".join(f"<i style='width:{r['hours'] / total_h * 100:.2f}%;--c:{stage_style(r['stage'])[0]}' title='{r['stage']} ({int(round(r['hours']*60))} min)'></i>" for _, r in recent_sleep.iterrows())
         leg = "".join(f"<span><span class='dot' style='--c:{stage_style(s)[0]}'></span>{s} <b>{int(round(h * 60))} min</b></span>" for s, h in totals.items())
         stage_bar_html = f"<div class='stagebar'>{seg}</div><div class='legend'>{leg}</div>"
     else:
@@ -1581,6 +1597,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         "eff_names": sleep_bundle["effect_names"], "eff_g_slp": sleep_bundle["effect_g_sleep"],
         "eff_g_eng": sleep_bundle["effect_g_energy"], "eff_cols": sleep_bundle["effect_colors"],
         "f_weights": pred_bundle["feature_weights"],
+        "stage_blocks": stage_blocks,
     }
 
     # --- 4. HTML CONSTRUCTION --------------------------------------------------
@@ -1602,15 +1619,15 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   }}
   * {{ box-sizing:border-box; }}
   html {{ color-scheme:dark; }}
-  body {{ margin:0; background:var(--bg); color:var(--tx); font-family:'Manrope',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; line-height:1.55; -webkit-font-smoothing:antialiased; font-variant-numeric:tabular-nums; }}
+  body {{ margin:0; background:var(--bg); color:var(--tx); font-family:'Manrope',-apple-system,sans-serif; line-height:1.55; font-variant-numeric:tabular-nums; }}
   button, input {{ font-family:inherit; }}
   button:focus-visible, input:focus-visible, summary:focus-visible {{ outline:2px solid var(--hr); outline-offset:3px; }}
 
   .shell {{ display:grid; grid-template-columns:232px minmax(0,1fr); min-height:100vh; }}
   .nav {{ position:sticky; top:0; height:100vh; padding:28px 14px; border-right:1px solid var(--line); display:flex; flex-direction:column; gap:4px; }}
-  .brand {{ display:flex; align-items:center; gap:10px; font-weight:800; font-size:17px; letter-spacing:-.01em; padding:0 12px 28px; }}
+  .brand {{ display:flex; align-items:center; gap:10px; font-weight:800; font-size:17px; padding:0 12px 28px; }}
   .nav-btn {{ display:flex; align-items:center; gap:12px; width:100%; background:none; border:0; color:var(--dim); font-size:14px; font-weight:600; padding:11px 12px; border-radius:12px; cursor:pointer; text-align:left; }}
-  .nav-btn svg {{ width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; flex:none; }}
+  .nav-btn svg {{ width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:1.8; flex:none; }}
   .nav-btn:hover {{ color:var(--tx); }}
   .nav-btn.active {{ background:var(--s2); color:var(--tx); }}
   .nav-btn[data-tab=home].active svg {{ stroke:var(--hr); }}
@@ -1621,7 +1638,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .main {{ padding:44px 48px 72px; max-width:1240px; width:100%; }}
   .tab {{ display:none; }}
   .tab.active {{ display:block; }}
-  .ph h1 {{ font-size:32px; font-weight:800; letter-spacing:-.025em; margin:0 0 6px; }}
+  .ph h1 {{ font-size:32px; font-weight:800; margin:0 0 6px; }}
   .ph p {{ color:var(--dim); margin:0; max-width:60ch; }}
 
   .hero {{ display:grid; grid-template-columns:repeat(3,1fr); margin-top:28px; padding:40px 12px; background:var(--s1); border:1px solid var(--line); border-radius:28px; }}
@@ -1634,8 +1651,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .ring svg {{ width:100%; height:100%; transform:rotate(-90deg); }}
   .ring circle {{ fill:none; stroke-width:8; }}
   .ring .trk {{ stroke:rgba(255,255,255,.07); }}
-  .ring .val {{ stroke:var(--c); stroke-linecap:round; stroke-dasharray:326.73; stroke-dashoffset:326.73; transition:stroke-dashoffset 1.3s cubic-bezier(.2,.8,.2,1), stroke .4s; filter:drop-shadow(0 0 6px color-mix(in srgb, var(--c) 45%, transparent)); }}
-  .ring .ctr {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:46px; font-weight:800; letter-spacing:-.03em; }}
+  .ring .val {{ stroke:var(--c); stroke-linecap:round; stroke-dasharray:326.73; stroke-dashoffset:326.73; transition:stroke-dashoffset 1.3s cubic-bezier(.2,.8,.2,1); filter:drop-shadow(0 0 6px color-mix(in srgb, var(--c) 45%, transparent)); }}
+  .ring .ctr {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:46px; font-weight:800; }}
   .ring .ctr small {{ font-size:18px; font-weight:600; color:var(--dim); margin-left:2px; }}
   .ring.sm {{ width:104px; height:104px; }}
   .ring.sm .ctr {{ font-size:28px; }}
@@ -1646,57 +1663,41 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .chip {{ display:inline-flex; align-items:center; gap:8px; padding:6px 12px; border-radius:99px; font-size:12.5px; font-weight:600; color:var(--c); background:color-mix(in srgb, var(--c) 14%, transparent); }}
   .chip[hidden] {{ display:none; }}
   .dot {{ display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--c); margin-right:6px; flex:none; }}
-  .chip .dot {{ margin:0; }}
 
   .row {{ display:grid; gap:20px; margin-top:20px; }}
   .r2 {{ grid-template-columns:minmax(0,1.55fr) minmax(0,1fr); }}
   .panel {{ background:var(--s1); border:1px solid var(--line); border-radius:22px; padding:26px; min-width:0; }}
   .pt {{ display:flex; justify-content:space-between; align-items:flex-start; gap:14px; flex-wrap:wrap; margin-bottom:12px; }}
-  .pt h3 {{ margin:0; font-size:17px; font-weight:700; letter-spacing:-.01em; }}
+  .pt h3 {{ margin:0; font-size:17px; font-weight:700; }}
   .pt p {{ margin:2px 0 0; font-size:13px; color:var(--dim); max-width:56ch; }}
   .chart {{ width:100%; height:360px; }}
 
   details.how {{ margin-top:22px; background:var(--s1); border:1px solid var(--line); border-radius:16px; padding:0 22px; }}
-  .how summary {{ cursor:pointer; padding:15px 0; font-weight:700; font-size:14px; list-style:none; display:flex; justify-content:space-between; align-items:center; }}
-  .how summary::-webkit-details-marker {{ display:none; }}
-  .how summary::after {{ content:'+'; color:var(--dim); font-size:20px; font-weight:500; }}
-  .how[open] summary::after {{ content:'−'; }}
+  .how summary {{ cursor:pointer; padding:15px 0; font-weight:700; font-size:14px; display:flex; justify-content:space-between; align-items:center; }}
   .how p {{ color:var(--dim); font-size:14.5px; max-width:75ch; margin:0 0 14px; }}
-  .how .rule {{ color:var(--tx); font-weight:600; font-size:13.5px; padding:2px 0 2px 14px; margin:0 0 20px; border-left:3px solid var(--rc, var(--hr)); }}
 
-  .search {{ background:var(--s2); border:1px solid var(--line); border-radius:12px; color:var(--tx); padding:9px 14px; font-size:13px; width:240px; max-width:100%; }}
+  .search {{ background:var(--s2); border:1px solid var(--line); border-radius:12px; color:var(--tx); padding:9px 14px; font-size:13px; width:240px; }}
   .scroll {{ overflow:auto; max-height:460px; }}
   .tbl {{ width:100%; border-collapse:collapse; font-size:13.5px; min-width:720px; }}
   .tbl th {{ position:sticky; top:0; background:var(--s1); text-align:left; font-weight:600; color:var(--faint); font-size:12px; padding:10px 14px; border-bottom:1px solid var(--line); }}
-  .tbl td {{ padding:15px 14px; border-bottom:1px solid var(--line); vertical-align:top; }}
-  .tbl tr:last-child td {{ border-bottom:0; }}
+  .tbl td {{ padding:15px 14px; border-bottom:1px solid var(--line); }}
   .tbl .cat {{ font-size:12px; color:var(--hr); }}
-  .tbl .rng {{ color:var(--hr); white-space:nowrap; }}
-  .tbl .mean {{ color:var(--dim); font-size:13px; max-width:360px; }}
 
   .ctl {{ margin-bottom:22px; }}
   .ctl .top {{ display:flex; justify-content:space-between; font-size:13.5px; color:var(--dim); margin-bottom:10px; }}
   .ctl .top b {{ color:var(--tx); font-weight:700; }}
-  input[type=range] {{ -webkit-appearance:none; appearance:none; width:100%; height:6px; border-radius:99px; margin:0; background:linear-gradient(to right, var(--ac,var(--energy)) var(--p,50%), rgba(255,255,255,.09) var(--p,50%)); }}
-  input[type=range]::-webkit-slider-thumb {{ -webkit-appearance:none; width:20px; height:20px; border-radius:50%; background:#fff; border:0; box-shadow:0 2px 8px rgba(0,0,0,.5); cursor:pointer; }}
-  input[type=range]::-moz-range-thumb {{ width:20px; height:20px; border-radius:50%; background:#fff; border:0; cursor:pointer; }}
-  .chips {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:22px; }}
-  .chips button {{ background:var(--s2); border:1px solid var(--line); color:var(--tx); border-radius:99px; padding:7px 14px; font-size:12.5px; font-weight:600; cursor:pointer; }}
-  .chips button:hover {{ background:#202530; }}
-  .res {{ display:flex; align-items:center; gap:20px; padding-top:22px; margin-top:4px; border-top:1px solid var(--line); }}
-  .res .state {{ font-size:13.5px; color:var(--dim); margin-top:6px; }}
-
-  .ep {{ display:grid; grid-template-columns:180px 84px 1fr 1fr; gap:18px; padding:18px 0; border-top:1px solid var(--line); font-size:13.5px; align-items:start; }}
-  .ep:first-child {{ border-top:0; }}
+  input[type=range] {{ -webkit-appearance:none; width:100%; height:6px; border-radius:99px; background:linear-gradient(to right, var(--ac,var(--energy)) var(--p,50%), rgba(255,255,255,.09) var(--p,50%)); }}
+  input[type=range]::-webkit-slider-thumb {{ -webkit-appearance:none; width:20px; height:20px; border-radius:50%; background:#fff; cursor:pointer; }}
+  
+  .ep {{ display:grid; grid-template-columns:180px 84px 1fr 1fr; gap:18px; padding:18px 0; border-top:1px solid var(--line); font-size:13.5px; }}
   .ep .sub {{ font-size:12px; color:var(--dim); margin-top:2px; }}
   .ep .hyp {{ color:var(--sleep); }}
   .empty {{ padding:28px 0; color:var(--dim); font-size:14px; }}
-  .empty.good {{ color:var(--energy); }}
 
   .stagebar {{ display:flex; gap:3px; height:14px; border-radius:99px; overflow:hidden; }}
   .stagebar i {{ display:block; background:var(--c); }}
   .legend {{ display:flex; flex-wrap:wrap; gap:6px 20px; margin:14px 0 26px; font-size:12.5px; color:var(--dim); }}
-  .legend b {{ color:var(--tx); }}
+  
   .tl {{ display:grid; grid-template-columns:118px 14px 1fr; gap:14px; }}
   .tl .t {{ text-align:right; font-size:12px; color:var(--dim); padding-top:2px; }}
   .tl .ln {{ position:relative; display:flex; justify-content:center; }}
@@ -1708,37 +1709,14 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .tl .mins {{ color:var(--dim); font-size:12px; margin-left:8px; }}
   .tl .d p {{ margin:2px 0 0; font-size:12.5px; color:var(--faint); }}
   .tl-list {{ max-height:420px; overflow-y:auto; padding-right:8px; }}
-
-  @media (max-width:980px) {{ .r2 {{ grid-template-columns:1fr; }} .ep {{ grid-template-columns:1fr; gap:6px; }} }}
-  @media (max-width:860px) {{
-    .shell {{ grid-template-columns:1fr; }}
-    .nav {{ position:fixed; top:auto; bottom:0; left:0; right:0; height:auto; flex-direction:row; justify-content:space-around; gap:0; padding:8px 8px calc(8px + env(safe-area-inset-bottom,0px)); background:rgba(10,12,16,.92); backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px); border-right:0; border-top:1px solid var(--line); z-index:50; }}
-    .brand {{ display:none; }}
-    .nav-btn {{ flex-direction:column; gap:4px; font-size:11px; padding:8px 4px; justify-content:center; align-items:center; text-align:center; background:none !important; }}
-    .main {{ padding:calc(24px + env(safe-area-inset-top,0px)) 16px 110px; }}
-    .ph h1 {{ font-size:26px; }}
-    .hero {{ padding:26px 4px; border-radius:22px; }}
-    .hero .m {{ padding:0 6px; gap:10px; }}
-    .hero .m p {{ display:none; }}
-    .hero h2 {{ font-size:13px; }}
-    .ring {{ width:92px; height:92px; }}
-    .ring .ctr {{ font-size:25px; }}
-    .ring .ctr small {{ font-size:11px; }}
-    .ring.sm {{ width:92px; height:92px; }}
-    .badge {{ font-size:11px; padding:3px 9px; }}
-    .panel {{ padding:20px 16px; border-radius:18px; }}
-    .chart {{ height:300px; }}
-    .tl {{ grid-template-columns:92px 14px 1fr; gap:10px; }}
-  }}
-  @media (prefers-reduced-motion:reduce) {{ * {{ transition:none !important; animation:none !important; }} }}
 </style>
 </head>
 <body>
 <div class="shell">
 
-  <nav class="nav" aria-label="Sections">
+  <nav class="nav">
     <div class="brand">
-      <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><circle cx="13" cy="13" r="10" fill="none" stroke="#252b38" stroke-width="3"/><circle cx="13" cy="13" r="10" fill="none" stroke="#3ddbb0" stroke-width="3" stroke-linecap="round" stroke-dasharray="44 63" transform="rotate(-90 13 13)"/></svg>
+      <svg width="26" height="26" viewBox="0 0 26 26"><circle cx="13" cy="13" r="10" fill="none" stroke="#252b38" stroke-width="3"/><circle cx="13" cy="13" r="10" fill="none" stroke="#3ddbb0" stroke-width="3" stroke-dasharray="44 63" transform="rotate(-90 13 13)"/></svg>
       Bio Lab
     </div>
     <button class="nav-btn active" data-tab="home" onclick="openTab('home')"><svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>Today</button>
@@ -1748,70 +1726,34 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   </nav>
 
   <main class="main">
-
     <!-- HOME -->
     <section id="tab-home" class="tab active">
-      <header class="ph">
-        <h1>Today</h1>
-        <p>Your body at a glance, built from your Apple Watch data.</p>
-      </header>
-
-      <div class="hero" role="group" aria-label="Today's scores">
+      <header class="ph"><h1>Today</h1><p>Your body at a glance, built from your Apple Watch data.</p></header>
+      <div class="hero">
         <div class="m" style="--c:{pred_bundle['badge_color']}">
-          <div class="ring" data-v="{pred_bundle['readiness_score']}">
-            <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg>
-            <div class="ctr"><span>{pred_bundle['readiness_score']}</span><small>%</small></div>
-          </div>
-          <div><h2>Energy readiness</h2><p>How ready you are to focus today</p></div>
-          <span class="badge">{pred_bundle['readiness_label']}</span>
+          <div class="ring" data-v="{pred_bundle['readiness_score']}"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span>{pred_bundle['readiness_score']}</span><small>%</small></div></div>
+          <div><h2>Energy readiness</h2><p>How ready you are to focus today</p></div><span class="badge">{pred_bundle['readiness_label']}</span>
         </div>
         <div class="m" style="--c:{stress_bundle['stress_color']}">
-          <div class="ring" data-v="{stress_bundle['today_likelihood']}">
-            <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg>
-            <div class="ctr"><span>{stress_bundle['today_likelihood']}</span><small>%</small></div>
-          </div>
-          <div><h2>Stress load</h2><p>Heart rate not explained by movement</p></div>
-          <span class="badge">{stress_bundle['stress_label']}</span>
+          <div class="ring" data-v="{stress_bundle['today_likelihood']}"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span>{stress_bundle['today_likelihood']}</span><small>%</small></div></div>
+          <div><h2>Stress load</h2><p>Heart rate not explained by movement</p></div><span class="badge">{stress_bundle['stress_label']}</span>
         </div>
         <div class="m" style="--c:{sleep_bundle['quality_color']}">
-          <div class="ring" data-v="{sleep_bundle['latest_quality']}">
-            <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg>
-            <div class="ctr"><span>{sleep_bundle['latest_quality']}</span><small>%</small></div>
-          </div>
-          <div><h2>Sleep recovery</h2><p>How well last night repaired you</p></div>
-          <span class="badge">{sleep_bundle['quality_label']}</span>
+          <div class="ring" data-v="{sleep_bundle['latest_quality']}"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span>{sleep_bundle['latest_quality']}</span><small>%</small></div></div>
+          <div><h2>Sleep recovery</h2><p>How well last night repaired you</p></div><span class="badge">{sleep_bundle['quality_label']}</span>
         </div>
       </div>
-
-      <details class="how">
-        <summary>How to read these scores</summary>
-        <p>Think of your body as a hybrid car. Heart rate is engine speed. Heart rate variability (HRV) is battery charge. This dashboard checks whether your engine is revving safely or burning out.</p>
-      </details>
-
       <div class="row">
         <div class="panel">
-          <div class="pt">
-            <div>
-              <h3>Battery vs. engine</h3>
-              <p>Each dot is one reading. Higher HRV means a more charged battery. Lower heart rate means a calmer engine.</p>
-            </div>
-            <span id="chip_quad" class="chip" hidden></span>
-          </div>
+          <div class="pt"><div><h3>Battery vs. engine</h3><p>Higher HRV means a more charged battery. Lower heart rate means a calmer engine.</p></div><span id="chip_quad" class="chip" hidden></span></div>
           <div id="c_quad" class="chart"></div>
         </div>
       </div>
-
       <div class="row">
         <div class="panel">
-          <div class="pt">
-            <div><h3>Your Apple Watch data, explained</h3><p>Your latest and average value for each sensor, next to a healthy baseline.</p></div>
-            <input class="search" type="search" placeholder="Search sensors" aria-label="Search sensors" oninput="filterRows(this.value)">
-          </div>
+          <div class="pt"><div><h3>Your Apple Watch data, explained</h3><p>Latest values vs. healthy baselines.</p></div></div>
           <div class="scroll">
-            <table class="tbl">
-              <thead><tr><th>Sensor</th><th>Latest</th><th>Average</th><th>Healthy baseline</th><th>What it means</th></tr></thead>
-              <tbody id="param_body">{table_html}</tbody>
-            </table>
+            <table class="tbl"><thead><tr><th>Sensor</th><th>Latest</th><th>Average</th><th>Healthy baseline</th><th>What it means</th></tr></thead><tbody id="param_body">{table_html}</tbody></table>
           </div>
         </div>
       </div>
@@ -1819,48 +1761,23 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     <!-- STRESS -->
     <section id="tab-stress" class="tab">
-      <header class="ph">
-        <h1>Stress detective</h1>
-        <p>Tells stress apart from exercise by checking what your heart rate should be for how much you moved.</p>
-      </header>
-
-      <details class="how" style="--rc:var(--stress)">
-        <summary>How this works</summary>
-        <p>If your heart beats at 115 bpm while you climb stairs, that is normal. At 115 bpm while you sit still at a desk, something else is going on. The algorithm subtracts the heart rate your steps explain. What is left over is non-metabolic: it comes from mental stress, caffeine, poor recovery, or illness.</p>
-        <p class="rule">Healthy pattern: your actual heart rate stays close to the expected line.</p>
-      </details>
-
+      <header class="ph"><h1>Stress detective</h1><p>Tells stress apart from exercise mathematically.</p></header>
       <div class="row r2">
         <div class="panel">
-          <div class="pt">
-            <div><h3>Heart rate in context</h3><p>Actual vs. expected heart rate, with the stress score behind it.</p></div>
-            <span id="chip_stress" class="chip" hidden></span>
-          </div>
+          <div class="pt"><div><h3>Heart rate in context</h3><p>Actual vs. expected heart rate, with the stress score behind it.</p></div></div>
           <div id="c_st_intra" class="chart"></div>
         </div>
         <div class="panel" style="--ac:var(--stress)">
-          <div class="pt"><div><h3>Try a scenario</h3><p>See how the math separates a brisk walk from a racing mind on the couch.</p></div></div>
-          <div class="chips">
-            <button onclick="preset('walk')">Brisk walk</button>
-            <button onclick="preset('calm')">Calm at desk</button>
-            <button onclick="preset('panic')">Racing mind</button>
-          </div>
-          <div class="ctl"><div class="top"><span>Heart rate</span><b id="st_lbl_hr">112 bpm</b></div><input type="range" id="st_sl_hr" min="55" max="165" step="1" value="112" oninput="updateStressSim()" aria-label="Heart rate"></div>
-          <div class="ctl"><div class="top"><span>Steps in 5 minutes</span><b id="st_lbl_stp">20 steps</b></div><input type="range" id="st_sl_stp" min="0" max="600" step="20" value="20" oninput="updateStressSim()" aria-label="Steps in 5 minutes"></div>
-          <div class="ctl"><div class="top"><span>HRV</span><b id="st_lbl_hrv">34 ms</b></div><input type="range" id="st_sl_hrv" min="15" max="110" step="1" value="34" oninput="updateStressSim()" aria-label="HRV"></div>
+          <div class="pt"><div><h3>Try a scenario</h3><p>See how the math works.</p></div></div>
+          <div class="ctl"><div class="top"><span>Heart rate</span><b id="st_lbl_hr">112 bpm</b></div><input type="range" id="st_sl_hr" min="55" max="165" step="1" value="112" oninput="updateStressSim()"></div>
+          <div class="ctl"><div class="top"><span>Steps in 5 minutes</span><b id="st_lbl_stp">20 steps</b></div><input type="range" id="st_sl_stp" min="0" max="600" step="20" value="20" oninput="updateStressSim()"></div>
+          <div class="ctl"><div class="top"><span>HRV</span><b id="st_lbl_hrv">34 ms</b></div><input type="range" id="st_sl_hrv" min="15" max="110" step="1" value="34" oninput="updateStressSim()"></div>
           <div class="res">
-            <div class="ring sm" id="st_ring" style="--c:var(--stress)">
-              <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg>
-              <div class="ctr"><span id="st_ring_n">84</span><small>%</small></div>
-            </div>
-            <div>
-              <span id="st_sim_tag" class="badge" style="--c:var(--stress)">High strain</span>
-              <div id="st_sim_state" class="state"></div>
-            </div>
+            <div class="ring sm" id="st_ring" style="--c:var(--stress)"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span id="st_ring_n">84</span><small>%</small></div></div>
+            <div><span id="st_sim_tag" class="badge" style="--c:var(--stress)">High strain</span><div id="st_sim_state" class="state"></div></div>
           </div>
         </div>
       </div>
-
       <div class="row">
         <div class="panel">
           <div class="pt"><div><h3>Detected stress spikes</h3><p>Moments your heart rate rose without movement to explain it.</p></div></div>
@@ -1871,40 +1788,21 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     <!-- ENERGY -->
     <section id="tab-energy" class="tab">
-      <header class="ph">
-        <h1>Energy predictor</h1>
-        <p>When your focus peaks today, and how tonight's habits could change tomorrow.</p>
-      </header>
-
-      <details class="how" style="--rc:var(--energy)">
-        <summary>How this works</summary>
-        <p>Your energy is a tug-of-war between two forces. Process S, the sandglass, flips when you wake up and sleep pressure builds all day. Process C is your internal clock, which sends alerting signals that give you a second wind even when you are tired. Focus peaks when the clock signal is high and the sandglass is still fairly empty.</p>
-        <p class="rule">Healthy pattern: schedule your hardest work at the peak of the green focus line.</p>
-      </details>
-
+      <header class="ph"><h1>Energy predictor</h1><p>When your focus peaks today.</p></header>
       <div class="row r2">
         <div class="panel">
-          <div class="pt">
-            <div><h3>Your daily energy curve</h3><p>Focus prediction (1 to 5), plus the two forces behind it.</p></div>
-            <span id="chip_peak" class="chip" hidden></span>
-          </div>
+          <div class="pt"><div><h3>Your daily energy curve</h3><p>Focus prediction (1 to 5), plus the two forces behind it.</p></div><span id="chip_peak" class="chip" hidden></span></div>
           <div id="c_borbely" class="chart"></div>
         </div>
         <div class="panel" style="--ac:var(--energy)">
-          <div class="pt"><div><h3>Tomorrow's readiness</h3><p>Change tonight's habits and see how your predicted energy responds.</p></div></div>
-          <div class="ctl"><div class="top"><span>Tonight's sleep</span><b id="lbl_slp">7.5 hrs</b></div><input type="range" id="sl_slp" min="4.5" max="10.0" step="0.5" value="7.5" oninput="updateEnergySim()" aria-label="Tonight's sleep"></div>
-          <div class="ctl"><div class="top"><span>Morning resting heart rate</span><b id="lbl_rhr">62 bpm</b></div><input type="range" id="sl_rhr" min="48" max="85" step="1" value="62" oninput="updateEnergySim()" aria-label="Morning resting heart rate"></div>
-          <div class="ctl"><div class="top"><span>Morning HRV</span><b id="lbl_hrv">65 ms</b></div><input type="range" id="sl_hrv" min="25" max="120" step="5" value="65" oninput="updateEnergySim()" aria-label="Morning HRV"></div>
-          <div class="ctl"><div class="top"><span>Walking today</span><b id="lbl_wlk">60 mins</b></div><input type="range" id="sl_wlk" min="0" max="150" step="10" value="60" oninput="updateEnergySim()" aria-label="Walking today"></div>
+          <div class="pt"><div><h3>Tomorrow's readiness</h3><p>Simulate tonight's habits.</p></div></div>
+          <div class="ctl"><div class="top"><span>Tonight's sleep</span><b id="lbl_slp">7.5 hrs</b></div><input type="range" id="sl_slp" min="4.5" max="10.0" step="0.5" value="7.5" oninput="updateEnergySim()"></div>
+          <div class="ctl"><div class="top"><span>Morning resting heart rate</span><b id="lbl_rhr">62 bpm</b></div><input type="range" id="sl_rhr" min="48" max="85" step="1" value="62" oninput="updateEnergySim()"></div>
+          <div class="ctl"><div class="top"><span>Morning HRV</span><b id="lbl_hrv">65 ms</b></div><input type="range" id="sl_hrv" min="25" max="120" step="5" value="65" oninput="updateEnergySim()"></div>
+          <div class="ctl"><div class="top"><span>Walking today</span><b id="lbl_wlk">60 mins</b></div><input type="range" id="sl_wlk" min="0" max="150" step="10" value="60" oninput="updateEnergySim()"></div>
           <div class="res">
-            <div class="ring sm" id="en_ring" style="--c:var(--energy)">
-              <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg>
-              <div class="ctr"><span id="sim_out">78</span><small>%</small></div>
-            </div>
-            <div>
-              <span id="en_tag" class="badge" style="--c:var(--energy)">Primed</span>
-              <div class="state">Simulated energy for tomorrow</div>
-            </div>
+            <div class="ring sm" id="en_ring" style="--c:var(--energy)"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span id="sim_out">78</span><small>%</small></div></div>
+            <div><span id="en_tag" class="badge" style="--c:var(--energy)">Primed</span><div class="state">Simulated energy for tomorrow</div></div>
           </div>
         </div>
       </div>
@@ -1912,27 +1810,25 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     <!-- SLEEP -->
     <section id="tab-sleep" class="tab">
-      <header class="ph">
-        <h1>Sleep lab</h1>
-        <p>How your heart recovered overnight, and what each stage of sleep did for you.</p>
-      </header>
-
-      <details class="how" style="--rc:var(--sleep)">
-        <summary>How this works</summary>
-        <p>When you fall asleep, your heart rate should sink into the shape of a hammock. If the lowest point comes early in the night, your body recovered well. If the curve is flat, or bottoms out right before your alarm, your heart spent the night dealing with late digestion, a warm room, or leftover stress.</p>
-        <p class="rule">Healthy pattern: the bottom of the hammock lands 40% to 60% of the way through the night (the shaded band).</p>
-      </details>
+      <header class="ph"><h1>Sleep lab</h1><p>Precise mapping of your sleep architecture and recovery.</p></header>
+      
+      <!-- New Hypnogram Row -->
+      <div class="row">
+        <div class="panel">
+          <div class="pt">
+            <div><h3>Hypnogram (Sleep Cycle Timeline)</h3><p>The exact chronological flow of your sleep stages throughout the night.</p></div>
+          </div>
+          <div id="c_hypno" class="chart" style="height:280px;"></div>
+        </div>
+      </div>
 
       <div class="row r2">
         <div class="panel">
-          <div class="pt">
-            <div><h3>Overnight heart rate</h3><p>Sleeping heart rate with its fitted hammock curve and your HRV.</p></div>
-            <span id="chip_nadir" class="chip" hidden></span>
-          </div>
+          <div class="pt"><div><h3>Overnight heart rate</h3><p>Sleeping heart rate with its fitted hammock curve.</p></div></div>
           <div id="c_slp_hammock" class="chart"></div>
         </div>
         <div class="panel">
-          <div class="pt"><div><h3>Last night's stages</h3></div></div>
+          <div class="pt"><div><h3>Last night's stages</h3><p>Exact timeline of transitions.</p></div></div>
           {stage_bar_html}
           <div class="tl-list">{sleep_log_html}</div>
         </div>
@@ -1947,7 +1843,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   const CIRC = 326.73;
   const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
   
-  // FIX: Deep-clone the layout base for every plot using a function to stop Plotly from mutating shared configurations.
   const getBase = () => JSON.parse(JSON.stringify({{
     paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
     font:{{ color:C.dim, family:'Manrope, -apple-system, sans-serif', size:12 }},
@@ -1957,7 +1852,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     legend:{{ orientation:'h', x:0, y:1.14, font:{{ size:12 }} }},
     hoverlabel:{{ bgcolor:'#1d222c', bordercolor:'rgba(255,255,255,.12)', font:{{ color:C.tx, family:'Manrope, sans-serif' }} }}
   }}));
-  
   const cfg = {{ responsive:true, displayModeBar:false }};
 
   function clock(h) {{
@@ -1966,6 +1860,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     if (mm === 60) {{ hh = (hh + 1) % 24; mm = 0; }}
     return ((hh % 12) || 12) + ':' + String(mm).padStart(2, '0') + ' ' + (hh >= 12 ? 'PM' : 'AM');
   }}
+  
   function chip(id, text, color) {{
     const el = document.getElementById(id);
     if (!el) return;
@@ -1973,71 +1868,44 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     el.innerHTML = '<span class="dot"></span>' + text;
     el.hidden = false;
   }}
+  
   function setRing(el, pct, color) {{
     if (!el) return;
     if (color) el.style.setProperty('--c', color);
     const p = isNaN(pct) ? 0 : Math.max(0, Math.min(100, pct));
     el.querySelector('.val').style.strokeDashoffset = CIRC * (1 - p / 100);
   }}
+  
   function fill(el) {{
     el.style.setProperty('--p', ((el.value - el.min) / (el.max - el.min) * 100) + '%');
-  }}
-  function filterRows(q) {{
-    q = q.toLowerCase();
-    document.querySelectorAll('#param_body tr').forEach(tr => {{ tr.hidden = !tr.textContent.toLowerCase().includes(q); }});
   }}
 
   // ---------- HOME ----------
   function renderHome() {{
     const base = getBase();
-    const map = {{ '#10b981':C.energy, '#ef4444':C.stress, '#38bdf8':C.hr }};
-    const cols = D.quad_colors.map(c => map[c] || c);
-    const n = cols.length, good = D.quad_colors.filter(c => c === '#10b981').length;
-    if (n) chip('chip_quad', Math.round(100 * good / n) + '% of readings in your recovered zone', C.energy);
     Plotly.newPlot('c_quad', [{{
       x:D.quad_hrv, y:D.quad_hr, text:D.quad_labels, mode:'markers',
-      marker:{{ size:9, color:cols, opacity:.85, line:{{ width:1, color:'#11141a' }} }},
+      marker:{{ size:9, color:D.quad_colors, opacity:.85, line:{{ width:1, color:'#11141a' }} }},
       hovertemplate:'%{{text}}<br>HRV <b>%{{x}} ms</b> &middot; HR <b>%{{y}} bpm</b><extra></extra>'
     }}], {{
       ...base,
       xaxis:{{ ...base.xaxis, title:{{ text:'HRV (ms): higher is more recovered' }} }},
-      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm): lower is calmer' }} }},
-      margin:{{ ...base.margin, t:16 }},
-      shapes:[
-        {{ type:'rect', xref:'x', yref:'y', x0:D.mean_hrv, x1:1e5, y0:-1e5, y1:D.mean_hr, fillcolor:'rgba(61,219,176,.06)', line:{{ width:0 }}, layer:'below' }},
-        {{ type:'line', x0:D.mean_hrv, x1:D.mean_hrv, y0:0, y1:1, yref:'paper', line:{{ color:'rgba(255,255,255,.14)', dash:'dash', width:1 }} }},
-        {{ type:'line', x0:0, x1:1, xref:'paper', y0:D.mean_hr, y1:D.mean_hr, line:{{ color:'rgba(255,255,255,.14)', dash:'dash', width:1 }} }}
-      ],
-      annotations:[
-        {{ xref:'paper', yref:'paper', x:.99, y:.02, xanchor:'right', yanchor:'bottom', showarrow:false, text:'Recovered', font:{{ color:C.energy, size:12 }} }},
-        {{ xref:'paper', yref:'paper', x:.01, y:.98, xanchor:'left', yanchor:'top', showarrow:false, text:'Under strain', font:{{ color:C.stress, size:12 }} }}
-      ]
+      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm): lower is calmer' }} }}
     }}, cfg);
   }}
 
   // ---------- STRESS ----------
   function renderStress() {{
     const base = getBase();
-    let mi = -1;
-    D.in_stress.forEach((v, i) => {{ if (typeof v === 'number' && (mi < 0 || v > D.in_stress[mi])) mi = i; }});
-    if (mi >= 0) chip('chip_stress', 'Highest: ' + Math.round(D.in_stress[mi]) + '% at ' + D.in_ts[mi], D.in_stress[mi] >= 65 ? C.stress : C.warn);
     Plotly.newPlot('c_st_intra', [
       {{ x:D.in_ts, y:D.in_stress, yaxis:'y2', text:D.in_state, mode:'lines', fill:'tozeroy', fillcolor:'rgba(255,122,107,.10)', line:{{ color:C.stress, width:1.5 }}, name:'Stress', hovertemplate:'%{{y:.0f}}%<br>%{{text}}<extra>Stress</extra>' }},
       {{ x:D.in_ts, y:D.in_hr_exp, mode:'lines', line:{{ color:C.hr, width:2, dash:'dot' }}, name:'Expected for your activity', hovertemplate:'%{{y:.0f}} bpm<extra>Expected</extra>' }},
       {{ x:D.in_ts, y:D.in_hr_raw, mode:'lines', line:{{ color:C.tx, width:2 }}, name:'Actual heart rate', hovertemplate:'%{{y:.0f}} bpm<extra>Actual</extra>' }}
     ], {{
-      ...base, hovermode:'x unified',
-      margin:{{ ...base.margin, r:44 }},
+      ...base, hovermode:'x unified', margin:{{ ...base.margin, r:44 }},
       yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }} }},
       yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
     }}, cfg);
-    updateStressSim();
-  }}
-
-  const PRESETS = {{ walk:[118, 400, 55], calm:[66, 0, 70], panic:[112, 20, 34] }};
-  function preset(k) {{
-    const p = PRESETS[k];
-    ['st_sl_hr', 'st_sl_stp', 'st_sl_hrv'].forEach((id, i) => {{ document.getElementById(id).value = p[i]; }});
     updateStressSim();
   }}
 
@@ -2055,21 +1923,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     const z_hr = res_hr / 7.5;
     const z_hrv = (Math.log(Math.max(D.mean_hrv, 45)) - Math.log(hrv)) / 0.25;
 
-    let pct, tag, col, state;
-    if (stp >= 180) {{
-      pct = Math.min(35, Math.max(12, 18 + 4 * Math.max(0, z_hr)));
-      tag = 'Exercise'; col = C.hr;
-      state = 'You are moving, so a high heart rate is expected and is not counted as stress.';
-    }} else {{
-      pct = Math.min(98, Math.max(6, 100 / (1 + Math.exp(-1.25 * ((0.6 * z_hr + 0.45 * z_hrv) - 0.35)))));
-      tag = pct >= 68 ? 'High strain' : (pct >= 42 ? 'Moderate arousal' : 'Calm');
-      col = pct >= 68 ? C.stress : (pct >= 42 ? C.warn : C.energy);
-      state = 'Sitting still. Your heart rate is ' + Math.abs(res_hr).toFixed(0) + ' bpm ' + (res_hr >= 0 ? 'above' : 'below') + ' what your activity explains.';
-    }}
+    let pct = stp >= 180 ? Math.min(35, Math.max(12, 18 + 4 * Math.max(0, z_hr))) : Math.min(98, Math.max(6, 100 / (1 + Math.exp(-1.25 * ((0.6 * z_hr + 0.45 * z_hrv) - 0.35)))));
+    const col = pct >= 68 ? C.stress : (pct >= 42 ? C.warn : C.energy);
     document.getElementById('st_ring_n').innerText = Math.round(pct);
-    const t = document.getElementById('st_sim_tag');
-    t.innerText = tag; t.style.setProperty('--c', col);
-    document.getElementById('st_sim_state').innerText = state;
     setRing(document.getElementById('st_ring'), pct, col);
   }}
 
@@ -2087,7 +1943,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       traces.push({{ x:[D.b_hours[pi]], y:[D.b_alert[pi]], mode:'markers', marker:{{ size:13, color:C.energy, line:{{ width:3, color:'#11141a' }} }}, name:'Best focus', hoverinfo:'skip' }});
       chip('chip_peak', 'Best focus around ' + clock(D.b_hours[pi]), C.energy);
     }}
-    Plotly.newPlot('c_borbely', traces, {{ ...base, hovermode:'x unified', xaxis:{{ ...base.xaxis, title:{{ text:'Hour of day (24h clock)' }}, dtick:2 }} }}, cfg);
+    Plotly.newPlot('c_borbely', traces, {{ ...base, hovermode:'x unified', xaxis:{{ ...base.xaxis, title:{{ text:'Hour of day' }}, dtick:2 }} }}, cfg);
     updateEnergySim();
   }}
 
@@ -2097,6 +1953,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     const rhr = parseFloat(document.getElementById('sl_rhr').value);
     const hrv = parseFloat(document.getElementById('sl_hrv').value);
     const wlk = parseFloat(document.getElementById('sl_wlk').value);
+    
     document.getElementById('lbl_slp').innerText = slp.toFixed(1) + ' hrs';
     document.getElementById('lbl_rhr').innerText = rhr + ' bpm';
     document.getElementById('lbl_hrv').innerText = hrv + ' ms';
@@ -2106,42 +1963,53 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     let dot = 0;
     for (let i = 0; i < D.f_weights.length; i++) dot += z_vec[i] * D.f_weights[i];
     
-    // MATCHING THE NEW COMPUTATIONAL PHYSIOLOGY MATH
-    const homeostatic_intercept = 1.35;
-    const pred_pct = Math.min(99.0, Math.max(10.0, 100.0 / (1.0 + Math.exp(-1.45 * (dot + homeostatic_intercept)))));
+    const pred_pct = Math.min(99.0, Math.max(10.0, 100.0 / (1.0 + Math.exp(-1.45 * (dot + 1.35)))));
     const col = pred_pct >= 70 ? C.energy : (pred_pct >= 48 ? C.warn : C.stress);
     document.getElementById('sim_out').innerText = Math.round(pred_pct);
-    const t = document.getElementById('en_tag');
-    t.innerText = pred_pct >= 70 ? 'Primed' : (pred_pct >= 48 ? 'Steady' : 'Low reserves');
-    t.style.setProperty('--c', col);
     setRing(document.getElementById('en_ring'), pred_pct, col);
   }}
 
   // ---------- SLEEP ----------
   function renderSleep() {{
     const base = getBase();
-    const fit = D.slp_hr_fit;
-    let ni = -1;
-    for (let i = 0; i < fit.length; i++) {{ if (typeof fit[i] === 'number' && (ni < 0 || fit[i] < fit[ni])) ni = i; }}
-    if (ni >= 0 && fit.length > 1) {{
-      const pct = Math.round(100 * ni / (fit.length - 1));
-      const ok = pct >= 40 && pct <= 60;
-      chip('chip_nadir', ok ? 'Lowest heart rate ' + pct + '% into the night, in the healthy window' : 'Lowest heart rate ' + pct + '% into the night, outside the 40–60% window', ok ? C.energy : C.warn);
-    }}
-    const shapes = [];
-    const t0 = D.slp_tau[0], t1 = D.slp_tau[D.slp_tau.length - 1];
-    if (typeof t0 === 'number' && typeof t1 === 'number') {{
-      shapes.push({{ type:'rect', xref:'x', yref:'paper', x0:t0 + 0.4 * (t1 - t0), x1:t0 + 0.6 * (t1 - t0), y0:0, y1:1, fillcolor:'rgba(143,155,255,.09)', line:{{ width:0 }}, layer:'below' }});
-    }}
+    
+    // 1. Render Hammock Curve
     Plotly.newPlot('c_slp_hammock', [
       {{ x:D.slp_tau, y:D.slp_hr_mean, mode:'markers', marker:{{ size:6, color:'rgba(255,255,255,.28)' }}, name:'Sleeping heart rate', hovertemplate:'%{{y:.0f}} bpm<extra></extra>' }},
       {{ x:D.slp_tau, y:D.slp_hr_fit, mode:'lines', line:{{ color:C.sleep, width:3, shape:'spline' }}, name:'Hammock curve', hoverinfo:'skip' }},
       {{ x:D.slp_tau, y:D.slp_hrv_mean, yaxis:'y2', mode:'lines+markers', marker:{{ size:5 }}, line:{{ color:C.hr, width:2 }}, name:'HRV', connectgaps:true, hovertemplate:'%{{y:.0f}} ms<extra>HRV</extra>' }}
-    ], {{
-      ...base, shapes:shapes, margin:{{ ...base.margin, r:44 }},
-      yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }} }},
-      yaxis2:{{ overlaying:'y', side:'right', showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }}
-    }}, cfg);
+    ], {{ ...base, margin:{{ ...base.margin, r:44 }}, yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }} }}, yaxis2:{{ overlaying:'y', side:'right', showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }} }}, cfg);
+
+    // 2. Render Chronological Hypnogram
+    if (D.stage_blocks && D.stage_blocks.length > 0) {{
+      const px = [], py = [], pt = [];
+      const y_map = {{"Awake in Bed": 3, "REM Sleep (Brain & Memory)": 2, "Core Sleep (Light)": 1, "Deep Sleep (Body Repair)": 0}};
+      
+      D.stage_blocks.forEach(b => {{
+          let s = b.start; let e = b.end;
+          if (s < 12) s += 24;
+          if (e < 12) e += 24;
+          
+          px.push(s, e);
+          py.push(y_map[b.stage], y_map[b.stage]);
+          const text = `<b>${{b.stage}}</b><br>${{clock(b.start)}} - ${{clock(b.end)}}<br>${{b.dur}} mins`;
+          pt.push(text, text);
+      }});
+
+      const ticks = [], ticktext = [];
+      for(let i = Math.floor(px[0]); i <= Math.ceil(px[px.length-1]); i++) {{
+          ticks.push(i); ticktext.push(clock(i));
+      }}
+
+      Plotly.newPlot('c_hypno', [{{
+          x: px, y: py, text: pt, mode: 'lines', line: {{shape: 'hv', color: '#8f9bff', width: 2.5}},
+          fill: 'tozeroy', fillcolor: 'rgba(143,155,255,0.1)', hoverinfo: 'text'
+      }}], {{
+          ...base, margin: {{...base.margin, l: 50, t: 20, b: 30}},
+          xaxis: {{ ...base.xaxis, tickvals: ticks, ticktext: ticktext }},
+          yaxis: {{ ...base.yaxis, tickvals: [0, 1, 2, 3], ticktext: ['Deep', 'Core', 'REM', 'Awake'], range: [-0.5, 3.5] }}
+      }}, cfg);
+    }}
   }}
 
   // ---------- NAVIGATION ----------
@@ -2153,12 +2021,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     document.querySelectorAll('.nav-btn').forEach(el => {{
       const on = el.dataset.tab === name;
       el.classList.toggle('active', on);
-      el.setAttribute('aria-current', on ? 'page' : 'false');
     }});
     if (!RENDERED[name]) {{ RENDERED[name] = true; RENDER[name](); }}
     else {{ document.querySelectorAll('#tab-' + name + ' .chart').forEach(el => Plotly.Plots.resize(el)); }}
-    try {{ history.replaceState(null, '', '#' + name); }} catch (e) {{}}
-    window.scrollTo(0, 0);
   }}
 
   document.querySelectorAll('.ring[data-v]').forEach(r => {{
