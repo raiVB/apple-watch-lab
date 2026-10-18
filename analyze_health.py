@@ -2360,57 +2360,56 @@ function renderHome() {{
       </div>`;
 
     window.dataPage = 1;
-    window.loadDataPage = async function(page) {
-      const metric = document.getElementById('dataMetric').value;
-      const start = document.getElementById('dataStart').value;
-      const end = document.getElementById('dataEnd').value;
-      const params = new URLSearchParams({page, limit:100});
-      if (metric) params.set('metric', metric);
-      if (start) params.set('start', start);
-      if (end) params.set('end', end);
+   window.loadDataPage = async function(page) {{
+  const metric = document.getElementById('dataMetric').value;
+  const start = document.getElementById('dataStart').value;
+  const end = document.getElementById('dataEnd').value;
+  const params = new URLSearchParams({{page, limit:100}});
+  if (metric) params.set('metric', metric);
+  if (start) params.set('start', start);
+  if (end) params.set('end', end);
 
-      const summary = document.getElementById('dataSummary');
-      summary.textContent = 'Loading…';
+  const summary = document.getElementById('dataSummary');
+  summary.textContent = 'Loading…';
 
-      try {
-        const response = await fetch('/api/records?' + params.toString());
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        const result = await response.json();
+  try {{
+    const response = await fetch('/api/records?' + params.toString());
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const result = await response.json();
 
-        const metricSelect = document.getElementById('dataMetric');
-        if (metricSelect.options.length === 1) {
-          result.metrics.forEach(m => {
-            const option = document.createElement('option');
-            option.value = m;
-            option.textContent = m;
-            metricSelect.appendChild(option);
-          });
-        }
+    const metricSelect = document.getElementById('dataMetric');
+    if (metricSelect.options.length === 1) {{
+      result.metrics.forEach(m => {{
+        const option = document.createElement('option');
+        option.value = m;
+        option.textContent = m;
+        metricSelect.appendChild(option);
+      }});
+    }}
 
-        window.dataPage = result.page;
-        document.getElementById('dataRows').innerHTML = result.rows.map(r => `
-          <tr>
-            <td>${r.timestamp ?? ''}</td>
-            <td>${r.metric ?? ''}</td>
-            <td>${r.value ?? ''}</td>
-            <td>${r.unit ?? ''}</td>
-            <td>${r.gap_minutes == null ? '—' : r.gap_minutes}</td>
-          </tr>`).join('');
+    window.dataPage = result.page;
+    document.getElementById('dataRows').innerHTML = result.rows.map(r => `
+      <tr>
+        <td>${{r.timestamp ?? ''}}</td>
+        <td>${{r.metric ?? ''}}</td>
+        <td>${{r.value ?? ''}}</td>
+        <td>${{r.unit ?? ''}}</td>
+        <td>${{r.gap_minutes == null ? '—' : r.gap_minutes}}</td>
+      </tr>`).join('');
 
-        document.getElementById('dataPageLabel').textContent =
-          `Page ${result.page} of ${result.pages}`;
-        summary.textContent = `${result.total.toLocaleString()} stored records`;
-        document.getElementById('dataPrev').disabled = result.page <= 1;
-        document.getElementById('dataNext').disabled =
-          result.page >= result.pages;
-      } catch (error) {
-        summary.textContent = 'Could not load records: ' + error.message;
-      }
-    };
+    document.getElementById('dataPageLabel').textContent =
+      `Page ${{result.page}} of ${{result.pages}}`;
+    summary.textContent = `${{result.total.toLocaleString()}} stored records`;
+    document.getElementById('dataPrev').disabled = result.page <= 1;
+    document.getElementById('dataNext').disabled =
+      result.page >= result.pages;
+  }} catch (error) {{
+    summary.textContent = 'Could not load records: ' + error.message;
+  }}
+}};
 
-    await loadDataPage(1);
-  }
-
+await loadDataPage(1);
+}}
   // ---------- NAVIGATION ----------
   const RENDER = {{ home:renderHome, stress:renderStress, energy:renderEnergy, sleep:renderSleep, data:renderData }};
   const RENDERED = {{}};
