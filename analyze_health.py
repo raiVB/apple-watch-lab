@@ -1478,11 +1478,11 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
 
 
 # ==============================================================================
-# PREMIUM TABBED UI/UX DASHBOARD BUILDER
+# PREMIUM TABBED UI/UX DASHBOARD BUILDER (LAYMAN SCIENCE EDITION)
 # ==============================================================================
 
 def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle):
-    print("[5/6] Building Premium 3-Activity Interactive SPA (Home + Sleep + Stress + Energy)...")
+    print("[5/6] Building Premium Layman-Friendly SPA (Home + Sleep + Stress + Energy)...")
     import json
 
     # --- 1. SLEEP TIMELINE LOG GENERATION ---
@@ -1494,48 +1494,44 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
             st_str = hour_to_clock_str(r["onset_hr"])
             en_str = hour_to_clock_str(r["wake_hr"])
             mins = int(round(r['hours'] * 60))
-            if "Deep" in r['stage']: col, icon = "#3b82f6", "🌊"
-            elif "REM" in r['stage']: col, icon = "#a855f7", "🧠"
-            elif "Awake" in r['stage']: col, icon = "#ef4444", "👀"
-            else: col, icon = "#38bdf8", "☁️"
+            if "Deep" in r['stage']: col, icon, desc = "#3b82f6", "🌊", "Body repairs muscles & clears brain toxins."
+            elif "REM" in r['stage']: col, icon, desc = "#a855f7", "🧠", "Brain organizes memories & learning."
+            elif "Awake" in r['stage']: col, icon, desc = "#ef4444", "👀", "Micro-awakenings (often unremembered)."
+            else: col, icon, desc = "#38bdf8", "☁️", "Light sleep bridging deep and REM cycles."
             
             sleep_log_html += f"""
             <div class="timeline-row">
                 <div class="time-col">{st_str} &rarr; {en_str}</div>
                 <div class="line-col"><div class="node" style="background:{col}; shadow: 0 0 10px {col};"></div></div>
                 <div class="data-col">
-                    <span style="color:{col}; font-weight:600;">{icon} {r['stage']}</span> 
-                    <span style="color:#94a3b8; font-size:12px; margin-left:8px;">({mins} mins)</span>
+                    <div style="color:{col}; font-weight:600;">{icon} {r['stage']} <span style="color:#94a3b8; font-size:12px; margin-left:8px;">({mins} mins)</span></div>
+                    <div style="color:#64748b; font-size:11px; margin-top:2px;">{desc}</div>
                 </div>
             </div>"""
     else:
         sleep_log_html = "<div style='color:#94a3b8; padding:20px;'>No precise sleep stage data available for last night. Wear watch to bed.</div>"
 
     # --- 2. DATA TABLES GENERATION ---
-    # Encyclopedia Table
     table_html = "".join([
         f"<tr><td><b>{r['name']}</b><br><span style='font-size:11px;color:#38bdf8;'>{r['category']}</span></td>"
         f"<td><span class='badge' style='background: #10b98122; color:#10b981;'>{r['latest']}</span></td>"
         f"<td><b>{r['avg']}</b></td><td style='color:#38bdf8;'>{r['normal']}</td>"
-        f"<td style='font-size:12px;color:#cbd5e1;'>{r['desc']}</td></tr>"
+        f"<td style='font-size:12px;color:#cbd5e1;line-height:1.4;'>{r['desc']}</td></tr>"
         for r in [{"name": k, "category": v[1], "latest": f"{df_raw[df_raw['metric']==k]['value'].iloc[-1]:.1f} {v[2]}" if not df_raw[df_raw['metric']==k].empty else "—", "avg": f"{df_raw[df_raw['metric']==k]['value'].mean():.1f} {v[2]}" if not df_raw[df_raw['metric']==k].empty else "—", "normal": v[3], "desc": v[4]} for k, v in PARAMETER_GUIDE.items()]
     ])
 
-    # Stress Episodes Table
     ep_rows_html = "".join([
         f"<tr><td><b>{ep['timestamp']}</b><br><span style='font-size:11px;color:#94a3b8;'>{ep['state']}</span></td>"
         f"<td><span class='badge' style='background:{'#ef4444' if ep['stress_pct']>=65 else '#f59e0b'}22; color:{'#ef4444' if ep['stress_pct']>=65 else '#f59e0b'};'>{ep['stress_pct']}%</span></td>"
         f"<td style='font-size:13px;'>{ep['facts']}</td><td style='font-size:13px;color:#c084fc;'>{ep['hypothesis']}</td></tr>"
         for ep in stress_bundle["episodes"]
-    ]) if stress_bundle["episodes"] else "<tr><td colspan='4' style='text-align:center;color:#10b981;padding:20px;'>No Unusual Non-Metabolic Stress Episodes Detected!</td></tr>"
+    ]) if stress_bundle["episodes"] else "<tr><td colspan='4' style='text-align:center;color:#10b981;padding:20px;'>No Unusual Non-Metabolic Stress Episodes Detected! Your heart only sped up when you were physically moving.</td></tr>"
 
     # --- 3. JSON PAYLOAD FOR PLOTLY ---
-    # Gathering data from Activity 1, 2, and 3 to send to JS
     all_dates = sorted(df_raw["date"].unique()) if not df_raw.empty else []
     recent_cutoff = all_dates[-min(14, len(all_dates))] if all_dates else "2026-01-01"
     df = df_raw[df_raw["date"] >= recent_cutoff]
     
-    # Quadrant Data
     hr_df = df[df["metric"] == "HeartRate"].sort_values("epoch_5m")
     hrv_df = df[df["metric"] == "HeartRateVariabilitySDNN"].sort_values("epoch_5m")
     quad_hrv, quad_hr, quad_labels, quad_colors = [], [], [], []
@@ -1574,49 +1570,35 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Apple Watch Series 11 Lab</title>
+<title>Apple Watch Layman Lab</title>
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 <style>
   :root {{ --bg: #020617; --card: #0f172a; --card-hover: #1e293b; --text-main: #f8fafc; --text-dim: #94a3b8; --border: #1e293b; --accent-blue: #38bdf8; --accent-green: #10b981; --accent-red: #ef4444; --accent-purp: #a855f7; }}
-  body {{ background: var(--bg); color: var(--text-main); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; line-height: 1.5; }}
-  
-  /* Navigation */
-  .nav-bar {{ background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); padding: 16px 32px; position: sticky; top: 0; z-index: 100; display: flex; gap: 12px; align-items: center; }}
-  .nav-title {{ font-size: 18px; font-weight: 700; color: var(--text-main); margin-right: 24px; display: flex; align-items: center; gap: 8px; }}
+  body {{ background: var(--bg); color: var(--text-main); font-family: -apple-system, sans-serif; margin: 0; line-height: 1.5; }}
+  .nav-bar {{ background: rgba(15, 23, 42, 0.95); border-bottom: 1px solid var(--border); padding: 16px 32px; position: sticky; top: 0; z-index: 100; display: flex; gap: 12px; }}
+  .nav-title {{ font-size: 18px; font-weight: 700; color: var(--text-main); margin-right: 24px; }}
   .nav-btn {{ background: transparent; border: none; color: var(--text-dim); font-size: 14px; font-weight: 600; cursor: pointer; padding: 8px 16px; border-radius: 99px; transition: 0.2s; }}
   .nav-btn:hover {{ background: var(--card-hover); color: var(--text-main); }}
   .nav-btn.active {{ background: var(--text-main); color: var(--bg); }}
-
-  /* Layout */
   .container {{ max-width: 1300px; margin: 0 auto; padding: 32px; }}
   .tab-content {{ display: none; animation: fadeIn 0.3s ease; }}
   .tab-content.active {{ display: block; }}
   @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(10px); }} to {{ opacity: 1; transform: translateY(0); }} }}
-
-  /* Grids & Cards */
   .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 24px; }}
   .grid-3 {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; margin-bottom: 24px; }}
   .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.2); }}
-  
-  /* Typography & Elements */
   h1 {{ font-size: 28px; margin: 0 0 8px 0; }}
   h3 {{ font-size: 16px; margin: 0 0 16px 0; color: var(--text-main); font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 12px; }}
   .badge {{ padding: 4px 10px; border-radius: 8px; font-size: 12px; font-weight: 700; display: inline-block; }}
   .chart-box {{ height: 380px; width: 100%; }}
-  
-  /* Science Callouts */
-  .science-box {{ background: linear-gradient(145deg, #0f172a 0%, #020617 100%); border: 1px solid; border-radius: 12px; padding: 20px; margin-bottom: 24px; display: flex; gap: 20px; align-items: flex-start; }}
-  .science-icon {{ font-size: 32px; background: rgba(255,255,255,0.05); padding: 12px; border-radius: 12px; }}
-  .science-text h4 {{ margin: 0 0 8px 0; font-size: 16px; }}
-  .science-text p {{ margin: 0 0 8px 0; font-size: 14px; color: var(--text-dim); }}
-  .safe-value {{ display: inline-block; background: rgba(16, 185, 129, 0.15); color: var(--accent-green); padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; border: 1px solid rgba(16, 185, 129, 0.3); }}
-
-  /* Tables */
+  .science-box {{ background: linear-gradient(145deg, #0f172a 0%, #020617 100%); border: 1px solid; border-radius: 12px; padding: 24px; margin-bottom: 24px; display: flex; gap: 20px; align-items: flex-start; }}
+  .science-icon {{ font-size: 38px; background: rgba(255,255,255,0.05); padding: 16px; border-radius: 16px; }}
+  .science-text h4 {{ margin: 0 0 10px 0; font-size: 18px; }}
+  .science-text p {{ margin: 0 0 12px 0; font-size: 14.5px; color: var(--text-dim); line-height: 1.6; }}
+  .safe-value {{ display: inline-block; background: rgba(255,255,255,0.1); padding: 6px 12px; border-radius: 6px; font-size: 13px; font-weight: 600; }}
   table {{ width: 100%; border-collapse: collapse; margin-bottom: 24px; font-size: 13px; }}
-  th {{ text-align: left; padding: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: 0.5px; font-size: 11px; }}
+  th {{ text-align: left; padding: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border); text-transform: uppercase; font-size: 11px; }}
   td {{ padding: 16px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }}
-
-  /* Custom Sleep Timeline */
   .timeline-row {{ display: grid; grid-template-columns: 120px 20px 1fr; gap: 16px; margin-bottom: 0; }}
   .time-col {{ text-align: right; font-size: 12px; color: var(--text-dim); padding-top: 2px; }}
   .line-col {{ display: flex; flex-direction: column; align-items: center; position: relative; }}
@@ -1624,8 +1606,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   .timeline-row:last-child .line-col::after {{ display: none; }}
   .node {{ width: 12px; height: 12px; border-radius: 50%; z-index: 2; margin-top: 4px; border: 2px solid var(--bg); }}
   .data-col {{ padding-bottom: 20px; }}
-  
-  /* Simulators */
   .slider-row {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; }}
   .slider-row input {{ width: 50%; accent-color: var(--accent-blue); }}
 </style>
@@ -1633,8 +1613,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 <body>
 
   <div class="nav-bar">
-    <div class="nav-title">⌚ Biometric Science Lab</div>
-    <button class="nav-btn active" onclick="openTab('tab-home', this)">🏠 Overview</button>
+    <div class="nav-title">⌚ Layman's Lab</div>
+    <button class="nav-btn active" onclick="openTab('tab-home', this)">🏠 General Health</button>
     <button class="nav-btn" onclick="openTab('tab-stress', this)">🕵️ 1. Stress Detective</button>
     <button class="nav-btn" onclick="openTab('tab-energy', this)">⚡ 2. Energy Predictor</button>
     <button class="nav-btn" onclick="openTab('tab-sleep', this)">🌙 3. Sleep Lab</button>
@@ -1642,10 +1622,10 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
   <div class="container">
     
-    <!-- ================== TAB: HOME ================== -->
+    <!-- HOME -->
     <div id="tab-home" class="tab-content active">
-      <h1 style="color:var(--accent-blue);">General Telemetry & Health Overview</h1>
-      <p style="color:var(--text-dim); margin-bottom:32px;">This dashboard unifies your Apple Watch telemetry, extracting the underlying physiological signals of stress, circadian energy, and restorative sleep via mathematical models.</p>
+      <h1 style="color:var(--accent-blue);">General Body Telemetry</h1>
+      <p style="color:var(--text-dim); margin-bottom:32px;">Your body is like a hybrid car. Heart Rate is the engine speed. Heart Rate Variability (HRV) is the battery charge. This dashboard checks if your engine is revving safely or burning out.</p>
 
       <div class="grid-3">
         <div class="card">
@@ -1654,12 +1634,12 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
           <div class="badge" style="background:{pred_bundle['badge_color']}22; color:{pred_bundle['badge_color']};">{pred_bundle['readiness_label']}</div>
         </div>
         <div class="card">
-          <div style="font-size:12px; color:var(--text-dim); text-transform:uppercase;">Current Autonomic Stress</div>
+          <div style="font-size:12px; color:var(--text-dim); text-transform:uppercase;">Current System Stress</div>
           <div style="font-size:36px; font-weight:700; color:{stress_bundle['stress_color']}; margin:8px 0;">{stress_bundle['today_likelihood']}%</div>
           <div class="badge" style="background:{stress_bundle['stress_color']}22; color:{stress_bundle['stress_color']};">{stress_bundle['stress_label']}</div>
         </div>
         <div class="card">
-          <div style="font-size:12px; color:var(--text-dim); text-transform:uppercase;">Restorative Sleep Quality</div>
+          <div style="font-size:12px; color:var(--text-dim); text-transform:uppercase;">Last Night's Sleep Repair</div>
           <div style="font-size:36px; font-weight:700; color:{sleep_bundle['quality_color']}; margin:8px 0;">{sleep_bundle['latest_quality']}%</div>
           <div class="badge" style="background:{sleep_bundle['quality_color']}22; color:{sleep_bundle['quality_color']};">{sleep_bundle['quality_label']}</div>
         </div>
@@ -1667,15 +1647,15 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
       <div class="grid-2">
         <div class="card">
-          <h3>Sympathovagal Phase Quadrant</h3>
-          <p style="font-size:13px; color:var(--text-dim);">Plots Heart Rate against HRV. The bottom-right quadrant represents peak parasympathetic recovery.</p>
+          <h3>The Battery vs. Engine Graph (HRV vs HR)</h3>
+          <p style="font-size:13px; color:var(--text-dim);">HRV is flexibility (higher is better). HR is workload (lower is calmer). <b>Bottom-Right quadrant</b> means your battery is charged and your engine is relaxed.</p>
           <div id="c_quad" class="chart-box"></div>
         </div>
         <div class="card">
-          <h3>Parameter Encyclopedia</h3>
+          <h3>Layman's Dictionary of Your Apple Watch Data</h3>
           <div style="max-height: 410px; overflow-y: auto;">
             <table>
-              <thead><tr><th>Parameter</th><th>Latest</th><th>Average</th><th>Healthy Range</th><th>Meaning</th></tr></thead>
+              <thead><tr><th>Sensor</th><th>Your Latest</th><th>Your Average</th><th>Healthy Baseline</th><th>What it actually means</th></tr></thead>
               <tbody>{table_html}</tbody>
             </table>
           </div>
@@ -1683,106 +1663,95 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       </div>
     </div>
 
-    <!-- ================== TAB: STRESS DETECTIVE ================== -->
+    <!-- STRESS -->
     <div id="tab-stress" class="tab-content">
       <h1 style="color:var(--accent-red);">Activity 1: Stress Detective</h1>
       
       <div class="science-box" style="border-color: var(--accent-red);">
         <div class="science-icon">🕵️</div>
         <div class="science-text">
-          <h4 style="color:var(--accent-red);">The Science: Metabolic De-Confounding & Mahalanobis Distance</h4>
-          <p>Normal heart rate rises linearly with physical movement (steps, stairs). This engine subtracts that "expected metabolic rate" from your actual heart rate. If your heart is racing while you are sitting still, it exposes <b>autonomic arousal</b> (caused by cognitive workload, emotional stress, caffeine, or illness). It cross-references this with HRV and ambient noise using a Mahalanobis Subspace to prevent false alarms.</p>
-          <div class="safe-value">Optimal Baseline: Stress Likelihood < 40% when sedentary.</div>
+          <h4 style="color:var(--accent-red);">The Science: The "Context Checker" Algorithm</h4>
+          <p>If your heart beats at 115 bpm while you walk up stairs, that's completely normal. But if it beats at 115 bpm while you are sitting motionless at a desk, your body is sounding a false alarm. This algorithm mathematically subtracts your physical movement (steps) from your heart rate. Whatever heart rate is left over is "Non-Metabolic"—meaning it was caused by mental stress, exam anxiety, caffeine, or illness.</p>
+          <div class="safe-value" style="color:var(--accent-red);">Healthy Rule: Actual HR (Red) should hug Expected HR (Blue) closely.</div>
         </div>
       </div>
 
       <div class="grid-2">
         <div class="card">
-          <h3>Intraday De-Confounded Timeline</h3>
+          <h3>The Context Timeline</h3>
           <div id="c_st_intra" class="chart-box"></div>
         </div>
         <div class="card">
-          <h3>🧪 Confounder Gate Simulator</h3>
-          <p style="font-size:13px; color:var(--text-dim); margin-bottom:20px;">Adjust the sliders to see how the engine mathematically separates exercise from psychological stress.</p>
-          <div class="slider-row"><span>Observed Heart Rate: <b id="st_lbl_hr">112 bpm</b></span><input type="range" id="st_sl_hr" min="55" max="165" step="1" value="112" oninput="updateStressSim()"></div>
-          <div class="slider-row"><span>Concurrent Steps (5-min): <b id="st_lbl_stp">20 steps</b></span><input type="range" id="st_sl_stp" min="0" max="600" step="20" value="20" oninput="updateStressSim()"></div>
-          <div class="slider-row"><span>Concurrent HRV (SDNN): <b id="st_lbl_hrv">34 ms</b></span><input type="range" id="st_sl_hrv" min="15" max="110" step="1" value="34" oninput="updateStressSim()"></div>
+          <h3>🧪 Simulate a False Alarm</h3>
+          <p style="font-size:13px; color:var(--text-dim); margin-bottom:20px;">Move the sliders to see how the math tells the difference between going for a brisk walk vs. panicking on the couch.</p>
+          <div class="slider-row"><span>Your Heart Rate: <b id="st_lbl_hr">112 bpm</b></span><input type="range" id="st_sl_hr" min="55" max="165" step="1" value="112" oninput="updateStressSim()"></div>
+          <div class="slider-row"><span>Steps Taken (5-min): <b id="st_lbl_stp">20 steps</b></span><input type="range" id="st_sl_stp" min="0" max="600" step="20" value="20" oninput="updateStressSim()"></div>
+          <div class="slider-row"><span>HRV (Shock Absorber): <b id="st_lbl_hrv">34 ms</b></span><input type="range" id="st_sl_hrv" min="15" max="110" step="1" value="34" oninput="updateStressSim()"></div>
           <div style="margin-top:24px; padding-top:16px; border-top:1px solid var(--border);">
-            <div style="font-size:13px; color:var(--text-dim);">Engine Classification: <b id="st_sim_state" style="color:var(--accent-red);">Sedentary — Non-Metabolic Elevation</b></div>
+            <div style="font-size:13px; color:var(--text-dim);">Algorithm Verdict: <b id="st_sim_state" style="color:var(--accent-red);">Sedentary — Mind racing, body still.</b></div>
             <div style="font-size:16px; margin-top:8px;">Estimated Stress: <b id="st_sim_out" style="color:var(--accent-red); font-size:20px;">84.2%</b></div>
           </div>
         </div>
       </div>
 
-      <div class="grid-2">
-        <div class="card">
-          <h3>Daily Stress Posterior & Anomaly Score</h3>
-          <div id="c_st_hist" class="chart-box"></div>
-        </div>
-        <div class="card">
-          <h3>Today's Autonomic Signal Contributions (Z-Scores)</h3>
-          <div id="c_st_contrib" class="chart-box"></div>
-        </div>
-      </div>
-
       <div class="card">
-        <h3>Detected Non-Metabolic Episodes Log</h3>
+        <h3>Detected Stress Spikes Log</h3>
         <table>
-          <thead><tr><th>Timestamp</th><th>Stress Estimate</th><th>Measured Objective Telemetry</th><th>Contextual Hypothesis</th></tr></thead>
+          <thead><tr><th>Time</th><th>Stress Score</th><th>The Objective Math Data</th><th>Probable Real-World Cause</th></tr></thead>
           <tbody>{ep_rows_html}</tbody>
         </table>
       </div>
     </div>
 
-    <!-- ================== TAB: ENERGY PREDICTOR ================== -->
+    <!-- ENERGY -->
     <div id="tab-energy" class="tab-content">
-      <h1 style="color:var(--accent-green);">Activity 2: Morning Energy Predictor</h1>
+      <h1 style="color:var(--accent-green);">Activity 2: Daily Energy Predictor</h1>
 
       <div class="science-box" style="border-color: var(--accent-green);">
         <div class="science-icon">⚡</div>
         <div class="science-text">
-          <h4 style="color:var(--accent-green);">The Science: Borbély Two-Process Model (S + C)</h4>
-          <p>Your subjective daily energy is dictated by the collision of two biological forces: <b>Process S (Adenosine)</b> is homeostatic sleep pressure that builds up every waking hour, making you tired. <b>Process C (Circadian)</b> is a 24-hour alerting signal driven by your suprachiasmatic nucleus. Peak cognitive focus occurs when your Circadian wave crests while your Adenosine pressure is still low.</p>
-          <div class="safe-value">Optimal Strategy: Do deep work during the peak of the green curve.</div>
+          <h4 style="color:var(--accent-green);">The Science: The Sandglass vs. The Sun</h4>
+          <p>Your energy is a tug-of-war. <b>Process S (Red Line)</b> is like a sandglass that flips the second you wake up; sleep pressure builds continuously. <b>Process C (Blue Line)</b> is your internal biological sun; it sends alerting signals that give you a "second wind" during the day, even when you're tired. Peak focus happens when your internal sun is high, but the sandglass is still relatively empty.</p>
+          <div class="safe-value" style="color:var(--accent-green);">Healthy Rule: Schedule your hardest coding/study sessions at the peak of the Green Focus Line.</div>
         </div>
       </div>
 
       <div class="grid-2">
         <div class="card">
-          <h3>Today's Predicted Alertness Curve</h3>
+          <h3>Your Daily Energy Waveform</h3>
           <div id="c_borbely" class="chart-box"></div>
         </div>
         <div class="card">
           <h3>🔬 Readiness Habit Simulator</h3>
-          <p style="font-size:13px; color:var(--text-dim); margin-bottom:20px;">Simulate how changing your habits tonight impacts tomorrow's energy readiness using Bayesian Ridge weights.</p>
-          <div class="slider-row"><span>Tonight's Sleep Duration: <b id="lbl_slp">7.5 hrs</b></span><input type="range" id="sl_slp" min="4.5" max="10.0" step="0.5" value="7.5" oninput="updateEnergySim()"></div>
+          <p style="font-size:13px; color:var(--text-dim); margin-bottom:20px;">Test how changing your physical habits tonight will mathematically impact your focus tomorrow.</p>
+          <div class="slider-row"><span>Tonight's Sleep: <b id="lbl_slp">7.5 hrs</b></span><input type="range" id="sl_slp" min="4.5" max="10.0" step="0.5" value="7.5" oninput="updateEnergySim()"></div>
           <div class="slider-row"><span>Morning Resting HR: <b id="lbl_rhr">62 bpm</b></span><input type="range" id="sl_rhr" min="48" max="85" step="1" value="62" oninput="updateEnergySim()"></div>
-          <div class="slider-row"><span>Morning HRV (SDNN): <b id="lbl_hrv">65 ms</b></span><input type="range" id="sl_hrv" min="25" max="120" step="5" value="65" oninput="updateEnergySim()"></div>
-          <div class="slider-row"><span>Walking / Exercise Today: <b id="lbl_wlk">60 mins</b></span><input type="range" id="sl_wlk" min="0" max="150" step="10" value="60" oninput="updateEnergySim()"></div>
+          <div class="slider-row"><span>Morning HRV: <b id="lbl_hrv">65 ms</b></span><input type="range" id="sl_hrv" min="25" max="120" step="5" value="65" oninput="updateEnergySim()"></div>
+          <div class="slider-row"><span>Walking Today: <b id="lbl_wlk">60 mins</b></span><input type="range" id="sl_wlk" min="0" max="150" step="10" value="60" oninput="updateEnergySim()"></div>
           <div style="margin-top:24px; padding-top:16px; border-top:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-size:14px;">Simulated Tomorrow Readiness:</span>
+            <span style="font-size:14px;">Simulated Tomorrow Energy:</span>
             <span id="sim_out" style="font-size:24px; font-weight:700; color:var(--accent-green);">78.4%</span>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- ================== TAB: SLEEP LAB ================== -->
+    <!-- SLEEP -->
     <div id="tab-sleep" class="tab-content">
       <h1 style="color:var(--accent-purp);">Activity 3: Sleep Experiment Lab</h1>
 
       <div class="science-box" style="border-color: var(--accent-purp);">
         <div class="science-icon">🌙</div>
         <div class="science-text">
-          <h4 style="color:var(--accent-purp);">The Science: Architecture & The Cardiac Hammock</h4>
-          <p>Restorative sleep is not just about duration. <b>Deep Sleep</b> (slow-wave) repairs tissue and flushes neurotoxins. <b>REM Sleep</b> consolidates memories. Mathematically, your overnight heart rate should form a U-shaped "Hammock Curve" as your parasympathetic nervous system cools your body down. A delayed nadir (bottom of the curve) indicates late digestion, alcohol, or chronic stress.</p>
-          <div class="safe-value">Optimal Baseline: Deep > 15%, REM > 20%, HR Nadir < 60% of night elapsed.</div>
+          <h4 style="color:var(--accent-purp);">The Science: The Cardiac Hammock Curve</h4>
+          <p>When you fall asleep, your heart rate should smoothly drop into the shape of a hammock. If the lowest point (the nadir) happens early in the night, your body recovered perfectly. If the hammock is flat, or bottoms out right before your alarm rings, it means your heart spent the entire night fighting off late-night digestion, room heat, or lingering stress instead of resting.</p>
+          <div class="safe-value" style="color:var(--accent-purp);">Healthy Rule: The bottom of your Hammock (Nadir) should hit between 40% and 60% of the way through the night.</div>
         </div>
       </div>
 
       <div class="grid-2">
         <div class="card">
-          <h3>Normalized Overnight Hammock Parabola HR(τ)</h3>
+          <h3>Your Overnight Hammock Curve</h3>
           <div id="c_slp_hammock" class="chart-box"></div>
         </div>
         <div class="card">
@@ -1791,12 +1760,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
             {sleep_log_html}
           </div>
         </div>
-      </div>
-
-      <div class="card">
-        <h3>N-of-1 Habit Effect Sizes (Hedges' g)</h3>
-        <p style="font-size:13px; color:var(--text-dim);">Evaluates your personal data to see which daily habits statistically improve your sleep and next-day energy.</p>
-        <div id="c_slp_effects" class="chart-box"></div>
       </div>
     </div>
 
@@ -1813,69 +1776,46 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     legend: {{ orientation: 'h', y: -0.15 }}
   }};
 
-  // Navigation Logic
   function openTab(tabId, btn) {{
     document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
     document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
     document.getElementById(tabId).classList.add('active');
     btn.classList.add('active');
-    window.dispatchEvent(new Event('resize')); // Fix Plotly rendering width issue on hidden tabs
+    window.dispatchEvent(new Event('resize')); 
   }}
 
-  // --- TAB 1: HOME PLOTS ---
   Plotly.newPlot('c_quad', [{{
     x: D.quad_hrv, y: D.quad_hr, text: D.quad_labels, mode: 'markers',
     marker: {{ size: 10, color: D.quad_colors, line: {{width:1, color:'#0f172a'}} }},
     hovertemplate: '%{{text}}<br>HRV: <b>%{{x}} ms</b> | HR: <b>%{{y}} bpm</b><extra></extra>'
   }}], {{
     ...layout,
-    xaxis: {{ ...layout.xaxis, title: 'HRV (ms) &rarr; Calmer' }},
-    yaxis: {{ ...layout.yaxis, title: 'Heart Rate (bpm) &darr; Calmer' }},
+    xaxis: {{ ...layout.xaxis, title: 'HRV (ms) &rarr; More Flexible' }},
+    yaxis: {{ ...layout.yaxis, title: 'Heart Rate (bpm) &darr; Less Workload' }},
     shapes: [
       {{ type:'line', x0:D.mean_hrv, x1:D.mean_hrv, y0:0, y1:1, yref:'paper', line:{{color:'#334155', dash:'dash'}} }},
       {{ type:'line', x0:0, x1:1, xref:'paper', y0:D.mean_hr, y1:D.mean_hr, line:{{color:'#334155', dash:'dash'}} }}
     ]
   }}, {{responsive:true}});
 
-  // --- TAB 2: STRESS DETECTIVE PLOTS ---
   Plotly.newPlot('c_st_intra', [
     {{ x: D.in_ts, y: D.in_hr_raw, mode:'lines', line:{{color:'#ef4444', width:2}}, name:'Actual HR' }},
     {{ x: D.in_ts, y: D.in_hr_exp, mode:'lines', line:{{color:'#38bdf8', width:2, dash:'dot'}}, name:'Metabolic Expected HR' }},
     {{ x: D.in_ts, y: D.in_stress, mode:'lines', yaxis:'y2', text: D.in_state, line:{{color:'#c084fc', width:2}}, name:'Stress %' }}
   ], {{ ...layout, yaxis2: {{ overlaying:'y', side:'right', range:[0, 105], font:{{color:'#c084fc'}} }} }}, {{responsive:true}});
 
-  Plotly.newPlot('c_st_hist', [
-    {{ x: D.st_dates, y: D.st_ci_up, mode:'lines', line:{{width:0}}, showlegend:false, hoverinfo:'skip' }},
-    {{ x: D.st_dates, y: D.st_ci_dn, mode:'lines', fill:'tonexty', fillcolor:'rgba(239,68,68,0.15)', line:{{width:0}}, name:'Uncertainty Band' }},
-    {{ x: D.st_dates, y: D.st_like, mode:'lines+markers', line:{{color:'#ef4444', width:3}}, name:'Stress Likelihood %' }},
-    {{ x: D.st_dates, y: D.st_anom, mode:'lines+markers', line:{{color:'#38bdf8', width:2, dash:'dash'}}, name:'Mahalanobis Anomaly χ² %' }}
-  ], layout, {{responsive:true}});
-
-  Plotly.newPlot('c_st_contrib', [{{
-    x: D.c_z, y: D.c_names, text: D.c_roles, type:'bar', orientation:'h',
-    marker: {{ color: D.c_colors }}, hovertemplate: '<b>%{{y}}</b><br>%{{text}}<extra></extra>'
-  }}], {{ ...layout, margin: {{ t:20, r:20, b:40, l:180 }} }}, {{responsive:true}});
-
-  // --- TAB 3: ENERGY PREDICTOR PLOTS ---
   Plotly.newPlot('c_borbely', [
     {{ x: D.b_hours, y: D.b_alert, mode:'lines+markers', marker:{{size:5}}, line:{{color:'#10b981', width:3}}, name:'Focus Prediction (1-5)' }},
-    {{ x: D.b_hours, y: D.b_adeno, mode:'lines', line:{{color:'#ef4444', width:2, dash:'dash'}}, name:'Process S (Adenosine)' }},
-    {{ x: D.b_hours, y: D.b_circ, mode:'lines', line:{{color:'#38bdf8', width:2, dash:'dot'}}, name:'Process C (Circadian)' }}
+    {{ x: D.b_hours, y: D.b_adeno, mode:'lines', line:{{color:'#ef4444', width:2, dash:'dash'}}, name:'Process S (Sandglass)' }},
+    {{ x: D.b_hours, y: D.b_circ, mode:'lines', line:{{color:'#38bdf8', width:2, dash:'dot'}}, name:'Process C (Internal Sun)' }}
   ], {{ ...layout, xaxis: {{ ...layout.xaxis, title: 'Hour of Day (6 = 6AM, 12 = Noon)' }} }}, {{responsive:true}});
 
-  // --- TAB 4: SLEEP LAB PLOTS ---
   Plotly.newPlot('c_slp_hammock', [
     {{ x: D.slp_tau, y: D.slp_hr_mean, mode:'markers+lines', marker:{{size:6, color:'#475569'}}, line:{{color:'#334155', width:1.5, dash:'dot'}}, name:'Sleeping HR' }},
-    {{ x: D.slp_tau, y: D.slp_hr_fit, mode:'lines', line:{{color:'#a855f7', width:3}}, name:'Hammock Fit Parabola' }},
+    {{ x: D.slp_tau, y: D.slp_hr_fit, mode:'lines', line:{{color:'#a855f7', width:3}}, name:'Hammock Curve Fit' }},
     {{ x: D.slp_tau, y: D.slp_hrv_mean, mode:'lines+markers', yaxis:'y2', marker:{{size:5}}, line:{{color:'#38bdf8', width:2}}, name:'Overnight HRV', connectgaps:true }}
   ], {{ ...layout, yaxis2: {{ overlaying:'y', side:'right', font:{{color:'#38bdf8'}} }} }}, {{responsive:true}});
 
-  Plotly.newPlot('c_slp_effects', [
-    {{ x: D.eff_g_slp, y: D.eff_names, type:'bar', orientation:'h', name:'Sleep Quality Effect', marker:{{color: D.eff_cols}} }},
-    {{ x: D.eff_g_eng, y: D.eff_names, type:'bar', orientation:'h', name:'Next-Day Energy Effect', marker:{{color:'#38bdf8', opacity:0.8}} }}
-  ], {{ ...layout, barmode: 'group', margin: {{ t:20, r:20, b:40, l:210 }} }}, {{responsive:true}});
-
-  // --- SIMULATOR LOGIC ---
   function updateStressSim() {{
     const hr = parseFloat(document.getElementById('st_sl_hr').value);
     const stp = parseFloat(document.getElementById('st_sl_stp').value);
