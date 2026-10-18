@@ -58,7 +58,6 @@ STAGE_MAP = {
     "awake": "Awake in Bed",
 }
 
-
 def clean_nans(obj):
     if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
         return None
@@ -67,7 +66,6 @@ def clean_nans(obj):
     if isinstance(obj, list):
         return [clean_nans(x) for x in obj]
     return obj
-
 
 @app.post("/webhook")
 async def receive_health_data(request: Request):
@@ -198,7 +196,6 @@ async def receive_health_data(request: Request):
         "sleep_added": added_sleep,
         "total": len(stored_records),
     }
-
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_cockpit():
