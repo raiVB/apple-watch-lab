@@ -1948,7 +1948,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   const D = {json.dumps(payload)};
   const CIRC = 326.73;
   const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
-  const base = {{
+  
+  // FIX: Deep-clone the layout base for every plot using a function to stop Plotly from mutating shared configurations.
+  const getBase = () => JSON.parse(JSON.stringify({{
     paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
     font:{{ color:C.dim, family:'Manrope, -apple-system, sans-serif', size:12 }},
     margin:{{ t:40, r:16, b:46, l:48 }},
@@ -1956,7 +1958,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     yaxis:{{ gridcolor:C.grid, zeroline:false, linecolor:'rgba(0,0,0,0)', tickfont:{{ size:11 }} }},
     legend:{{ orientation:'h', x:0, y:1.14, font:{{ size:12 }} }},
     hoverlabel:{{ bgcolor:'#1d222c', bordercolor:'rgba(255,255,255,.12)', font:{{ color:C.tx, family:'Manrope, sans-serif' }} }}
-  }};
+  }}));
+  
   const cfg = {{ responsive:true, displayModeBar:false }};
 
   function clock(h) {{
@@ -1988,6 +1991,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
   // ---------- HOME ----------
   function renderHome() {{
+    const base = getBase();
     const map = {{ '#10b981':C.energy, '#ef4444':C.stress, '#38bdf8':C.hr }};
     const cols = D.quad_colors.map(c => map[c] || c);
     const n = cols.length, good = D.quad_colors.filter(c => c === '#10b981').length;
@@ -2015,6 +2019,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
   // ---------- STRESS ----------
   function renderStress() {{
+    const base = getBase();
     let mi = -1;
     D.in_stress.forEach((v, i) => {{ if (typeof v === 'number' && (mi < 0 || v > D.in_stress[mi])) mi = i; }});
     if (mi >= 0) chip('chip_stress', 'Highest: ' + Math.round(D.in_stress[mi]) + '% at ' + D.in_ts[mi], D.in_stress[mi] >= 65 ? C.stress : C.warn);
@@ -2072,6 +2077,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
   // ---------- ENERGY ----------
   function renderEnergy() {{
+    const base = getBase();
     let pi = -1;
     D.b_alert.forEach((v, i) => {{ if (typeof v === 'number' && (pi < 0 || v > D.b_alert[pi])) pi = i; }});
     const traces = [
@@ -2098,7 +2104,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     document.getElementById('lbl_hrv').innerText = hrv + ' ms';
     document.getElementById('lbl_wlk').innerText = wlk + ' mins';
 
-const z_vec = [(slp - 7.5)/0.85, 0, (rhr - D.mean_hr + 8)/4.0, (Math.log(hrv) - Math.log(Math.max(D.mean_hrv, 30)))/0.22, (wlk - 50)/25, ((wlk - 50)/25) - 0.25*(((wlk - 50)/25)**2)];
+    const z_vec = [(slp - 7.5)/0.85, 0, (rhr - D.mean_hr + 8)/4.0, (Math.log(hrv) - Math.log(Math.max(D.mean_hrv, 30)))/0.22, (wlk - 50)/25, ((wlk - 50)/25) - 0.25*(((wlk - 50)/25)**2)];
     let dot = 0;
     for (let i = 0; i < D.f_weights.length; i++) dot += z_vec[i] * D.f_weights[i];
     
@@ -2115,6 +2121,7 @@ const z_vec = [(slp - 7.5)/0.85, 0, (rhr - D.mean_hr + 8)/4.0, (Math.log(hrv) - 
 
   // ---------- SLEEP ----------
   function renderSleep() {{
+    const base = getBase();
     const fit = D.slp_hr_fit;
     let ni = -1;
     for (let i = 0; i < fit.length; i++) {{ if (typeof fit[i] === 'number' && (ni < 0 || fit[i] < fit[ni])) ni = i; }}
