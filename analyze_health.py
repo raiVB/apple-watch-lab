@@ -926,7 +926,7 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
     else:
         valid_train = pd.DataFrame()
 
- if len(valid_train) >= 2:
+    if len(valid_train) >= 2:
         X = valid_train[feature_cols].to_numpy(dtype=float)
         y = valid_train["mean_energy"].to_numpy(dtype=float) - 3.2
         I_mat = np.eye(len(beta_0))
@@ -940,8 +940,6 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
     raw_pred_centered = X_all @ beta_map
     
     # SCIENTIFIC REFINEMENT: The Homeostatic Intercept
-    # Shifts the biological baseline so a perfectly average day (Z=0) 
-    # yields ~85% readiness, accurately reflecting a healthy young adult's baseline.
     homeostatic_intercept = 1.35 
     
     df_feat["pred_energy_1_5"] = np.clip(3.8 + raw_pred_centered, 1.0, 5.0)
