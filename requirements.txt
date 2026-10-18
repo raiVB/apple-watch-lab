@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 pandas
 numpy
+pymongo[srv]==4.6.2
