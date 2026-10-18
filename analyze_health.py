@@ -936,10 +936,16 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
         beta_map = beta_0.copy()
         model_mode = f"Biophysical Prior Mode (Log 2+ days in {LOG_CSV} to adapt personal ML weights)"
 
-    X_all = df_feat[feature_cols].to_numpy(dtype=float)
+ X_all = df_feat[feature_cols].to_numpy(dtype=float)
     raw_pred_centered = X_all @ beta_map
-    df_feat["pred_energy_1_5"] = np.clip(3.2 + raw_pred_centered, 1.0, 5.0)
-    df_feat["readiness_pct"] = np.clip(100.0 / (1.0 + np.exp(-1.35 * raw_pred_centered)), 15.0, 99.0)
+    
+    # SCIENTIFIC REFINEMENT: The Homeostatic Intercept
+    # Shifts the biological baseline so a perfectly average day (Z=0) 
+    # yields ~85% readiness, accurately reflecting a healthy young adult's baseline.
+    homeostatic_intercept = 1.35 
+    
+    df_feat["pred_energy_1_5"] = np.clip(3.8 + raw_pred_centered, 1.0, 5.0)
+    df_feat["readiness_pct"] = np.clip(100.0 / (1.0 + np.exp(-1.45 * (raw_pred_centered + homeostatic_intercept))), 10.0, 99.0)
 
     today = df_feat.iloc[-1]
     readiness_score = float(today["readiness_pct"])
@@ -2092,11 +2098,13 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     document.getElementById('lbl_hrv').innerText = hrv + ' ms';
     document.getElementById('lbl_wlk').innerText = wlk + ' mins';
 
-    const z_vec = [(slp - 7.5)/0.85, 0, (rhr - D.mean_hr + 8)/4.0, (Math.log(hrv) - Math.log(Math.max(D.mean_hrv, 30)))/0.22, (wlk - 50)/25, ((wlk - 50)/25) - 0.25*(((wlk - 50)/25)**2)];
+const z_vec = [(slp - 7.5)/0.85, 0, (rhr - D.mean_hr + 8)/4.0, (Math.log(hrv) - Math.log(Math.max(D.mean_hrv, 30)))/0.22, (wlk - 50)/25, ((wlk - 50)/25) - 0.25*(((wlk - 50)/25)**2)];
     let dot = 0;
     for (let i = 0; i < D.f_weights.length; i++) dot += z_vec[i] * D.f_weights[i];
-
-    const pred_pct = Math.min(99, Math.max(15, 100 / (1 + Math.exp(-1.35 * dot))));
+    
+    // MATCHING THE NEW COMPUTATIONAL PHYSIOLOGY MATH
+    const homeostatic_intercept = 1.35;
+    const pred_pct = Math.min(99.0, Math.max(10.0, 100.0 / (1.0 + Math.exp(-1.45 * (dot + homeostatic_intercept)))));
     const col = pred_pct >= 70 ? C.energy : (pred_pct >= 48 ? C.warn : C.stress);
     document.getElementById('sim_out').innerText = Math.round(pred_pct);
     const t = document.getElementById('en_tag');
