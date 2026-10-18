@@ -1898,6 +1898,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     <button class="nav-btn" data-tab="stress" onclick="openTab('stress')"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Stress</button>
     <button class="nav-btn" data-tab="energy" onclick="openTab('energy')"><svg viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg>Energy</button>
     <button class="nav-btn" data-tab="sleep" onclick="openTab('sleep')"><svg viewBox="0 0 24 24"><path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/></svg>Sleep</button>
+    <button class="nav-btn" data-tab="data" onclick="openTab('data')">📊 Data Explorer</button>
   </nav>
 
   <main class="main">
