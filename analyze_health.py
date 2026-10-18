@@ -1481,7 +1481,7 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
     }
 
 # ==============================================================================
-# BIO LAB DASHBOARD BUILDER (Merciless Data Purifier)
+# BIO LAB DASHBOARD BUILDER (Explicit Axis Labels & Hypnogram Fix)
 # Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
 # ==============================================================================
 
@@ -1490,15 +1490,19 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     import json
 
     # --- 0. MERCILESS DATA PURIFIER ------------------------------------------
-    # Health Auto Export sends both 8-hour summaries AND minute-by-minute raw blocks.
-    # This mathematically detects and destroys the 8-hour summary blocks.
     if not df_sleep.empty:
-        # Calculate the actual time window of the block
-        df_sleep['window_hrs'] = (df_sleep['end_epoch'] - df_sleep['start_epoch']) * 300 / 3600.0
-        # If the block spans 8 hours on the clock but only contains 1 hour of Deep Sleep, it is a fake summary.
-        # We only keep rows where the timestamp window matches the logged duration (tolerance of 0.75 hours).
-        valid_mask = abs(df_sleep['window_hrs'] - df_sleep['hours']) <= 0.75
-        df_sleep = df_sleep[valid_mask].copy()
+        df_sleep = df_sleep.copy()
+        calc_dur = df_sleep['wake_hr'] - df_sleep['onset_hr']
+        calc_dur = np.where(calc_dur < 0, calc_dur + 24.0, calc_dur)
+        df_sleep['is_summary'] = abs(df_sleep['hours'] - calc_dur) > 0.75
+        
+        filtered_dfs = []
+        for d, grp in df_sleep.groupby('date'):
+            if not grp[~grp['is_summary']].empty:
+                filtered_dfs.append(grp[~grp['is_summary']])
+            else:
+                filtered_dfs.append(grp)
+        df_sleep = pd.concat(filtered_dfs) if filtered_dfs else df_sleep
 
     # --- 1. SLEEP TIMELINE + STAGE BAR ---------------------------------------
     def stage_style(stage):
@@ -1509,10 +1513,12 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     sleep_log_html, stage_bar_html = "", ""
     stage_blocks = []
+    is_summary_night = False
     
     if not df_sleep.empty:
         latest_sleep_date = df_sleep['date'].max()
         recent_sleep = df_sleep[df_sleep['date'] == latest_sleep_date].sort_values("start_epoch")
+        is_summary_night = bool(recent_sleep['is_summary'].all())
         
         totals = {}
         for _, r in recent_sleep.iterrows():
@@ -1527,9 +1533,11 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
                 "end": r["wake_hr"], "dur": mins
             })
 
+            time_label = "Daily Summary Total" if is_summary_night else f"{st_str} &ndash; {en_str}"
+
             sleep_log_html += f"""
             <div class="tl" style="--c:{col}">
-              <div class="t" style="font-weight: 600;">{st_str} &ndash; {en_str}</div>
+              <div class="t" style="font-weight: 600;">{time_label}</div>
               <div class="ln"><span class="nd"></span></div>
               <div class="d"><b>{r['stage']}</b><span class="mins">{mins} min</span><p>{desc}</p></div>
             </div>"""
@@ -1539,7 +1547,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         leg = "".join(f"<span><span class='dot' style='--c:{stage_style(s)[0]}'></span>{s} <b>{int(round(h * 60))} min</b></span>" for s, h in totals.items())
         stage_bar_html = f"<div class='stagebar'>{seg}</div><div class='legend'>{leg}</div>"
     else:
-        sleep_log_html = "<div class='empty'>No detailed stages found. Ensure Sleep Focus is active.</div>"
+        sleep_log_html = "<div class='empty'>No sleep stages recorded last night. Ensure Sleep Focus is active.</div>"
 
     # --- 2. DATA TABLE + STRESS EPISODES -------------------------------------
     table_html = ""
@@ -1596,14 +1604,11 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         "in_ts": stress_bundle["intraday_ts"], "in_hr_raw": stress_bundle["intraday_hr_raw"],
         "in_hr_exp": stress_bundle["intraday_hr_exp"], "in_stress": stress_bundle["intraday_stress"],
         "in_state": stress_bundle["intraday_state"],
-        "c_names": stress_bundle["contrib_names"], "c_z": stress_bundle["contrib_z"],
-        "c_colors": stress_bundle["contrib_colors"], "c_roles": stress_bundle["contrib_roles"],
         "slp_tau": sleep_bundle["hammock_tau_x"], "slp_hr_mean": sleep_bundle["hammock_hr_mean"],
         "slp_hr_fit": sleep_bundle["hammock_hr_fitted"], "slp_hrv_mean": sleep_bundle["hammock_hrv_mean"],
-        "eff_names": sleep_bundle["effect_names"], "eff_g_slp": sleep_bundle["effect_g_sleep"],
-        "eff_g_eng": sleep_bundle["effect_g_energy"], "eff_cols": sleep_bundle["effect_colors"],
         "f_weights": pred_bundle["feature_weights"],
-        "stage_blocks": stage_blocks
+        "stage_blocks": stage_blocks,
+        "is_summary_night": is_summary_night
     }
 
     # --- 4. HTML CONSTRUCTION --------------------------------------------------
@@ -1818,7 +1823,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     <section id="tab-sleep" class="tab">
       <header class="ph"><h1>Sleep lab</h1><p>Precise mapping of your sleep architecture and recovery.</p></header>
       
-      <!-- Hypnogram Row -->
       <div class="row">
         <div class="panel">
           <div class="pt"><div><h3>Hypnogram (Sleep Cycle Timeline)</h3><p>The exact chronological flow of your sleep stages throughout the night.</p></div></div>
@@ -1847,7 +1851,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   const CIRC = 326.73;
   const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
   
-  // Safe deep clone to stop axis settings from mutating across charts
   const getBase = () => JSON.parse(JSON.stringify({{
     paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
     font:{{ color:C.dim, family:'Manrope, -apple-system, sans-serif', size:12 }},
@@ -1889,8 +1892,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       hovertemplate:'%{{text}}<br>HRV <b>%{{x}} ms</b> &middot; HR <b>%{{y}} bpm</b><extra></extra>'
     }}], {{
       ...base,
-      xaxis:{{ ...base.xaxis, title:{{ text:'HRV (ms): higher is more recovered' }}, type:'linear' }},
-      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm): lower is calmer' }}, type:'linear' }}
+      xaxis:{{ ...base.xaxis, title:{{ text:'Heart Rate Variability (ms) &rarr; Battery Charge' }}, type:'linear' }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'Resting Heart Rate (bpm) &darr; Engine Speed' }}, type:'linear' }}
     }}, cfg);
   }}
 
@@ -1903,8 +1906,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       {{ x:D.in_ts, y:D.in_hr_raw, mode:'lines', line:{{ color:C.tx, width:2 }}, name:'Actual heart rate', hovertemplate:'%{{y:.0f}} bpm<extra>Actual</extra>' }}
     ], {{
       ...base, hovermode:'x unified', margin:{{ ...base.margin, r:44 }},
-      yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }}, type:'linear' }},
-      yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
+      xaxis:{{ ...base.xaxis, title:{{ text:'Time of Day' }} }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'Heart Rate (bpm)' }} }},
+      yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], title:{{ text:'Stress (%)', font:{{color:C.stress, size:11}} }}, showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
     }}, cfg);
     updateStressSim();
   }}
@@ -1943,7 +1947,11 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       traces.push({{ x:[D.b_hours[pi]], y:[D.b_alert[pi]], mode:'markers', marker:{{ size:13, color:C.energy, line:{{ width:3, color:'#11141a' }} }}, name:'Best focus', hoverinfo:'skip' }});
       chip('chip_peak', 'Best focus around ' + clock(D.b_hours[pi]), C.energy);
     }}
-    Plotly.newPlot('c_borbely', traces, {{ ...base, hovermode:'x unified', xaxis:{{ ...base.xaxis, title:{{ text:'Hour of day' }}, dtick:2, type:'linear' }}, yaxis:{{ ...base.yaxis, type:'linear' }} }}, cfg);
+    Plotly.newPlot('c_borbely', traces, {{ 
+      ...base, hovermode:'x unified', 
+      xaxis:{{ ...base.xaxis, title:{{ text:'Hour of Day (24h Clock)' }}, dtick:2, type:'linear' }}, 
+      yaxis:{{ ...base.yaxis, title:{{ text:'Biological Intensity (Scale 1-5)' }}, type:'linear' }} 
+    }}, cfg);
     updateEnergySim();
   }}
 
@@ -1973,17 +1981,20 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   function renderSleep() {{
     const base = getBase();
     
-    // 1. Render Hammock Curve
     Plotly.newPlot('c_slp_hammock', [
       {{ x:D.slp_tau, y:D.slp_hr_mean, mode:'markers', marker:{{ size:6, color:'rgba(255,255,255,.28)' }}, name:'Sleeping heart rate', hovertemplate:'%{{y:.0f}} bpm<extra></extra>' }},
       {{ x:D.slp_tau, y:D.slp_hr_fit, mode:'lines', line:{{ color:C.sleep, width:3, shape:'spline' }}, name:'Hammock curve', hoverinfo:'skip' }},
       {{ x:D.slp_tau, y:D.slp_hrv_mean, yaxis:'y2', mode:'lines+markers', marker:{{ size:5 }}, line:{{ color:C.hr, width:2 }}, name:'HRV', connectgaps:true, hovertemplate:'%{{y:.0f}} ms<extra>HRV</extra>' }}
-    ], {{ ...base, margin:{{ ...base.margin, r:44 }}, xaxis:{{ ...base.xaxis, type:'linear' }}, yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }}, type:'linear' }}, yaxis2:{{ overlaying:'y', side:'right', showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }} }}, cfg);
+    ], {{ 
+      ...base, margin:{{ ...base.margin, r:44 }}, 
+      xaxis:{{ ...base.xaxis, title:{{ text:'Percentage of Night Completed (0.0 to 1.0)' }}, type:'linear' }}, 
+      yaxis:{{ ...base.yaxis, title:{{ text:'Heart Rate (bpm)' }}, type:'linear' }}, 
+      yaxis2:{{ overlaying:'y', side:'right', title:{{ text:'HRV (ms)', font:{{color:C.hr, size:11}} }}, showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }} 
+    }}, cfg);
 
-    // 2. Safely Render Hypnogram or Fallback Message
-    if (!D.stage_blocks || D.stage_blocks.length === 0) {{
+    if (D.is_summary_night || !D.stage_blocks || D.stage_blocks.length === 0) {{
       document.getElementById('c_hypno').innerHTML = `<div style="display:flex; height:100%; align-items:center; justify-content:center; color:#8c95a6; font-size:13.5px; text-align:center; padding:20px;">
-        <div><b style="color:#eef1f6; font-size: 15px;">No chronological data found.</b><br><br>Ensure Apple Watch Sleep Focus is tracking stages.</div>
+        <div><b style="color:#eef1f6; font-size: 15px;">Chronological data missing.</b><br><br>The payload only contained total durations (summary mode), not the minute-by-minute breakdown.</div>
       </div>`;
     }} else {{
       const px = [], py = [], pt = [];
@@ -2017,8 +2028,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
           fill: 'tozeroy', fillcolor: 'rgba(143,155,255,0.1)', hoverinfo: 'text'
       }}], {{
           ...base, margin: {{...base.margin, l: 50, t: 20, b: 30}},
-          xaxis: {{ ...base.xaxis, tickvals: ticks, ticktext: ticktext, type: 'linear' }},
-          yaxis: {{ ...base.yaxis, tickvals: [0, 1, 2, 3], ticktext: ['Deep', 'Core', 'REM', 'Awake'], range: [-0.5, 3.5], type: 'linear' }}
+          xaxis: {{ ...base.xaxis, title:{{ text:'Exact Time of Night' }}, tickvals: ticks, ticktext: ticktext, type: 'linear' }},
+          yaxis: {{ ...base.yaxis, title:{{ text:'Sleep Depth' }}, tickvals: [0, 1, 2, 3], ticktext: ['Deep', 'Core', 'REM', 'Awake'], range: [-0.5, 3.5], type: 'linear' }}
       }}, cfg);
     }}
   }}
@@ -2048,7 +2059,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
     with open("biometric_science_lab.html", "w", encoding="utf-8") as f:
         f.write(html)
-
 
     abs_path = os.path.abspath(HTML_DASHBOARD)
     print(f"[6/6] Launching Unified 3-Activity Biometric Science Lab: {abs_path}")
