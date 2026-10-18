@@ -1476,62 +1476,76 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
         "diary_rows": night_records[-10:][::-1],
     }
 
-
 # ==============================================================================
-# PREMIUM TABBED UI/UX DASHBOARD BUILDER (LAYMAN SCIENCE EDITION)
+# BIO LAB DASHBOARD BUILDER (Oura / Whoop-style redesign)
+# Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
 # ==============================================================================
 
 def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle):
-    print("[5/6] Building Premium Layman-Friendly SPA (Home + Sleep + Stress + Energy)...")
+    print("[5/6] Building Bio Lab dashboard (Home + Stress + Energy + Sleep)...")
     import json
 
-    # --- 1. SLEEP TIMELINE LOG GENERATION ---
-    sleep_log_html = ""
+    # --- 1. SLEEP TIMELINE + STAGE BAR ---------------------------------------
+    def stage_style(stage):
+        if "Deep" in stage:  return "#5b6cff", "Body repairs muscle and clears waste from the brain."
+        if "REM" in stage:   return "#c4a1ff", "Brain sorts memories and learning."
+        if "Awake" in stage: return "#ff7a6b", "Brief awakenings, often not remembered."
+        return "#7cc4ff", "Light sleep that links deep and REM cycles."
+
+    sleep_log_html, stage_bar_html = "", ""
     if not df_sleep.empty:
         latest_sleep_date = df_sleep['date'].max()
         recent_sleep = df_sleep[df_sleep['date'] == latest_sleep_date].sort_values("start_epoch")
+        totals = {}
         for _, r in recent_sleep.iterrows():
             st_str = hour_to_clock_str(r["onset_hr"])
             en_str = hour_to_clock_str(r["wake_hr"])
             mins = int(round(r['hours'] * 60))
-            if "Deep" in r['stage']: col, icon, desc = "#3b82f6", "🌊", "Body repairs muscles & clears brain toxins."
-            elif "REM" in r['stage']: col, icon, desc = "#a855f7", "🧠", "Brain organizes memories & learning."
-            elif "Awake" in r['stage']: col, icon, desc = "#ef4444", "👀", "Micro-awakenings (often unremembered)."
-            else: col, icon, desc = "#38bdf8", "☁️", "Light sleep bridging deep and REM cycles."
-            
+            col, desc = stage_style(r['stage'])
+            totals[r['stage']] = totals.get(r['stage'], 0) + r['hours']
             sleep_log_html += f"""
-            <div class="timeline-row">
-                <div class="time-col">{st_str} &rarr; {en_str}</div>
-                <div class="line-col"><div class="node" style="background:{col}; shadow: 0 0 10px {col};"></div></div>
-                <div class="data-col">
-                    <div style="color:{col}; font-weight:600;">{icon} {r['stage']} <span style="color:#94a3b8; font-size:12px; margin-left:8px;">({mins} mins)</span></div>
-                    <div style="color:#64748b; font-size:11px; margin-top:2px;">{desc}</div>
-                </div>
+            <div class="tl" style="--c:{col}">
+              <div class="t">{st_str} &ndash; {en_str}</div>
+              <div class="ln"><span class="nd"></span></div>
+              <div class="d"><b>{r['stage']}</b><span class="mins">{mins} min</span><p>{desc}</p></div>
             </div>"""
+        total_h = sum(totals.values()) or 1
+        seg = "".join(f"<i style='width:{h / total_h * 100:.1f}%;--c:{stage_style(s)[0]}' title='{s}'></i>" for s, h in totals.items())
+        leg = "".join(f"<span><span class='dot' style='--c:{stage_style(s)[0]}'></span>{s} <b>{int(round(h * 60))} min</b></span>" for s, h in totals.items())
+        stage_bar_html = f"<div class='stagebar'>{seg}</div><div class='legend'>{leg}</div>"
     else:
-        sleep_log_html = "<div style='color:#94a3b8; padding:20px;'>No precise sleep stage data available for last night. Wear watch to bed.</div>"
+        sleep_log_html = "<div class='empty'>No sleep stages recorded for last night. Wear your watch to bed to see them here.</div>"
 
-    # --- 2. DATA TABLES GENERATION ---
-    table_html = "".join([
-        f"<tr><td><b>{r['name']}</b><br><span style='font-size:11px;color:#38bdf8;'>{r['category']}</span></td>"
-        f"<td><span class='badge' style='background: #10b98122; color:#10b981;'>{r['latest']}</span></td>"
-        f"<td><b>{r['avg']}</b></td><td style='color:#38bdf8;'>{r['normal']}</td>"
-        f"<td style='font-size:12px;color:#cbd5e1;line-height:1.4;'>{r['desc']}</td></tr>"
-        for r in [{"name": k, "category": v[1], "latest": f"{df_raw[df_raw['metric']==k]['value'].iloc[-1]:.1f} {v[2]}" if not df_raw[df_raw['metric']==k].empty else "—", "avg": f"{df_raw[df_raw['metric']==k]['value'].mean():.1f} {v[2]}" if not df_raw[df_raw['metric']==k].empty else "—", "normal": v[3], "desc": v[4]} for k, v in PARAMETER_GUIDE.items()]
-    ])
+    # --- 2. DATA TABLE + STRESS EPISODES -------------------------------------
+    table_html = ""
+    for k, v in PARAMETER_GUIDE.items():
+        sub = df_raw[df_raw['metric'] == k]['value']
+        latest = f"{sub.iloc[-1]:.1f} {v[2]}" if not sub.empty else "—"
+        avg = f"{sub.mean():.1f} {v[2]}" if not sub.empty else "—"
+        table_html += (
+            f"<tr><td><b>{k}</b><br><span class='cat'>{v[1]}</span></td>"
+            f"<td><span class='pill' style='--c:#3ddbb0'>{latest}</span></td>"
+            f"<td><b>{avg}</b></td><td class='rng'>{v[3]}</td><td class='mean'>{v[4]}</td></tr>"
+        )
 
-    ep_rows_html = "".join([
-        f"<tr><td><b>{ep['timestamp']}</b><br><span style='font-size:11px;color:#94a3b8;'>{ep['state']}</span></td>"
-        f"<td><span class='badge' style='background:{'#ef4444' if ep['stress_pct']>=65 else '#f59e0b'}22; color:{'#ef4444' if ep['stress_pct']>=65 else '#f59e0b'};'>{ep['stress_pct']}%</span></td>"
-        f"<td style='font-size:13px;'>{ep['facts']}</td><td style='font-size:13px;color:#c084fc;'>{ep['hypothesis']}</td></tr>"
-        for ep in stress_bundle["episodes"]
-    ]) if stress_bundle["episodes"] else "<tr><td colspan='4' style='text-align:center;color:#10b981;padding:20px;'>No Unusual Non-Metabolic Stress Episodes Detected! Your heart only sped up when you were physically moving.</td></tr>"
+    ep_rows_html = ""
+    for ep in stress_bundle["episodes"]:
+        ec = "#ff7a6b" if ep['stress_pct'] >= 65 else "#f5b84a"
+        ep_rows_html += f"""
+        <div class="ep" style="--c:{ec}">
+          <div><b>{ep['timestamp']}</b><div class="sub">{ep['state']}</div></div>
+          <div><span class="pill">{ep['stress_pct']}%</span></div>
+          <div>{ep['facts']}</div>
+          <div class="hyp">{ep['hypothesis']}</div>
+        </div>"""
+    if not ep_rows_html:
+        ep_rows_html = "<div class='empty good'>No unusual stress episodes. Your heart rate only rose when you were moving.</div>"
 
-    # --- 3. JSON PAYLOAD FOR PLOTLY ---
+    # --- 3. JSON PAYLOAD FOR PLOTLY ------------------------------------------
     all_dates = sorted(df_raw["date"].unique()) if not df_raw.empty else []
     recent_cutoff = all_dates[-min(14, len(all_dates))] if all_dates else "2026-01-01"
     df = df_raw[df_raw["date"] >= recent_cutoff]
-    
+
     hr_df = df[df["metric"] == "HeartRate"].sort_values("epoch_5m")
     hrv_df = df[df["metric"] == "HeartRateVariabilitySDNN"].sort_values("epoch_5m")
     quad_hrv, quad_hr, quad_labels, quad_colors = [], [], [], []
@@ -1565,286 +1579,510 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         "f_weights": pred_bundle["feature_weights"],
     }
 
-    # --- 4. HTML CONSTRUCTION ---
+    # --- 4. HTML CONSTRUCTION --------------------------------------------------
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Apple Watch Layman Lab</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bio Lab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 <style>
-  :root {{ --bg: #020617; --card: #0f172a; --card-hover: #1e293b; --text-main: #f8fafc; --text-dim: #94a3b8; --border: #1e293b; --accent-blue: #38bdf8; --accent-green: #10b981; --accent-red: #ef4444; --accent-purp: #a855f7; }}
-  body {{ background: var(--bg); color: var(--text-main); font-family: -apple-system, sans-serif; margin: 0; line-height: 1.5; }}
-  .nav-bar {{ background: rgba(15, 23, 42, 0.95); border-bottom: 1px solid var(--border); padding: 16px 32px; position: sticky; top: 0; z-index: 100; display: flex; gap: 12px; }}
-  .nav-title {{ font-size: 18px; font-weight: 700; color: var(--text-main); margin-right: 24px; }}
-  .nav-btn {{ background: transparent; border: none; color: var(--text-dim); font-size: 14px; font-weight: 600; cursor: pointer; padding: 8px 16px; border-radius: 99px; transition: 0.2s; }}
-  .nav-btn:hover {{ background: var(--card-hover); color: var(--text-main); }}
-  .nav-btn.active {{ background: var(--text-main); color: var(--bg); }}
-  .container {{ max-width: 1300px; margin: 0 auto; padding: 32px; }}
-  .tab-content {{ display: none; animation: fadeIn 0.3s ease; }}
-  .tab-content.active {{ display: block; }}
-  @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(10px); }} to {{ opacity: 1; transform: translateY(0); }} }}
-  .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 24px; }}
-  .grid-3 {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; margin-bottom: 24px; }}
-  .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.2); }}
-  h1 {{ font-size: 28px; margin: 0 0 8px 0; }}
-  h3 {{ font-size: 16px; margin: 0 0 16px 0; color: var(--text-main); font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 12px; }}
-  .badge {{ padding: 4px 10px; border-radius: 8px; font-size: 12px; font-weight: 700; display: inline-block; }}
-  .chart-box {{ height: 380px; width: 100%; }}
-  .science-box {{ background: linear-gradient(145deg, #0f172a 0%, #020617 100%); border: 1px solid; border-radius: 12px; padding: 24px; margin-bottom: 24px; display: flex; gap: 20px; align-items: flex-start; }}
-  .science-icon {{ font-size: 38px; background: rgba(255,255,255,0.05); padding: 16px; border-radius: 16px; }}
-  .science-text h4 {{ margin: 0 0 10px 0; font-size: 18px; }}
-  .science-text p {{ margin: 0 0 12px 0; font-size: 14.5px; color: var(--text-dim); line-height: 1.6; }}
-  .safe-value {{ display: inline-block; background: rgba(255,255,255,0.1); padding: 6px 12px; border-radius: 6px; font-size: 13px; font-weight: 600; }}
-  table {{ width: 100%; border-collapse: collapse; margin-bottom: 24px; font-size: 13px; }}
-  th {{ text-align: left; padding: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border); text-transform: uppercase; font-size: 11px; }}
-  td {{ padding: 16px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }}
-  .timeline-row {{ display: grid; grid-template-columns: 120px 20px 1fr; gap: 16px; margin-bottom: 0; }}
-  .time-col {{ text-align: right; font-size: 12px; color: var(--text-dim); padding-top: 2px; }}
-  .line-col {{ display: flex; flex-direction: column; align-items: center; position: relative; }}
-  .line-col::after {{ content: ''; position: absolute; top: 14px; bottom: -14px; width: 2px; background: var(--border); z-index: 1; }}
-  .timeline-row:last-child .line-col::after {{ display: none; }}
-  .node {{ width: 12px; height: 12px; border-radius: 50%; z-index: 2; margin-top: 4px; border: 2px solid var(--bg); }}
-  .data-col {{ padding-bottom: 20px; }}
-  .slider-row {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; }}
-  .slider-row input {{ width: 50%; accent-color: var(--accent-blue); }}
+  :root {{
+    --bg:#0a0c10; --s1:#11141a; --s2:#181c24; --line:rgba(255,255,255,.07);
+    --tx:#eef1f6; --dim:#8c95a6; --faint:#5d6677;
+    --sleep:#8f9bff; --stress:#ff7a6b; --energy:#3ddbb0; --hr:#7cc4ff; --warn:#f5b84a;
+  }}
+  * {{ box-sizing:border-box; }}
+  html {{ color-scheme:dark; }}
+  body {{ margin:0; background:var(--bg); color:var(--tx); font-family:'Manrope',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; line-height:1.55; -webkit-font-smoothing:antialiased; font-variant-numeric:tabular-nums; }}
+  button, input {{ font-family:inherit; }}
+  button:focus-visible, input:focus-visible, summary:focus-visible {{ outline:2px solid var(--hr); outline-offset:3px; }}
+
+  .shell {{ display:grid; grid-template-columns:232px minmax(0,1fr); min-height:100vh; }}
+  .nav {{ position:sticky; top:0; height:100vh; padding:28px 14px; border-right:1px solid var(--line); display:flex; flex-direction:column; gap:4px; }}
+  .brand {{ display:flex; align-items:center; gap:10px; font-weight:800; font-size:17px; letter-spacing:-.01em; padding:0 12px 28px; }}
+  .nav-btn {{ display:flex; align-items:center; gap:12px; width:100%; background:none; border:0; color:var(--dim); font-size:14px; font-weight:600; padding:11px 12px; border-radius:12px; cursor:pointer; text-align:left; }}
+  .nav-btn svg {{ width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; flex:none; }}
+  .nav-btn:hover {{ color:var(--tx); }}
+  .nav-btn.active {{ background:var(--s2); color:var(--tx); }}
+  .nav-btn[data-tab=home].active svg {{ stroke:var(--hr); }}
+  .nav-btn[data-tab=stress].active svg {{ stroke:var(--stress); }}
+  .nav-btn[data-tab=energy].active svg {{ stroke:var(--energy); }}
+  .nav-btn[data-tab=sleep].active svg {{ stroke:var(--sleep); }}
+
+  .main {{ padding:44px 48px 72px; max-width:1240px; width:100%; }}
+  .tab {{ display:none; }}
+  .tab.active {{ display:block; }}
+  .ph h1 {{ font-size:32px; font-weight:800; letter-spacing:-.025em; margin:0 0 6px; }}
+  .ph p {{ color:var(--dim); margin:0; max-width:60ch; }}
+
+  .hero {{ display:grid; grid-template-columns:repeat(3,1fr); margin-top:28px; padding:40px 12px; background:var(--s1); border:1px solid var(--line); border-radius:28px; }}
+  .hero .m {{ display:flex; flex-direction:column; align-items:center; text-align:center; gap:16px; padding:0 20px; }}
+  .hero .m + .m {{ border-left:1px solid var(--line); }}
+  .hero h2 {{ font-size:16px; font-weight:700; margin:0; }}
+  .hero p {{ margin:2px 0 0; font-size:13px; color:var(--dim); }}
+
+  .ring {{ position:relative; width:172px; height:172px; flex:none; }}
+  .ring svg {{ width:100%; height:100%; transform:rotate(-90deg); }}
+  .ring circle {{ fill:none; stroke-width:8; }}
+  .ring .trk {{ stroke:rgba(255,255,255,.07); }}
+  .ring .val {{ stroke:var(--c); stroke-linecap:round; stroke-dasharray:326.73; stroke-dashoffset:326.73; transition:stroke-dashoffset 1.3s cubic-bezier(.2,.8,.2,1), stroke .4s; filter:drop-shadow(0 0 6px color-mix(in srgb, var(--c) 45%, transparent)); }}
+  .ring .ctr {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:46px; font-weight:800; letter-spacing:-.03em; }}
+  .ring .ctr small {{ font-size:18px; font-weight:600; color:var(--dim); margin-left:2px; }}
+  .ring.sm {{ width:104px; height:104px; }}
+  .ring.sm .ctr {{ font-size:28px; }}
+  .ring.sm .ctr small {{ font-size:13px; }}
+
+  .badge, .pill {{ display:inline-block; padding:4px 12px; border-radius:99px; font-size:12.5px; font-weight:700; color:var(--c); background:color-mix(in srgb, var(--c) 14%, transparent); }}
+  .pill {{ padding:3px 10px; font-size:12px; }}
+  .chip {{ display:inline-flex; align-items:center; gap:8px; padding:6px 12px; border-radius:99px; font-size:12.5px; font-weight:600; color:var(--c); background:color-mix(in srgb, var(--c) 14%, transparent); }}
+  .chip[hidden] {{ display:none; }}
+  .dot {{ display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--c); margin-right:6px; flex:none; }}
+  .chip .dot {{ margin:0; }}
+
+  .row {{ display:grid; gap:20px; margin-top:20px; }}
+  .r2 {{ grid-template-columns:minmax(0,1.55fr) minmax(0,1fr); }}
+  .panel {{ background:var(--s1); border:1px solid var(--line); border-radius:22px; padding:26px; min-width:0; }}
+  .pt {{ display:flex; justify-content:space-between; align-items:flex-start; gap:14px; flex-wrap:wrap; margin-bottom:12px; }}
+  .pt h3 {{ margin:0; font-size:17px; font-weight:700; letter-spacing:-.01em; }}
+  .pt p {{ margin:2px 0 0; font-size:13px; color:var(--dim); max-width:56ch; }}
+  .chart {{ width:100%; height:360px; }}
+
+  details.how {{ margin-top:22px; background:var(--s1); border:1px solid var(--line); border-radius:16px; padding:0 22px; }}
+  .how summary {{ cursor:pointer; padding:15px 0; font-weight:700; font-size:14px; list-style:none; display:flex; justify-content:space-between; align-items:center; }}
+  .how summary::-webkit-details-marker {{ display:none; }}
+  .how summary::after {{ content:'+'; color:var(--dim); font-size:20px; font-weight:500; }}
+  .how[open] summary::after {{ content:'−'; }}
+  .how p {{ color:var(--dim); font-size:14.5px; max-width:75ch; margin:0 0 14px; }}
+  .how .rule {{ color:var(--tx); font-weight:600; font-size:13.5px; padding:2px 0 2px 14px; margin:0 0 20px; border-left:3px solid var(--rc, var(--hr)); }}
+
+  .search {{ background:var(--s2); border:1px solid var(--line); border-radius:12px; color:var(--tx); padding:9px 14px; font-size:13px; width:240px; max-width:100%; }}
+  .scroll {{ overflow:auto; max-height:460px; }}
+  .tbl {{ width:100%; border-collapse:collapse; font-size:13.5px; min-width:720px; }}
+  .tbl th {{ position:sticky; top:0; background:var(--s1); text-align:left; font-weight:600; color:var(--faint); font-size:12px; padding:10px 14px; border-bottom:1px solid var(--line); }}
+  .tbl td {{ padding:15px 14px; border-bottom:1px solid var(--line); vertical-align:top; }}
+  .tbl tr:last-child td {{ border-bottom:0; }}
+  .tbl .cat {{ font-size:12px; color:var(--hr); }}
+  .tbl .rng {{ color:var(--hr); white-space:nowrap; }}
+  .tbl .mean {{ color:var(--dim); font-size:13px; max-width:360px; }}
+
+  .ctl {{ margin-bottom:22px; }}
+  .ctl .top {{ display:flex; justify-content:space-between; font-size:13.5px; color:var(--dim); margin-bottom:10px; }}
+  .ctl .top b {{ color:var(--tx); font-weight:700; }}
+  input[type=range] {{ -webkit-appearance:none; appearance:none; width:100%; height:6px; border-radius:99px; margin:0; background:linear-gradient(to right, var(--ac,var(--energy)) var(--p,50%), rgba(255,255,255,.09) var(--p,50%)); }}
+  input[type=range]::-webkit-slider-thumb {{ -webkit-appearance:none; width:20px; height:20px; border-radius:50%; background:#fff; border:0; box-shadow:0 2px 8px rgba(0,0,0,.5); cursor:pointer; }}
+  input[type=range]::-moz-range-thumb {{ width:20px; height:20px; border-radius:50%; background:#fff; border:0; cursor:pointer; }}
+  .chips {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:22px; }}
+  .chips button {{ background:var(--s2); border:1px solid var(--line); color:var(--tx); border-radius:99px; padding:7px 14px; font-size:12.5px; font-weight:600; cursor:pointer; }}
+  .chips button:hover {{ background:#202530; }}
+  .res {{ display:flex; align-items:center; gap:20px; padding-top:22px; margin-top:4px; border-top:1px solid var(--line); }}
+  .res .state {{ font-size:13.5px; color:var(--dim); margin-top:6px; }}
+
+  .ep {{ display:grid; grid-template-columns:180px 84px 1fr 1fr; gap:18px; padding:18px 0; border-top:1px solid var(--line); font-size:13.5px; align-items:start; }}
+  .ep:first-child {{ border-top:0; }}
+  .ep .sub {{ font-size:12px; color:var(--dim); margin-top:2px; }}
+  .ep .hyp {{ color:var(--sleep); }}
+  .empty {{ padding:28px 0; color:var(--dim); font-size:14px; }}
+  .empty.good {{ color:var(--energy); }}
+
+  .stagebar {{ display:flex; gap:3px; height:14px; border-radius:99px; overflow:hidden; }}
+  .stagebar i {{ display:block; background:var(--c); }}
+  .legend {{ display:flex; flex-wrap:wrap; gap:6px 20px; margin:14px 0 26px; font-size:12.5px; color:var(--dim); }}
+  .legend b {{ color:var(--tx); }}
+  .tl {{ display:grid; grid-template-columns:118px 14px 1fr; gap:14px; }}
+  .tl .t {{ text-align:right; font-size:12px; color:var(--dim); padding-top:2px; }}
+  .tl .ln {{ position:relative; display:flex; justify-content:center; }}
+  .tl .ln::after {{ content:''; position:absolute; top:20px; bottom:-6px; width:2px; background:var(--line); }}
+  .tl:last-child .ln::after {{ display:none; }}
+  .nd {{ width:10px; height:10px; margin-top:6px; border-radius:50%; background:var(--c); box-shadow:0 0 10px var(--c); position:relative; z-index:1; }}
+  .tl .d {{ padding-bottom:20px; }}
+  .tl .d b {{ color:var(--c); font-size:14px; }}
+  .tl .mins {{ color:var(--dim); font-size:12px; margin-left:8px; }}
+  .tl .d p {{ margin:2px 0 0; font-size:12.5px; color:var(--faint); }}
+  .tl-list {{ max-height:420px; overflow-y:auto; padding-right:8px; }}
+
+  @media (max-width:980px) {{ .r2 {{ grid-template-columns:1fr; }} .ep {{ grid-template-columns:1fr; gap:6px; }} }}
+  @media (max-width:860px) {{
+    .shell {{ grid-template-columns:1fr; }}
+    .nav {{ position:fixed; top:auto; bottom:0; left:0; right:0; height:auto; flex-direction:row; justify-content:space-around; gap:0; padding:8px 8px calc(8px + env(safe-area-inset-bottom,0px)); background:rgba(10,12,16,.92); backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px); border-right:0; border-top:1px solid var(--line); z-index:50; }}
+    .brand {{ display:none; }}
+    .nav-btn {{ flex-direction:column; gap:4px; font-size:11px; padding:8px 4px; justify-content:center; align-items:center; text-align:center; background:none !important; }}
+    .main {{ padding:calc(24px + env(safe-area-inset-top,0px)) 16px 110px; }}
+    .ph h1 {{ font-size:26px; }}
+    .hero {{ padding:26px 4px; border-radius:22px; }}
+    .hero .m {{ padding:0 6px; gap:10px; }}
+    .hero .m p {{ display:none; }}
+    .hero h2 {{ font-size:13px; }}
+    .ring {{ width:92px; height:92px; }}
+    .ring .ctr {{ font-size:25px; }}
+    .ring .ctr small {{ font-size:11px; }}
+    .ring.sm {{ width:92px; height:92px; }}
+    .badge {{ font-size:11px; padding:3px 9px; }}
+    .panel {{ padding:20px 16px; border-radius:18px; }}
+    .chart {{ height:300px; }}
+    .tl {{ grid-template-columns:92px 14px 1fr; gap:10px; }}
+  }}
+  @media (prefers-reduced-motion:reduce) {{ * {{ transition:none !important; animation:none !important; }} }}
 </style>
 </head>
 <body>
+<div class="shell">
 
-  <div class="nav-bar">
-    <div class="nav-title">⌚ Layman's Lab</div>
-    <button class="nav-btn active" onclick="openTab('tab-home', this)">🏠 General Health</button>
-    <button class="nav-btn" onclick="openTab('tab-stress', this)">🕵️ 1. Stress Detective</button>
-    <button class="nav-btn" onclick="openTab('tab-energy', this)">⚡ 2. Energy Predictor</button>
-    <button class="nav-btn" onclick="openTab('tab-sleep', this)">🌙 3. Sleep Lab</button>
-  </div>
+  <nav class="nav" aria-label="Sections">
+    <div class="brand">
+      <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><circle cx="13" cy="13" r="10" fill="none" stroke="#252b38" stroke-width="3"/><circle cx="13" cy="13" r="10" fill="none" stroke="#3ddbb0" stroke-width="3" stroke-linecap="round" stroke-dasharray="44 63" transform="rotate(-90 13 13)"/></svg>
+      Bio Lab
+    </div>
+    <button class="nav-btn active" data-tab="home" onclick="openTab('home')"><svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>Today</button>
+    <button class="nav-btn" data-tab="stress" onclick="openTab('stress')"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Stress</button>
+    <button class="nav-btn" data-tab="energy" onclick="openTab('energy')"><svg viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg>Energy</button>
+    <button class="nav-btn" data-tab="sleep" onclick="openTab('sleep')"><svg viewBox="0 0 24 24"><path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/></svg>Sleep</button>
+  </nav>
 
-  <div class="container">
-    
+  <main class="main">
+
     <!-- HOME -->
-    <div id="tab-home" class="tab-content active">
-      <h1 style="color:var(--accent-blue);">General Body Telemetry</h1>
-      <p style="color:var(--text-dim); margin-bottom:32px;">Your body is like a hybrid car. Heart Rate is the engine speed. Heart Rate Variability (HRV) is the battery charge. This dashboard checks if your engine is revving safely or burning out.</p>
+    <section id="tab-home" class="tab active">
+      <header class="ph">
+        <h1>Today</h1>
+        <p>Your body at a glance, built from your Apple Watch data.</p>
+      </header>
 
-      <div class="grid-3">
-        <div class="card">
-          <div style="font-size:12px; color:var(--text-dim); text-transform:uppercase;">Daily Energy Readiness</div>
-          <div style="font-size:36px; font-weight:700; color:{pred_bundle['badge_color']}; margin:8px 0;">{pred_bundle['readiness_score']}%</div>
-          <div class="badge" style="background:{pred_bundle['badge_color']}22; color:{pred_bundle['badge_color']};">{pred_bundle['readiness_label']}</div>
+      <div class="hero" role="group" aria-label="Today's scores">
+        <div class="m" style="--c:{pred_bundle['badge_color']}">
+          <div class="ring" data-v="{pred_bundle['readiness_score']}">
+            <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg>
+            <div class="ctr"><span>{pred_bundle['readiness_score']}</span><small>%</small></div>
+          </div>
+          <div><h2>Energy readiness</h2><p>How ready you are to focus today</p></div>
+          <span class="badge">{pred_bundle['readiness_label']}</span>
         </div>
-        <div class="card">
-          <div style="font-size:12px; color:var(--text-dim); text-transform:uppercase;">Current System Stress</div>
-          <div style="font-size:36px; font-weight:700; color:{stress_bundle['stress_color']}; margin:8px 0;">{stress_bundle['today_likelihood']}%</div>
-          <div class="badge" style="background:{stress_bundle['stress_color']}22; color:{stress_bundle['stress_color']};">{stress_bundle['stress_label']}</div>
+        <div class="m" style="--c:{stress_bundle['stress_color']}">
+          <div class="ring" data-v="{stress_bundle['today_likelihood']}">
+            <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg>
+            <div class="ctr"><span>{stress_bundle['today_likelihood']}</span><small>%</small></div>
+          </div>
+          <div><h2>Stress load</h2><p>Heart rate not explained by movement</p></div>
+          <span class="badge">{stress_bundle['stress_label']}</span>
         </div>
-        <div class="card">
-          <div style="font-size:12px; color:var(--text-dim); text-transform:uppercase;">Last Night's Sleep Repair</div>
-          <div style="font-size:36px; font-weight:700; color:{sleep_bundle['quality_color']}; margin:8px 0;">{sleep_bundle['latest_quality']}%</div>
-          <div class="badge" style="background:{sleep_bundle['quality_color']}22; color:{sleep_bundle['quality_color']};">{sleep_bundle['quality_label']}</div>
+        <div class="m" style="--c:{sleep_bundle['quality_color']}">
+          <div class="ring" data-v="{sleep_bundle['latest_quality']}">
+            <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg>
+            <div class="ctr"><span>{sleep_bundle['latest_quality']}</span><small>%</small></div>
+          </div>
+          <div><h2>Sleep recovery</h2><p>How well last night repaired you</p></div>
+          <span class="badge">{sleep_bundle['quality_label']}</span>
         </div>
       </div>
 
-      <div class="grid-2">
-        <div class="card">
-          <h3>The Battery vs. Engine Graph (HRV vs HR)</h3>
-          <p style="font-size:13px; color:var(--text-dim);">HRV is flexibility (higher is better). HR is workload (lower is calmer). <b>Bottom-Right quadrant</b> means your battery is charged and your engine is relaxed.</p>
-          <div id="c_quad" class="chart-box"></div>
+      <details class="how">
+        <summary>How to read these scores</summary>
+        <p>Think of your body as a hybrid car. Heart rate is engine speed. Heart rate variability (HRV) is battery charge. This dashboard checks whether your engine is revving safely or burning out.</p>
+      </details>
+
+      <div class="row">
+        <div class="panel">
+          <div class="pt">
+            <div>
+              <h3>Battery vs. engine</h3>
+              <p>Each dot is one reading. Higher HRV means a more charged battery. Lower heart rate means a calmer engine.</p>
+            </div>
+            <span id="chip_quad" class="chip" hidden></span>
+          </div>
+          <div id="c_quad" class="chart"></div>
         </div>
-        <div class="card">
-          <h3>Layman's Dictionary of Your Apple Watch Data</h3>
-          <div style="max-height: 410px; overflow-y: auto;">
-            <table>
-              <thead><tr><th>Sensor</th><th>Your Latest</th><th>Your Average</th><th>Healthy Baseline</th><th>What it actually means</th></tr></thead>
-              <tbody>{table_html}</tbody>
+      </div>
+
+      <div class="row">
+        <div class="panel">
+          <div class="pt">
+            <div><h3>Your Apple Watch data, explained</h3><p>Your latest and average value for each sensor, next to a healthy baseline.</p></div>
+            <input class="search" type="search" placeholder="Search sensors" aria-label="Search sensors" oninput="filterRows(this.value)">
+          </div>
+          <div class="scroll">
+            <table class="tbl">
+              <thead><tr><th>Sensor</th><th>Latest</th><th>Average</th><th>Healthy baseline</th><th>What it means</th></tr></thead>
+              <tbody id="param_body">{table_html}</tbody>
             </table>
           </div>
         </div>
       </div>
-    </div>
+    </section>
 
     <!-- STRESS -->
-    <div id="tab-stress" class="tab-content">
-      <h1 style="color:var(--accent-red);">Activity 1: Stress Detective</h1>
-      
-      <div class="science-box" style="border-color: var(--accent-red);">
-        <div class="science-icon">🕵️</div>
-        <div class="science-text">
-          <h4 style="color:var(--accent-red);">The Science: The "Context Checker" Algorithm</h4>
-          <p>If your heart beats at 115 bpm while you walk up stairs, that's completely normal. But if it beats at 115 bpm while you are sitting motionless at a desk, your body is sounding a false alarm. This algorithm mathematically subtracts your physical movement (steps) from your heart rate. Whatever heart rate is left over is "Non-Metabolic"—meaning it was caused by mental stress, exam anxiety, caffeine, or illness.</p>
-          <div class="safe-value" style="color:var(--accent-red);">Healthy Rule: Actual HR (Red) should hug Expected HR (Blue) closely.</div>
-        </div>
-      </div>
+    <section id="tab-stress" class="tab">
+      <header class="ph">
+        <h1>Stress detective</h1>
+        <p>Tells stress apart from exercise by checking what your heart rate should be for how much you moved.</p>
+      </header>
 
-      <div class="grid-2">
-        <div class="card">
-          <h3>The Context Timeline</h3>
-          <div id="c_st_intra" class="chart-box"></div>
+      <details class="how" style="--rc:var(--stress)">
+        <summary>How this works</summary>
+        <p>If your heart beats at 115 bpm while you climb stairs, that is normal. At 115 bpm while you sit still at a desk, something else is going on. The algorithm subtracts the heart rate your steps explain. What is left over is non-metabolic: it comes from mental stress, caffeine, poor recovery, or illness.</p>
+        <p class="rule">Healthy pattern: your actual heart rate stays close to the expected line.</p>
+      </details>
+
+      <div class="row r2">
+        <div class="panel">
+          <div class="pt">
+            <div><h3>Heart rate in context</h3><p>Actual vs. expected heart rate, with the stress score behind it.</p></div>
+            <span id="chip_stress" class="chip" hidden></span>
+          </div>
+          <div id="c_st_intra" class="chart"></div>
         </div>
-        <div class="card">
-          <h3>🧪 Simulate a False Alarm</h3>
-          <p style="font-size:13px; color:var(--text-dim); margin-bottom:20px;">Move the sliders to see how the math tells the difference between going for a brisk walk vs. panicking on the couch.</p>
-          <div class="slider-row"><span>Your Heart Rate: <b id="st_lbl_hr">112 bpm</b></span><input type="range" id="st_sl_hr" min="55" max="165" step="1" value="112" oninput="updateStressSim()"></div>
-          <div class="slider-row"><span>Steps Taken (5-min): <b id="st_lbl_stp">20 steps</b></span><input type="range" id="st_sl_stp" min="0" max="600" step="20" value="20" oninput="updateStressSim()"></div>
-          <div class="slider-row"><span>HRV (Shock Absorber): <b id="st_lbl_hrv">34 ms</b></span><input type="range" id="st_sl_hrv" min="15" max="110" step="1" value="34" oninput="updateStressSim()"></div>
-          <div style="margin-top:24px; padding-top:16px; border-top:1px solid var(--border);">
-            <div style="font-size:13px; color:var(--text-dim);">Algorithm Verdict: <b id="st_sim_state" style="color:var(--accent-red);">Sedentary — Mind racing, body still.</b></div>
-            <div style="font-size:16px; margin-top:8px;">Estimated Stress: <b id="st_sim_out" style="color:var(--accent-red); font-size:20px;">84.2%</b></div>
+        <div class="panel" style="--ac:var(--stress)">
+          <div class="pt"><div><h3>Try a scenario</h3><p>See how the math separates a brisk walk from a racing mind on the couch.</p></div></div>
+          <div class="chips">
+            <button onclick="preset('walk')">Brisk walk</button>
+            <button onclick="preset('calm')">Calm at desk</button>
+            <button onclick="preset('panic')">Racing mind</button>
+          </div>
+          <div class="ctl"><div class="top"><span>Heart rate</span><b id="st_lbl_hr">112 bpm</b></div><input type="range" id="st_sl_hr" min="55" max="165" step="1" value="112" oninput="updateStressSim()" aria-label="Heart rate"></div>
+          <div class="ctl"><div class="top"><span>Steps in 5 minutes</span><b id="st_lbl_stp">20 steps</b></div><input type="range" id="st_sl_stp" min="0" max="600" step="20" value="20" oninput="updateStressSim()" aria-label="Steps in 5 minutes"></div>
+          <div class="ctl"><div class="top"><span>HRV</span><b id="st_lbl_hrv">34 ms</b></div><input type="range" id="st_sl_hrv" min="15" max="110" step="1" value="34" oninput="updateStressSim()" aria-label="HRV"></div>
+          <div class="res">
+            <div class="ring sm" id="st_ring" style="--c:var(--stress)">
+              <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg>
+              <div class="ctr"><span id="st_ring_n">84</span><small>%</small></div>
+            </div>
+            <div>
+              <span id="st_sim_tag" class="badge" style="--c:var(--stress)">High strain</span>
+              <div id="st_sim_state" class="state"></div>
+            </div>
           </div>
         </div>
       </div>
 
-      <div class="card">
-        <h3>Detected Stress Spikes Log</h3>
-        <table>
-          <thead><tr><th>Time</th><th>Stress Score</th><th>The Objective Math Data</th><th>Probable Real-World Cause</th></tr></thead>
-          <tbody>{ep_rows_html}</tbody>
-        </table>
+      <div class="row">
+        <div class="panel">
+          <div class="pt"><div><h3>Detected stress spikes</h3><p>Moments your heart rate rose without movement to explain it.</p></div></div>
+          {ep_rows_html}
+        </div>
       </div>
-    </div>
+    </section>
 
     <!-- ENERGY -->
-    <div id="tab-energy" class="tab-content">
-      <h1 style="color:var(--accent-green);">Activity 2: Daily Energy Predictor</h1>
+    <section id="tab-energy" class="tab">
+      <header class="ph">
+        <h1>Energy predictor</h1>
+        <p>When your focus peaks today, and how tonight's habits could change tomorrow.</p>
+      </header>
 
-      <div class="science-box" style="border-color: var(--accent-green);">
-        <div class="science-icon">⚡</div>
-        <div class="science-text">
-          <h4 style="color:var(--accent-green);">The Science: The Sandglass vs. The Sun</h4>
-          <p>Your energy is a tug-of-war. <b>Process S (Red Line)</b> is like a sandglass that flips the second you wake up; sleep pressure builds continuously. <b>Process C (Blue Line)</b> is your internal biological sun; it sends alerting signals that give you a "second wind" during the day, even when you're tired. Peak focus happens when your internal sun is high, but the sandglass is still relatively empty.</p>
-          <div class="safe-value" style="color:var(--accent-green);">Healthy Rule: Schedule your hardest coding/study sessions at the peak of the Green Focus Line.</div>
-        </div>
-      </div>
+      <details class="how" style="--rc:var(--energy)">
+        <summary>How this works</summary>
+        <p>Your energy is a tug-of-war between two forces. Process S, the sandglass, flips when you wake up and sleep pressure builds all day. Process C is your internal clock, which sends alerting signals that give you a second wind even when you are tired. Focus peaks when the clock signal is high and the sandglass is still fairly empty.</p>
+        <p class="rule">Healthy pattern: schedule your hardest work at the peak of the green focus line.</p>
+      </details>
 
-      <div class="grid-2">
-        <div class="card">
-          <h3>Your Daily Energy Waveform</h3>
-          <div id="c_borbely" class="chart-box"></div>
+      <div class="row r2">
+        <div class="panel">
+          <div class="pt">
+            <div><h3>Your daily energy curve</h3><p>Focus prediction (1 to 5), plus the two forces behind it.</p></div>
+            <span id="chip_peak" class="chip" hidden></span>
+          </div>
+          <div id="c_borbely" class="chart"></div>
         </div>
-        <div class="card">
-          <h3>🔬 Readiness Habit Simulator</h3>
-          <p style="font-size:13px; color:var(--text-dim); margin-bottom:20px;">Test how changing your physical habits tonight will mathematically impact your focus tomorrow.</p>
-          <div class="slider-row"><span>Tonight's Sleep: <b id="lbl_slp">7.5 hrs</b></span><input type="range" id="sl_slp" min="4.5" max="10.0" step="0.5" value="7.5" oninput="updateEnergySim()"></div>
-          <div class="slider-row"><span>Morning Resting HR: <b id="lbl_rhr">62 bpm</b></span><input type="range" id="sl_rhr" min="48" max="85" step="1" value="62" oninput="updateEnergySim()"></div>
-          <div class="slider-row"><span>Morning HRV: <b id="lbl_hrv">65 ms</b></span><input type="range" id="sl_hrv" min="25" max="120" step="5" value="65" oninput="updateEnergySim()"></div>
-          <div class="slider-row"><span>Walking Today: <b id="lbl_wlk">60 mins</b></span><input type="range" id="sl_wlk" min="0" max="150" step="10" value="60" oninput="updateEnergySim()"></div>
-          <div style="margin-top:24px; padding-top:16px; border-top:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-size:14px;">Simulated Tomorrow Energy:</span>
-            <span id="sim_out" style="font-size:24px; font-weight:700; color:var(--accent-green);">78.4%</span>
+        <div class="panel" style="--ac:var(--energy)">
+          <div class="pt"><div><h3>Tomorrow's readiness</h3><p>Change tonight's habits and see how your predicted energy responds.</p></div></div>
+          <div class="ctl"><div class="top"><span>Tonight's sleep</span><b id="lbl_slp">7.5 hrs</b></div><input type="range" id="sl_slp" min="4.5" max="10.0" step="0.5" value="7.5" oninput="updateEnergySim()" aria-label="Tonight's sleep"></div>
+          <div class="ctl"><div class="top"><span>Morning resting heart rate</span><b id="lbl_rhr">62 bpm</b></div><input type="range" id="sl_rhr" min="48" max="85" step="1" value="62" oninput="updateEnergySim()" aria-label="Morning resting heart rate"></div>
+          <div class="ctl"><div class="top"><span>Morning HRV</span><b id="lbl_hrv">65 ms</b></div><input type="range" id="sl_hrv" min="25" max="120" step="5" value="65" oninput="updateEnergySim()" aria-label="Morning HRV"></div>
+          <div class="ctl"><div class="top"><span>Walking today</span><b id="lbl_wlk">60 mins</b></div><input type="range" id="sl_wlk" min="0" max="150" step="10" value="60" oninput="updateEnergySim()" aria-label="Walking today"></div>
+          <div class="res">
+            <div class="ring sm" id="en_ring" style="--c:var(--energy)">
+              <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg>
+              <div class="ctr"><span id="sim_out">78</span><small>%</small></div>
+            </div>
+            <div>
+              <span id="en_tag" class="badge" style="--c:var(--energy)">Primed</span>
+              <div class="state">Simulated energy for tomorrow</div>
+            </div>
           </div>
         </div>
       </div>
-    </div>
+    </section>
 
     <!-- SLEEP -->
-    <div id="tab-sleep" class="tab-content">
-      <h1 style="color:var(--accent-purp);">Activity 3: Sleep Experiment Lab</h1>
+    <section id="tab-sleep" class="tab">
+      <header class="ph">
+        <h1>Sleep lab</h1>
+        <p>How your heart recovered overnight, and what each stage of sleep did for you.</p>
+      </header>
 
-      <div class="science-box" style="border-color: var(--accent-purp);">
-        <div class="science-icon">🌙</div>
-        <div class="science-text">
-          <h4 style="color:var(--accent-purp);">The Science: The Cardiac Hammock Curve</h4>
-          <p>When you fall asleep, your heart rate should smoothly drop into the shape of a hammock. If the lowest point (the nadir) happens early in the night, your body recovered perfectly. If the hammock is flat, or bottoms out right before your alarm rings, it means your heart spent the entire night fighting off late-night digestion, room heat, or lingering stress instead of resting.</p>
-          <div class="safe-value" style="color:var(--accent-purp);">Healthy Rule: The bottom of your Hammock (Nadir) should hit between 40% and 60% of the way through the night.</div>
-        </div>
-      </div>
+      <details class="how" style="--rc:var(--sleep)">
+        <summary>How this works</summary>
+        <p>When you fall asleep, your heart rate should sink into the shape of a hammock. If the lowest point comes early in the night, your body recovered well. If the curve is flat, or bottoms out right before your alarm, your heart spent the night dealing with late digestion, a warm room, or leftover stress.</p>
+        <p class="rule">Healthy pattern: the bottom of the hammock lands 40% to 60% of the way through the night (the shaded band).</p>
+      </details>
 
-      <div class="grid-2">
-        <div class="card">
-          <h3>Your Overnight Hammock Curve</h3>
-          <div id="c_slp_hammock" class="chart-box"></div>
-        </div>
-        <div class="card">
-          <h3>Last Night's Stage Timeline</h3>
-          <div style="max-height:380px; overflow-y:auto; padding-right:10px;">
-            {sleep_log_html}
+      <div class="row r2">
+        <div class="panel">
+          <div class="pt">
+            <div><h3>Overnight heart rate</h3><p>Sleeping heart rate with its fitted hammock curve and your HRV.</p></div>
+            <span id="chip_nadir" class="chip" hidden></span>
           </div>
+          <div id="c_slp_hammock" class="chart"></div>
+        </div>
+        <div class="panel">
+          <div class="pt"><div><h3>Last night's stages</h3></div></div>
+          {stage_bar_html}
+          <div class="tl-list">{sleep_log_html}</div>
         </div>
       </div>
-    </div>
+    </section>
 
-  </div> <!-- End Container -->
+  </main>
+</div>
 
 <script>
   const D = {json.dumps(payload)};
-  const layout = {{ 
-    paper_bgcolor: '#0f172a', plot_bgcolor: '#0f172a', 
-    font: {{ color: '#94a3b8', family: '-apple-system, sans-serif' }}, 
-    margin: {{ t: 20, r: 20, b: 40, l: 50 }},
-    xaxis: {{ gridcolor: '#1e293b', zerolinecolor: '#334155' }},
-    yaxis: {{ gridcolor: '#1e293b', zerolinecolor: '#334155' }},
-    legend: {{ orientation: 'h', y: -0.15 }}
+  const CIRC = 326.73;
+  const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
+  const base = {{
+    paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
+    font:{{ color:C.dim, family:'Manrope, -apple-system, sans-serif', size:12 }},
+    margin:{{ t:40, r:16, b:46, l:48 }},
+    xaxis:{{ gridcolor:C.grid, zeroline:false, linecolor:'rgba(0,0,0,0)', tickfont:{{ size:11 }} }},
+    yaxis:{{ gridcolor:C.grid, zeroline:false, linecolor:'rgba(0,0,0,0)', tickfont:{{ size:11 }} }},
+    legend:{{ orientation:'h', x:0, y:1.14, font:{{ size:12 }} }},
+    hoverlabel:{{ bgcolor:'#1d222c', bordercolor:'rgba(255,255,255,.12)', font:{{ color:C.tx, family:'Manrope, sans-serif' }} }}
   }};
+  const cfg = {{ responsive:true, displayModeBar:false }};
 
-  function openTab(tabId, btn) {{
-    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-    document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
-    document.getElementById(tabId).classList.add('active');
-    btn.classList.add('active');
-    window.dispatchEvent(new Event('resize')); 
+  function clock(h) {{
+    h = ((h % 24) + 24) % 24;
+    let hh = Math.floor(h), mm = Math.round((h - hh) * 60);
+    if (mm === 60) {{ hh = (hh + 1) % 24; mm = 0; }}
+    return ((hh % 12) || 12) + ':' + String(mm).padStart(2, '0') + ' ' + (hh >= 12 ? 'PM' : 'AM');
+  }}
+  function chip(id, text, color) {{
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.style.setProperty('--c', color);
+    el.innerHTML = '<span class="dot"></span>' + text;
+    el.hidden = false;
+  }}
+  function setRing(el, pct, color) {{
+    if (!el) return;
+    if (color) el.style.setProperty('--c', color);
+    const p = isNaN(pct) ? 0 : Math.max(0, Math.min(100, pct));
+    el.querySelector('.val').style.strokeDashoffset = CIRC * (1 - p / 100);
+  }}
+  function fill(el) {{
+    el.style.setProperty('--p', ((el.value - el.min) / (el.max - el.min) * 100) + '%');
+  }}
+  function filterRows(q) {{
+    q = q.toLowerCase();
+    document.querySelectorAll('#param_body tr').forEach(tr => {{ tr.hidden = !tr.textContent.toLowerCase().includes(q); }});
   }}
 
-  Plotly.newPlot('c_quad', [{{
-    x: D.quad_hrv, y: D.quad_hr, text: D.quad_labels, mode: 'markers',
-    marker: {{ size: 10, color: D.quad_colors, line: {{width:1, color:'#0f172a'}} }},
-    hovertemplate: '%{{text}}<br>HRV: <b>%{{x}} ms</b> | HR: <b>%{{y}} bpm</b><extra></extra>'
-  }}], {{
-    ...layout,
-    xaxis: {{ ...layout.xaxis, title: 'HRV (ms) &rarr; More Flexible' }},
-    yaxis: {{ ...layout.yaxis, title: 'Heart Rate (bpm) &darr; Less Workload' }},
-    shapes: [
-      {{ type:'line', x0:D.mean_hrv, x1:D.mean_hrv, y0:0, y1:1, yref:'paper', line:{{color:'#334155', dash:'dash'}} }},
-      {{ type:'line', x0:0, x1:1, xref:'paper', y0:D.mean_hr, y1:D.mean_hr, line:{{color:'#334155', dash:'dash'}} }}
-    ]
-  }}, {{responsive:true}});
+  // ---------- HOME ----------
+  function renderHome() {{
+    const map = {{ '#10b981':C.energy, '#ef4444':C.stress, '#38bdf8':C.hr }};
+    const cols = D.quad_colors.map(c => map[c] || c);
+    const n = cols.length, good = D.quad_colors.filter(c => c === '#10b981').length;
+    if (n) chip('chip_quad', Math.round(100 * good / n) + '% of readings in your recovered zone', C.energy);
+    Plotly.newPlot('c_quad', [{{
+      x:D.quad_hrv, y:D.quad_hr, text:D.quad_labels, mode:'markers',
+      marker:{{ size:9, color:cols, opacity:.85, line:{{ width:1, color:'#11141a' }} }},
+      hovertemplate:'%{{text}}<br>HRV <b>%{{x}} ms</b> &middot; HR <b>%{{y}} bpm</b><extra></extra>'
+    }}], {{
+      ...base,
+      xaxis:{{ ...base.xaxis, title:{{ text:'HRV (ms): higher is more recovered' }} }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm): lower is calmer' }} }},
+      margin:{{ ...base.margin, t:16 }},
+      shapes:[
+        {{ type:'rect', xref:'x', yref:'y', x0:D.mean_hrv, x1:1e5, y0:-1e5, y1:D.mean_hr, fillcolor:'rgba(61,219,176,.06)', line:{{ width:0 }}, layer:'below' }},
+        {{ type:'line', x0:D.mean_hrv, x1:D.mean_hrv, y0:0, y1:1, yref:'paper', line:{{ color:'rgba(255,255,255,.14)', dash:'dash', width:1 }} }},
+        {{ type:'line', x0:0, x1:1, xref:'paper', y0:D.mean_hr, y1:D.mean_hr, line:{{ color:'rgba(255,255,255,.14)', dash:'dash', width:1 }} }}
+      ],
+      annotations:[
+        {{ xref:'paper', yref:'paper', x:.99, y:.02, xanchor:'right', yanchor:'bottom', showarrow:false, text:'Recovered', font:{{ color:C.energy, size:12 }} }},
+        {{ xref:'paper', yref:'paper', x:.01, y:.98, xanchor:'left', yanchor:'top', showarrow:false, text:'Under strain', font:{{ color:C.stress, size:12 }} }}
+      ]
+    }}, cfg);
+  }}
 
-  Plotly.newPlot('c_st_intra', [
-    {{ x: D.in_ts, y: D.in_hr_raw, mode:'lines', line:{{color:'#ef4444', width:2}}, name:'Actual HR' }},
-    {{ x: D.in_ts, y: D.in_hr_exp, mode:'lines', line:{{color:'#38bdf8', width:2, dash:'dot'}}, name:'Metabolic Expected HR' }},
-    {{ x: D.in_ts, y: D.in_stress, mode:'lines', yaxis:'y2', text: D.in_state, line:{{color:'#c084fc', width:2}}, name:'Stress %' }}
-  ], {{ ...layout, yaxis2: {{ overlaying:'y', side:'right', range:[0, 105], font:{{color:'#c084fc'}} }} }}, {{responsive:true}});
+  // ---------- STRESS ----------
+  function renderStress() {{
+    let mi = -1;
+    D.in_stress.forEach((v, i) => {{ if (typeof v === 'number' && (mi < 0 || v > D.in_stress[mi])) mi = i; }});
+    if (mi >= 0) chip('chip_stress', 'Highest: ' + Math.round(D.in_stress[mi]) + '% at ' + D.in_ts[mi], D.in_stress[mi] >= 65 ? C.stress : C.warn);
+    Plotly.newPlot('c_st_intra', [
+      {{ x:D.in_ts, y:D.in_stress, yaxis:'y2', text:D.in_state, mode:'lines', fill:'tozeroy', fillcolor:'rgba(255,122,107,.10)', line:{{ color:C.stress, width:1.5 }}, name:'Stress', hovertemplate:'%{{y:.0f}}%<br>%{{text}}<extra>Stress</extra>' }},
+      {{ x:D.in_ts, y:D.in_hr_exp, mode:'lines', line:{{ color:C.hr, width:2, dash:'dot' }}, name:'Expected for your activity', hovertemplate:'%{{y:.0f}} bpm<extra>Expected</extra>' }},
+      {{ x:D.in_ts, y:D.in_hr_raw, mode:'lines', line:{{ color:C.tx, width:2 }}, name:'Actual heart rate', hovertemplate:'%{{y:.0f}} bpm<extra>Actual</extra>' }}
+    ], {{
+      ...base, hovermode:'x unified',
+      margin:{{ ...base.margin, r:44 }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }} }},
+      yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
+    }}, cfg);
+    updateStressSim();
+  }}
 
-  Plotly.newPlot('c_borbely', [
-    {{ x: D.b_hours, y: D.b_alert, mode:'lines+markers', marker:{{size:5}}, line:{{color:'#10b981', width:3}}, name:'Focus Prediction (1-5)' }},
-    {{ x: D.b_hours, y: D.b_adeno, mode:'lines', line:{{color:'#ef4444', width:2, dash:'dash'}}, name:'Process S (Sandglass)' }},
-    {{ x: D.b_hours, y: D.b_circ, mode:'lines', line:{{color:'#38bdf8', width:2, dash:'dot'}}, name:'Process C (Internal Sun)' }}
-  ], {{ ...layout, xaxis: {{ ...layout.xaxis, title: 'Hour of Day (6 = 6AM, 12 = Noon)' }} }}, {{responsive:true}});
-
-  Plotly.newPlot('c_slp_hammock', [
-    {{ x: D.slp_tau, y: D.slp_hr_mean, mode:'markers+lines', marker:{{size:6, color:'#475569'}}, line:{{color:'#334155', width:1.5, dash:'dot'}}, name:'Sleeping HR' }},
-    {{ x: D.slp_tau, y: D.slp_hr_fit, mode:'lines', line:{{color:'#a855f7', width:3}}, name:'Hammock Curve Fit' }},
-    {{ x: D.slp_tau, y: D.slp_hrv_mean, mode:'lines+markers', yaxis:'y2', marker:{{size:5}}, line:{{color:'#38bdf8', width:2}}, name:'Overnight HRV', connectgaps:true }}
-  ], {{ ...layout, yaxis2: {{ overlaying:'y', side:'right', font:{{color:'#38bdf8'}} }} }}, {{responsive:true}});
+  const PRESETS = {{ walk:[118, 400, 55], calm:[66, 0, 70], panic:[112, 20, 34] }};
+  function preset(k) {{
+    const p = PRESETS[k];
+    ['st_sl_hr', 'st_sl_stp', 'st_sl_hrv'].forEach((id, i) => {{ document.getElementById(id).value = p[i]; }});
+    updateStressSim();
+  }}
 
   function updateStressSim() {{
+    document.querySelectorAll('#tab-stress input[type=range]').forEach(fill);
     const hr = parseFloat(document.getElementById('st_sl_hr').value);
     const stp = parseFloat(document.getElementById('st_sl_stp').value);
     const hrv = parseFloat(document.getElementById('st_sl_hrv').value);
     document.getElementById('st_lbl_hr').innerText = hr + ' bpm';
     document.getElementById('st_lbl_stp').innerText = stp + ' steps';
     document.getElementById('st_lbl_hrv').innerText = hrv + ' ms';
-    
+
     const exp_hr = 68.0 + 0.095 * stp;
     const res_hr = hr - exp_hr;
     const z_hr = res_hr / 7.5;
     const z_hrv = (Math.log(Math.max(D.mean_hrv, 45)) - Math.log(hrv)) / 0.25;
 
-    const stateEl = document.getElementById('st_sim_state');
-    const outEl = document.getElementById('st_sim_out');
-
+    let pct, tag, col, state;
     if (stp >= 180) {{
-      stateEl.innerText = 'Physical Activity Gate Triggered'; stateEl.style.color = '#38bdf8';
-      outEl.innerText = Math.min(35, Math.max(12, 18 + 4 * Math.max(0, z_hr))).toFixed(1) + '% (Exercise)'; outEl.style.color = '#10b981';
+      pct = Math.min(35, Math.max(12, 18 + 4 * Math.max(0, z_hr)));
+      tag = 'Exercise'; col = C.hr;
+      state = 'You are moving, so a high heart rate is expected and is not counted as stress.';
     }} else {{
-      stateEl.innerText = 'Sedentary Window (Non-Metabolic HR: ' + (res_hr >= 0 ? '+' : '') + res_hr.toFixed(0) + ' bpm)';
-      stateEl.style.color = res_hr > 10 ? '#ef4444' : '#cbd5e1';
-      const prob = Math.min(98, Math.max(6, 100 / (1 + Math.exp(-1.25 * ((0.6 * z_hr + 0.45 * z_hrv) - 0.35)))));
-      outEl.innerText = prob.toFixed(1) + '% (' + (prob >= 68 ? 'High Strain' : (prob >= 42 ? 'Moderate Arousal' : 'Calm')) + ')';
-      outEl.style.color = prob >= 68 ? '#ef4444' : (prob >= 42 ? '#f59e0b' : '#10b981');
+      pct = Math.min(98, Math.max(6, 100 / (1 + Math.exp(-1.25 * ((0.6 * z_hr + 0.45 * z_hrv) - 0.35)))));
+      tag = pct >= 68 ? 'High strain' : (pct >= 42 ? 'Moderate arousal' : 'Calm');
+      col = pct >= 68 ? C.stress : (pct >= 42 ? C.warn : C.energy);
+      state = 'Sitting still. Your heart rate is ' + Math.abs(res_hr).toFixed(0) + ' bpm ' + (res_hr >= 0 ? 'above' : 'below') + ' what your activity explains.';
     }}
+    document.getElementById('st_ring_n').innerText = Math.round(pct);
+    const t = document.getElementById('st_sim_tag');
+    t.innerText = tag; t.style.setProperty('--c', col);
+    document.getElementById('st_sim_state').innerText = state;
+    setRing(document.getElementById('st_ring'), pct, col);
+  }}
+
+  // ---------- ENERGY ----------
+  function renderEnergy() {{
+    let pi = -1;
+    D.b_alert.forEach((v, i) => {{ if (typeof v === 'number' && (pi < 0 || v > D.b_alert[pi])) pi = i; }});
+    const traces = [
+      {{ x:D.b_hours, y:D.b_alert, mode:'lines', line:{{ color:C.energy, width:3, shape:'spline' }}, name:'Focus prediction', hovertemplate:'%{{y:.2f}}<extra>Focus</extra>' }},
+      {{ x:D.b_hours, y:D.b_adeno, mode:'lines', line:{{ color:C.stress, width:2, dash:'dash' }}, name:'Process S (sandglass)', hovertemplate:'%{{y:.2f}}<extra>S</extra>' }},
+      {{ x:D.b_hours, y:D.b_circ, mode:'lines', line:{{ color:C.hr, width:2, dash:'dot' }}, name:'Process C (internal clock)', hovertemplate:'%{{y:.2f}}<extra>C</extra>' }}
+    ];
+    if (pi >= 0) {{
+      traces.push({{ x:[D.b_hours[pi]], y:[D.b_alert[pi]], mode:'markers', marker:{{ size:13, color:C.energy, line:{{ width:3, color:'#11141a' }} }}, name:'Best focus', hoverinfo:'skip' }});
+      chip('chip_peak', 'Best focus around ' + clock(D.b_hours[pi]), C.energy);
+    }}
+    Plotly.newPlot('c_borbely', traces, {{ ...base, hovermode:'x unified', xaxis:{{ ...base.xaxis, title:{{ text:'Hour of day (24h clock)' }}, dtick:2 }} }}, cfg);
+    updateEnergySim();
   }}
 
   function updateEnergySim() {{
+    document.querySelectorAll('#tab-energy input[type=range]').forEach(fill);
     const slp = parseFloat(document.getElementById('sl_slp').value);
     const rhr = parseFloat(document.getElementById('sl_rhr').value);
     const hrv = parseFloat(document.getElementById('sl_hrv').value);
@@ -1857,18 +2095,72 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     const z_vec = [(slp - 7.5)/0.85, 0, (rhr - D.mean_hr + 8)/4.0, (Math.log(hrv) - Math.log(Math.max(D.mean_hrv, 30)))/0.22, (wlk - 50)/25, ((wlk - 50)/25) - 0.25*(((wlk - 50)/25)**2)];
     let dot = 0;
     for (let i = 0; i < D.f_weights.length; i++) dot += z_vec[i] * D.f_weights[i];
-    
+
     const pred_pct = Math.min(99, Math.max(15, 100 / (1 + Math.exp(-1.35 * dot))));
-    const outEl = document.getElementById('sim_out');
-    outEl.innerText = pred_pct.toFixed(1) + '%';
-    outEl.style.color = pred_pct >= 70 ? '#10b981' : (pred_pct >= 48 ? '#f59e0b' : '#ef4444');
+    const col = pred_pct >= 70 ? C.energy : (pred_pct >= 48 ? C.warn : C.stress);
+    document.getElementById('sim_out').innerText = Math.round(pred_pct);
+    const t = document.getElementById('en_tag');
+    t.innerText = pred_pct >= 70 ? 'Primed' : (pred_pct >= 48 ? 'Steady' : 'Low reserves');
+    t.style.setProperty('--c', col);
+    setRing(document.getElementById('en_ring'), pred_pct, col);
   }}
+
+  // ---------- SLEEP ----------
+  function renderSleep() {{
+    const fit = D.slp_hr_fit;
+    let ni = -1;
+    for (let i = 0; i < fit.length; i++) {{ if (typeof fit[i] === 'number' && (ni < 0 || fit[i] < fit[ni])) ni = i; }}
+    if (ni >= 0 && fit.length > 1) {{
+      const pct = Math.round(100 * ni / (fit.length - 1));
+      const ok = pct >= 40 && pct <= 60;
+      chip('chip_nadir', ok ? 'Lowest heart rate ' + pct + '% into the night, in the healthy window' : 'Lowest heart rate ' + pct + '% into the night, outside the 40–60% window', ok ? C.energy : C.warn);
+    }}
+    const shapes = [];
+    const t0 = D.slp_tau[0], t1 = D.slp_tau[D.slp_tau.length - 1];
+    if (typeof t0 === 'number' && typeof t1 === 'number') {{
+      shapes.push({{ type:'rect', xref:'x', yref:'paper', x0:t0 + 0.4 * (t1 - t0), x1:t0 + 0.6 * (t1 - t0), y0:0, y1:1, fillcolor:'rgba(143,155,255,.09)', line:{{ width:0 }}, layer:'below' }});
+    }}
+    Plotly.newPlot('c_slp_hammock', [
+      {{ x:D.slp_tau, y:D.slp_hr_mean, mode:'markers', marker:{{ size:6, color:'rgba(255,255,255,.28)' }}, name:'Sleeping heart rate', hovertemplate:'%{{y:.0f}} bpm<extra></extra>' }},
+      {{ x:D.slp_tau, y:D.slp_hr_fit, mode:'lines', line:{{ color:C.sleep, width:3, shape:'spline' }}, name:'Hammock curve', hoverinfo:'skip' }},
+      {{ x:D.slp_tau, y:D.slp_hrv_mean, yaxis:'y2', mode:'lines+markers', marker:{{ size:5 }}, line:{{ color:C.hr, width:2 }}, name:'HRV', connectgaps:true, hovertemplate:'%{{y:.0f}} ms<extra>HRV</extra>' }}
+    ], {{
+      ...base, shapes:shapes, margin:{{ ...base.margin, r:44 }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'bpm' }} }},
+      yaxis2:{{ overlaying:'y', side:'right', showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }}
+    }}, cfg);
+  }}
+
+  // ---------- NAVIGATION ----------
+  const RENDER = {{ home:renderHome, stress:renderStress, energy:renderEnergy, sleep:renderSleep }};
+  const RENDERED = {{}};
+  function openTab(name) {{
+    if (!RENDER[name]) name = 'home';
+    document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.id === 'tab-' + name));
+    document.querySelectorAll('.nav-btn').forEach(el => {{
+      const on = el.dataset.tab === name;
+      el.classList.toggle('active', on);
+      el.setAttribute('aria-current', on ? 'page' : 'false');
+    }});
+    if (!RENDERED[name]) {{ RENDERED[name] = true; RENDER[name](); }}
+    else {{ document.querySelectorAll('#tab-' + name + ' .chart').forEach(el => Plotly.Plots.resize(el)); }}
+    try {{ history.replaceState(null, '', '#' + name); }} catch (e) {{}}
+    window.scrollTo(0, 0);
+  }}
+
+  document.querySelectorAll('.ring[data-v]').forEach(r => {{
+    const v = parseFloat(r.dataset.v);
+    requestAnimationFrame(() => requestAnimationFrame(() => setRing(r, v)));
+  }});
+  openTab((location.hash || '#home').slice(1));
 </script>
 </body>
 </html>"""
 
     with open("biometric_science_lab.html", "w", encoding="utf-8") as f:
         f.write(html)
+
+
 
     abs_path = os.path.abspath(HTML_DASHBOARD)
     print(f"[6/6] Launching Unified 3-Activity Biometric Science Lab: {abs_path}")
