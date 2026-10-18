@@ -1483,11 +1483,6 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
 # ==============================================================================
 # BIO LAB DASHBOARD BUILDER (final: robust sleep-stage ingestion + hypnogram)
 # Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
-#
-# Sleep data can come from either place (raw_sleep wins if given):
-#   raw_sleep = path to your Health Auto Export .json, a list of dicts, or a DataFrame
-#               with the raw records: {"start", "end", "value": Core/Deep/REM/Awake, "qty"}
-#   df_sleep  = your existing DataFrame (columns date, stage, hours, onset_hr, wake_hr ...)
 # ==============================================================================
 
 def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=None):
@@ -1511,7 +1506,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         if "rem" in s: return "REM"
         if "awake" in s or "wake" in s: return "Awake"
         if "core" in s or "light" in s or "unspecified" in s or s.strip() in ("asleep", "sleep"): return "Core"
-        return None  # "In Bed" and anything else is ignored
+        return None
 
     def clk(h):
         h = h % 24
@@ -1552,7 +1547,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         out["mins"] = (out["end"] - out["start"]).dt.total_seconds() / 60.0
         return out if not out.empty else None
 
-    def to_segments(d):  # raw records: start / end / value
+    def to_segments(d):
         cols = {str(c).lower(): c for c in d.columns}
         pick = lambda *names: next((cols[n.lower()] for n in names if n.lower() in cols), None)
         c_s, c_e, c_v = pick("start", "startDate"), pick("end", "endDate"), pick("value", "stage", "category")
@@ -1565,23 +1560,35 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         out["summary"] = False
         return out
 
-    def from_nightly(d):  # your pipeline's df_sleep: date / stage / hours / onset_hr / wake_hr
+    def from_nightly(d):
         if not {"date", "onset_hr", "wake_hr", "hours", "stage"} <= set(d.columns): return None
         d = d.sort_values("start_epoch") if "start_epoch" in d.columns else d.copy()
-        on = d["onset_hr"].astype(float)
-        day = pd.to_datetime(d["date"].astype(str).str[:10], errors="coerce")
-        wrap = on.groupby(d["date"]).transform(lambda s: (s.diff() < -12).cumsum())
-        start = day + pd.to_timedelta(on + wrap * 24.0, unit="h")
-        gap = d["wake_hr"].astype(float) - on
-        dur = np.where(gap < 0, gap + 24.0, gap)
-        out = pd.DataFrame({"key": d["stage"].map(stage_key), "start": start,
-                            "end": start + pd.to_timedelta(d["hours"].astype(float), unit="h")})
-        out["summary"] = (d["hours"].astype(float) - dur).abs().values > 0.75
+        
+        # BULLETPROOF FIX: Use explicit epochs if available to sidestep timezone grouping bugs
+        if "start_epoch" in d.columns and "end_epoch" in d.columns:
+            start = pd.to_datetime(d["start_epoch"], unit="s", utc=True)
+            end = pd.to_datetime(d["end_epoch"], unit="s", utc=True)
+        else:
+            on = d["onset_hr"].astype(float)
+            day = pd.to_datetime(d["date"].astype(str).str[:10], errors="coerce")
+            wrap = on.groupby(d["date"]).transform(lambda s: (s.diff() < -12).cumsum())
+            start = day + pd.to_timedelta(on + wrap * 24.0, unit="h")
+            end = start + pd.to_timedelta(d["hours"].astype(float), unit="h")
+            
+        out = pd.DataFrame({"key": d["stage"].map(stage_key), "start": start, "end": end})
+        
+        # BULLETPROOF FIX: Any block longer than 4.0 hours for a single stage is a fake Apple Summary block
+        out["summary"] = d["hours"].astype(float) > 4.0
         return out
 
     def pick_night(seg):
+        # Force drop summary blocks if detailed chronological blocks (>4 rows) exist
         real = seg[~seg["summary"]]
-        seg = (real if not real.empty else seg).sort_values("start").reset_index(drop=True)
+        if not real.empty and len(real) >= 4:
+            seg = real.sort_values("start").reset_index(drop=True)
+        else:
+            seg = seg.sort_values("start").reset_index(drop=True)
+            
         prev_end = seg["end"].cummax().shift(1)
         seg["sess"] = ((seg["start"] - prev_end) > pd.Timedelta(hours=2.5)).cumsum()
         asleep = seg[seg["key"] != "Awake"].groupby("sess")["mins"].sum()
@@ -1642,12 +1649,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         tiles += [("Time asleep", hm(asleep_min)), ("Deep + REM", f"{deep_rem_pct:.0f}% of sleep")]
         sleep_stats_html = "<div class='row'><div class='stats'>" + "".join(f"<div class='stat'><span>{t}</span><b>{v}</b></div>" for t, v in tiles) + "</div></div>"
 
-        print(f"      sleep: {src_label} | {night['start'].min():%d %b %H:%M} to {night['end'].max():%H:%M} | "
-              + ", ".join(f"{k} {int(round(mins_by[k]))}m" for k in ORDER)
-              + (" | NIGHTLY TOTALS ONLY: pass raw_sleep=<json path or records> for the full hypnogram" if is_summary_night else ""))
     else:
         sleep_log_html = "<div class='empty'>No sleep stages found for your latest night. Make sure your watch recorded sleep, and that raw_sleep or df_sleep is passed in.</div>"
-        print("      sleep: no usable stage data found (check df_sleep / raw_sleep)")
 
     # --- 2. DATA TABLE + STRESS EPISODES -------------------------------------
     table_html = ""
@@ -1699,8 +1702,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         "b_hours": pred_bundle["hours_grid"], "b_alert": pred_bundle["alertness_curve"],
         "b_adeno": pred_bundle["adenosine_curve"], "b_circ": pred_bundle["circadian_curve"],
         "st_dates": stress_bundle["daily_dates"], "st_like": stress_bundle["daily_likelihood"],
-        "st_ci_up": stress_bundle["daily_ci_upper"], "st_ci_dn": stress_bundle["daily_ci_lower"],
-        "st_anom": stress_bundle["daily_anomaly"],
         "in_ts": stress_bundle["intraday_ts"], "in_hr_raw": stress_bundle["intraday_hr_raw"],
         "in_hr_exp": stress_bundle["intraday_hr_exp"], "in_stress": stress_bundle["intraday_stress"],
         "in_state": stress_bundle["intraday_state"],
