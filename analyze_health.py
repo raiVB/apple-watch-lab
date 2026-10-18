@@ -1481,7 +1481,7 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
     }
 
 # ==============================================================================
-# BIO LAB DASHBOARD BUILDER (final: robust sleep-stage ingestion + hypnogram)
+# BIO LAB DASHBOARD BUILDER (final: robust sleep-stage ingestion + hypnogram + sync badge)
 # Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
 # ==============================================================================
 
@@ -1616,6 +1616,22 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         if seg is not None: night = pick_night(seg)
     except Exception as e:
         print(f"      sleep ingest failed: {e!r}")
+
+    # --- 0.5. CALCULATE LAST SYNCED TIME -------------------------------------
+    latest_ts = pd.NaT
+    if not df_raw.empty and "timestamp" in df_raw.columns:
+        latest_ts = pd.to_datetime(df_raw["timestamp"]).max()
+        
+    if night is not None and not night.empty and "end" in night.columns:
+        sleep_max = pd.to_datetime(night["end"]).max()
+        if pd.isna(latest_ts) or sleep_max > latest_ts:
+            latest_ts = sleep_max
+
+    if pd.isna(latest_ts):
+        last_synced_str = "Waiting for data..."
+    else:
+        # Formats to: "Oct 18, 2026 • 08:24 AM"
+        last_synced_str = latest_ts.strftime("%b %d, %Y &bull; %I:%M %p")
 
     # --- 1. SLEEP TIMELINE, STAT TILES, STAGE BAR ------------------------------
     sleep_log_html, stage_bar_html, sleep_stats_html = "", "", ""
@@ -1887,7 +1903,13 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
   <main class="main">
     <!-- HOME -->
     <section id="tab-home" class="tab active">
-      <header class="ph"><div><h1>Today</h1><p>Your body at a glance, built from your Apple Watch data.</p></div></header>
+      <header class="ph">
+        <div><h1>Today</h1><p>Your body at a glance, built from your Apple Watch data.</p></div>
+        <div style="background:var(--s2); border:1px solid var(--line); padding:8px 16px; border-radius:14px; text-align:right;">
+           <div style="font-size:11px; color:var(--dim); text-transform:uppercase; font-weight:800; letter-spacing:0.5px; margin-bottom:2px;">Last Synced</div>
+           <div style="font-size:13.5px; color:var(--tx); font-weight:700;">{last_synced_str}</div>
+        </div>
+      </header>
       <div class="hero">
         <div class="m" style="--c:{pred_bundle['badge_color']}">
           <div class="ring" data-v="{pred_bundle['readiness_score']}"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span>{pred_bundle['readiness_score']}</span><small>%</small></div></div>
@@ -2091,7 +2113,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     ], {{
       ...base, hovermode:'x unified', margin:{{ ...base.margin, r:56 }},
       xaxis:{{ ...base.xaxis, title:{{ text:'Time of day' }} }},
-      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm)' }} }},
+      yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm)' }}, type:'linear' }},
       yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], title:{{ text:'Stress (%)', font:{{ color:C.stress, size:11 }} }}, showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
     }}, cfg);
     updateStressSim();
