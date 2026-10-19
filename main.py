@@ -301,3 +301,108 @@ def backtest_readiness(request: Request):
             "It does not calculate predictive accuracy or prove model validity."
         )
     }
+
+@app.get("/api/backtest/dataset")
+def backtest_dataset(request: Request):
+    check_token(request)
+
+    checkins = list(
+        db.psych_checkins.find(
+            {
+                "skipped": False,
+                "stress": {"$gte": 0, "$lte": 4},
+                "server_timestamp": {"$exists": True},
+            },
+            {
+                "_id": 0,
+                "stress": 1,
+                "server_timestamp": 1,
+                "client_timezone_offset": 1,
+            },
+        ).sort("server_timestamp", 1)
+    )
+
+    results = []
+
+    for checkin in checkins:
+        try:
+            timestamp = datetime.fromisoformat(
+                checkin["server_timestamp"].replace("Z", "+00:00")
+            )
+            if timestamp.utcoffset() is None:
+                continue
+
+            # JavaScript getTimezoneOffset() is UTC minus local time.
+            offset = int(checkin.get("client_timezone_offset") or 0)
+            local_end = (
+                timestamp.astimezone(datetime.now().astimezone().tzinfo)
+                .replace(tzinfo=None)
+                + timedelta(minutes=offset)
+            )
+            # Convert UTC to the check-in device's local wall-clock time.
+            local_end = timestamp.replace(tzinfo=None) - timedelta(minutes=offset)
+            local_start = local_end - timedelta(minutes=60)
+
+            rows = list(
+                db.records.find(
+                    {
+                        "metric": {"$in": ["HeartRate", "HeartRateVariabilitySDNN"]},
+                        "date": {
+                            "$gte": local_start.strftime("%Y-%m-%d"),
+                            "$lte": local_end.strftime("%Y-%m-%d"),
+                        },
+                        "timestamp": {
+                            "$gte": local_start.strftime("%Y-%m-%d %H:%M:%S"),
+                            "$lte": local_end.strftime("%Y-%m-%d %H:%M:%S"),
+                        },
+                    },
+                    {"_id": 0, "metric": 1, "timestamp": 1, "value": 1},
+                )
+            )
+
+            features = {}
+            for metric in ["HeartRate", "HeartRateVariabilitySDNN"]:
+                values = [
+                    float(row["value"])
+                    for row in rows
+                    if row.get("metric") == metric
+                    and row.get("value") is not None
+                ]
+                features[metric] = {
+                    "sample_count": len(values),
+                    "mean": round(sum(values) / len(values), 2) if values else None,
+                }
+
+            results.append(
+                {
+                    "checkin_timestamp_utc": checkin["server_timestamp"],
+                    "stress_label": int(checkin["stress"]),
+                    "window_start_local": local_start.isoformat(sep=" "),
+                    "window_end_local": local_end.isoformat(sep=" "),
+                    "features": features,
+                    "has_heart_rate": features["HeartRate"]["sample_count"] > 0,
+                }
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            results.append(
+                {
+                    "checkin_timestamp_utc": checkin.get("server_timestamp"),
+                    "error": str(exc),
+                }
+            )
+
+    matched = sum(1 for row in results if row.get("has_heart_rate"))
+
+    return {
+        "status": "dataset_prepared",
+        "checkins_processed": len(results),
+        "checkins_with_heart_rate": matched,
+        "checkins_without_heart_rate": len(results) - matched,
+        "lookback_minutes": 60,
+        "future_sensor_data_used": False,
+        "results": results,
+        "note": (
+            "Feature preparation only; no predictive accuracy is calculated. "
+            "Verify metric names and timestamp conventions before model evaluation."
+        ),
+    }
