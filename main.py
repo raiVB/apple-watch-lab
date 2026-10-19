@@ -334,11 +334,7 @@ def backtest_dataset(request: Request):
 
             # JavaScript getTimezoneOffset() is UTC minus local time.
             offset = int(checkin.get("client_timezone_offset") or 0)
-            local_end = (
-                timestamp.astimezone(datetime.now().astimezone().tzinfo)
-                .replace(tzinfo=None)
-                + timedelta(minutes=offset)
-            )
+         
             # Convert UTC to the check-in device's local wall-clock time.
             local_end = timestamp.replace(tzinfo=None) - timedelta(minutes=offset)
             local_start = local_end - timedelta(minutes=60)
