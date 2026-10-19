@@ -706,6 +706,8 @@ if not hr_epochs.empty:
                         "hypothesis": hyp + " (Hypothesis — cross-check with your calendar/caffeine)."
                     })
 
+# ... end of detected_episodes.append block above ...
+
     dedup_episodes = []
     for ep_item in sorted(detected_episodes, key=lambda x: x["timestamp"]):
         if not dedup_episodes:
