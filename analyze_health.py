@@ -810,7 +810,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
     else:
         s_label, s_color = "Low Stress (Parasympathetic Dominance)", "#10b981"
 
-  return {
+    return {
         "today_likelihood": s_like, 
         "today_coverage": float(today_s["coverage_ratio"]),
         "today_anomaly_mag": float(today_s["anomaly_magnitude"]),
