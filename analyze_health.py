@@ -571,7 +571,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
     intraday_rows = []
     detected_episodes = []
 
-if not hr_epochs.empty:
+    if not hr_epochs.empty:
         ep_indices = hr_epochs.index.tolist()
         step_map = steps_5m.to_dict()
         kcal_map = kcal_5m.to_dict()
@@ -594,7 +594,7 @@ if not hr_epochs.empty:
             
             c_ex = sum(ex_map.get(ep - l, 0.0) * math.exp(-l / tau_buckets) for l in range(5))
             if is_s or is_w or c_ex >= 1.0:
-                continue # Train only on clean, waking, non-exercise periods
+                continue # Train only on clean, waking periods
                 
             c_st = sum(step_map.get(ep - l, 0.0) * math.exp(-l / tau_buckets) for l in range(5))
             c_kc = sum(kcal_map.get(ep - l, 0.0) * math.exp(-l / tau_buckets) for l in range(5))
@@ -669,9 +669,10 @@ if not hr_epochs.empty:
                 epoch_stress_pct = float(np.clip(100.0 / (1.0 + math.exp(-1.25 * (lin_s - 0.35))), 8.0, 98.0))
 
             intraday_rows.append({
-                "epoch_5m": ep, "timestamp": str(row["ts"]), "date": str(row["date"]),
-                "hour": round(hr_hour, 2), "hr_raw": round(hr_val, 1),
-                "hr_expected_met": round(expected_hr, 1), "hr_non_met_res": round(non_met_residual, 1),
+                "epoch_5m": ep, "timestamp": str(row["ts"]),
+                "hr_raw": round(hr_val, 1),
+                "expected_hr": round(expected_hr, 1),
+                "hr_non_met_res": round(non_met_residual, 1),
                 "conv_steps": round(conv_steps, 0),
                 "hrv_ms": None if pd.isna(hrv_val) else round(hrv_val, 1),
                 "noise_db": None if pd.isna(amb_db) else round(amb_db, 1),
@@ -705,8 +706,6 @@ if not hr_epochs.empty:
                         "facts": "; ".join(facts) + ".",
                         "hypothesis": hyp + " (Hypothesis — cross-check with your calendar/caffeine)."
                     })
-
-# ... end of detected_episodes.append block above ...
 
     dedup_episodes = []
     for ep_item in sorted(detected_episodes, key=lambda x: x["timestamp"]):
