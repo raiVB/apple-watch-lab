@@ -258,3 +258,46 @@ def serve_cockpit(request: Request):
 
     with open("biometric_science_lab.html", "r", encoding="utf-8") as f:
         return f.read()
+
+@app.get("/api/backtest/readiness")
+def backtest_readiness(request: Request):
+    check_token(request)
+
+    # Count completed check-ins with valid stress labels.
+    checkins = list(
+        db.psych_checkins.find(
+            {"skipped": False, "stress": {"$gte": 0, "$lte": 4}},
+            {"_id": 0, "stress": 1, "server_timestamp": 1}
+        ).sort("server_timestamp", 1)
+    )
+
+    # Inspect the stored heart-rate date range.
+    first_hr = db.records.find_one(
+        {"metric": "HeartRate", "date": {"$exists": True}},
+        {"_id": 0, "date": 1},
+        sort=[("date", 1)]
+    )
+    last_hr = db.records.find_one(
+        {"metric": "HeartRate", "date": {"$exists": True}},
+        {"_id": 0, "date": 1},
+        sort=[("date", -1)]
+    )
+
+    return {
+        "status": "insufficient_data" if len(checkins) < 10 else "data_available_for_review",
+        "completed_stress_checkins": len(checkins),
+        "minimum_checkins_for_initial_review": 10,
+        "heart_rate_first_date": first_hr.get("date") if first_hr else None,
+        "heart_rate_last_date": last_hr.get("date") if last_hr else None,
+        "checkins": [
+            {
+                "timestamp": c.get("server_timestamp"),
+                "stress": c.get("stress")
+            }
+            for c in checkins
+        ],
+        "note": (
+            "This endpoint checks data readiness only. "
+            "It does not calculate predictive accuracy or prove model validity."
+        )
+    }
