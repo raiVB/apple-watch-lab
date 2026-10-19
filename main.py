@@ -387,18 +387,53 @@ def backtest_dataset(request: Request):
                 }
             )
 
+    
     matched = sum(1 for row in results if row.get("has_heart_rate"))
+
+    # Preliminary data-quality checks for each observation.
+    MIN_HR_SAMPLES = 6
+
+    for row in results:
+        if row.get("error"):
+            row["data_quality"] = "error"
+            row["usable_for_preliminary_analysis"] = False
+            continue
+
+        hr_count = row.get("features", {}).get("HeartRate", {}).get(
+            "sample_count", 0
+        )
+        hrv_count = row.get("features", {}).get(
+            "HeartRateVariabilitySDNN", {}
+        ).get("sample_count", 0)
+
+        row["data_quality"] = (
+            "insufficient_heart_rate"
+            if hr_count < MIN_HR_SAMPLES
+            else "heart_rate_available"
+        )
+        row["usable_for_preliminary_analysis"] = hr_count >= MIN_HR_SAMPLES
+        row["hrv_available"] = hrv_count > 0
+
+    usable = sum(
+        1 for row in results
+        if row.get("usable_for_preliminary_analysis") is True
+    )
 
     return {
         "status": "dataset_prepared",
         "checkins_processed": len(results),
         "checkins_with_heart_rate": matched,
         "checkins_without_heart_rate": len(results) - matched,
+        "checkins_usable_for_preliminary_analysis": usable,
+        "checkins_below_minimum_hr_samples": len(results) - usable,
+        "minimum_hr_samples": MIN_HR_SAMPLES,
         "lookback_minutes": 60,
         "future_sensor_data_used": False,
         "results": results,
         "note": (
             "Feature preparation only; no predictive accuracy is calculated. "
-            "Verify metric names and timestamp conventions before model evaluation."
+            "Six heart-rate samples is a preliminary data-quality rule, "
+            "not a clinically validated threshold. HRV availability is "
+            "reported separately because HRV samples may be sparse."
         ),
     }
