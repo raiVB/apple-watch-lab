@@ -2670,6 +2670,60 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     <!-- STRESS -->
     <section id="tab-stress" class="tab">
       <header class="ph"><div><h1>Stress detective</h1><p>Tells stress apart from exercise by checking what your heart rate should be for how much you moved.</p></div></header>
+        <div class="card" id="class-attendance-card">
+    <h2>My class attendance</h2>
+    <p>Log what actually happened. A scheduled class is not assumed to be attended.</p>
+
+    <div class="row r2">
+      <label>
+        Date
+        <input id="class-date" type="date">
+      </label>
+      <label>
+        Class
+        <select id="class-subject">
+          <option value="">Choose a class</option>
+          <option value="BET">BET</option>
+          <option value="Maths">Maths</option>
+          <option value="Chemistry">Chemistry</option>
+          <option value="Engineering Graphics">Engineering Graphics</option>
+          <option value="Biology">Biology</option>
+          <option value="EVS">EVS</option>
+          <option value="PSUC">PSUC</option>
+          <option value="PSUC Lab">PSUC Lab</option>
+          <option value="Chemistry Lab">Chemistry Lab</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="row r2">
+      <label>
+        Attendance
+        <select id="class-status">
+          <option value="attended">Attended</option>
+          <option value="late">Arrived late / left early</option>
+          <option value="missed">Missed</option>
+          <option value="unsure">Unsure</option>
+        </select>
+      </label>
+      <label>
+        Actual arrival time
+        <input id="class-actual-start" type="datetime-local">
+      </label>
+      <label>
+        Actual departure time
+        <input id="class-actual-end" type="datetime-local">
+      </label>
+    </div>
+
+    <label>
+      Notes (optional)
+      <input id="class-notes" type="text" placeholder="e.g. arrived 8 min late">
+    </label>
+
+    <button id="save-class-attendance" type="button">Save attendance</button>
+    <p id="class-attendance-message" role="status"></p>
+  </div>
       <div class="row r2">
         <div class="panel">
           <div class="pt"><div><h3>Heart rate in context</h3><p>Actual vs. expected heart rate, with the stress score behind it.</p></div></div>
@@ -2931,6 +2985,62 @@ if (typeof initBodyScene === 'function') initBodyScene();
       yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], title:{{ text:'Stress (%)', font:{{ color:C.stress, size:11 }} }}, showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
     }}, cfg);
     updateStressSim();
+  }}
+
+  // Class attendance form -> FastAPI backend
+  const classAttendanceButton = document.getElementById('save-class-attendance');
+
+  if (classAttendanceButton) {{
+    classAttendanceButton.addEventListener('click', async function() {{
+      const date = document.getElementById('class-date').value;
+      const subject = document.getElementById('class-subject').value;
+      const status = document.getElementById('class-status').value;
+      const start = document.getElementById('class-actual-start').value;
+      const end = document.getElementById('class-actual-end').value;
+      const notes = document.getElementById('class-notes').value.trim();
+      const message = document.getElementById('class-attendance-message');
+
+      if (!date || !subject) {{
+        message.textContent = 'Please choose a date and class.';
+        return;
+      }}
+
+      if (start && end && new Date(end) <= new Date(start)) {{
+        message.textContent = 'Departure must be after arrival.';
+        return;
+      }}
+
+      const payload = {{
+        class_id: date + '|' + subject,
+        status: status,
+        actual_start: (status === 'missed' || status === 'unsure') ? null : (start || null),
+        actual_end: (status === 'missed' || status === 'unsure') ? null : (end || null),
+        notes: notes || null,
+        client_timezone_offset: new Date().getTimezoneOffset()
+      }};
+
+      classAttendanceButton.disabled = true;
+      message.textContent = 'Saving attendance...';
+
+      try {{
+        const response = await fetch('/api/class-attendance' + window.location.search, {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload)
+        }});
+
+        if (!response.ok) {{
+          const error = await response.text();
+          throw new Error(error || 'Request failed (' + response.status + ')');
+        }}
+
+        message.textContent = 'Attendance saved successfully.';
+      }} catch (error) {{
+        message.textContent = 'Could not save attendance: ' + error.message;
+      }} finally {{
+        classAttendanceButton.disabled = false;
+      }}
+    }});
   }}
 
   function updateStressSim() {{
