@@ -1484,6 +1484,630 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
 # BIO LAB DASHBOARD BUILDER (final: robust sleep-stage ingestion + hypnogram + sync badge)
 # Python f-string: every literal { } in CSS/JS is doubled as {{ }}.
 # ==============================================================================
+# ==============================================================================
+# 3D BODY SCAN HOME PAGE  (paste this whole function ABOVE `def build_dashboard`)
+#
+# It returns {"css": ..., "html": ..., "js": ...} as plain strings. They are NOT f-strings,
+# so everything inside uses normal single { } braces. Your f-string just drops them in.
+# Needs: pandas-style df_raw (metric/value/date/timestamp/unit) + your three bundles.
+# ==============================================================================
+
+def build_body_scene(df_raw, pred_bundle, stress_bundle, sleep_bundle):
+    import json
+
+    d = df_raw
+    latest_date = d["date"].max() if (d is not None and not d.empty) else None
+
+    def ok(v):
+        return v is not None and v == v
+
+    def sub(m):
+        return d[d["metric"] == m] if (d is not None and not d.empty) else d
+
+    def last(m):
+        s = sub(m)
+        return float(s["value"].iloc[-1]) if (s is not None and len(s)) else None
+
+    def avg(m):
+        s = sub(m)
+        return float(s["value"].mean()) if (s is not None and len(s)) else None
+
+    def today(m):
+        s = sub(m)
+        if s is None or not len(s) or latest_date is None:
+            return None
+        s = s[s["date"] == latest_date]
+        return float(s["value"].sum()) if len(s) else None
+
+    def f(v, nd=0, suf=""):
+        return "—" if not ok(v) else f"{v:,.{nd}f}{suf}"
+
+    def clk(h):
+        h = h % 24
+        hh, mm = int(h), int(round((h - int(h)) * 60))
+        if mm == 60:
+            hh, mm = (hh + 1) % 24, 0
+        return f"{(hh % 12) or 12}:{mm:02d} {'AM' if hh < 12 else 'PM'}"
+
+    GREEN, AMBER, RED, DIM, BLUE = "#3ddbb0", "#f5b84a", "#ff7a6b", "#8c95a6", "#7cc4ff"
+
+    # ---- raw numbers -------------------------------------------------------------
+    hr, rhr, hrr = last("HeartRate"), last("RestingHeartRate"), last("HeartRateRecoveryOneMinute")
+    hrv, hrv_avg = last("HeartRateVariabilitySDNN"), avg("HeartRateVariabilitySDNN")
+    rr, spo2, vo2 = last("RespiratoryRate"), last("OxygenSaturation"), last("VO2Max")
+    noise, noise_avg, hp = last("EnvironmentalAudioExposure"), avg("EnvironmentalAudioExposure"), last("HeadphoneAudioExposure")
+    kcal, ex_min, stand, basal = today("ActiveEnergyBurned"), today("AppleExerciseTime"), today("AppleStandTime"), today("BasalEnergyBurned")
+    steps, dist, flights, speed = today("StepCount"), today("DistanceWalkingRunning"), today("FlightsClimbed"), avg("WalkingSpeed")
+    wtemp = last("AppleSleepingWristTemperature")
+    n_rows = int(len(d)) if d is not None else 0
+    n_metrics = int(d["metric"].nunique()) if n_rows else 0
+    first_date = d["date"].min() if n_rows else None
+    last_ts = d["timestamp"].max() if n_rows else None
+    wunit = ""
+    s_w = sub("AppleSleepingWristTemperature")
+    if s_w is not None and len(s_w) and "unit" in s_w.columns:
+        wunit = str(s_w["unit"].iloc[-1])
+
+    # best focus time from the energy curve
+    best_focus = "—"
+    try:
+        hrs, al = list(pred_bundle["hours_grid"]), list(pred_bundle["alertness_curve"])
+        i = max(range(len(al)), key=lambda k: al[k] if ok(al[k]) else -1e9)
+        best_focus = clk(float(hrs[i]))
+    except Exception:
+        pass
+
+    # ---- one record per organ -----------------------------------------------------
+    hrv_tag, hrv_col = "Live sensor", BLUE
+    if ok(hrv) and ok(hrv_avg) and hrv_avg:
+        delta = (hrv / hrv_avg - 1) * 100
+        hrv_tag, hrv_col = f"HRV {delta:+.0f}% vs avg", (GREEN if delta >= 0 else AMBER)
+
+    lung_tag, lung_col = "No oxygen data", DIM
+    if ok(spo2):
+        lung_tag, lung_col = f"SpO₂ {spo2:.0f}%", (GREEN if spo2 >= 95 else AMBER)
+
+    ear_tag, ear_col = "No noise data", DIM
+    if ok(noise):
+        ear_tag, ear_col = (("Loud", RED) if noise >= 85 else ("Moderate", AMBER) if noise >= 70 else ("Quiet", GREEN))
+
+    organs = [
+        {"id": "brain", "name": "Brain", "color": "#b88cff",
+         "v": f"{stress_bundle['today_likelihood']}", "u": "% stress", "s": f"Energy {pred_bundle['readiness_score']}% · Sleep {sleep_bundle['latest_quality']}%",
+         "tag": f"{stress_bundle['stress_label']}", "tagColor": stress_bundle["stress_color"],
+         "rows": [["Stress load", f"{stress_bundle['today_likelihood']}% ({stress_bundle['stress_label']})"],
+                  ["Energy readiness", f"{pred_bundle['readiness_score']}% ({pred_bundle['readiness_label']})"],
+                  ["Sleep recovery", f"{sleep_bundle['latest_quality']}% ({sleep_bundle['quality_label']})"],
+                  ["Best focus time", best_focus]],
+         "note": "Stress, energy and sleep scores are estimated from your heart rate, HRV and movement. The Watch does not measure the brain directly."},
+        {"id": "heart", "name": "Heart", "color": "#ff5d73",
+         "v": f(hr), "u": "bpm", "s": f"Resting {f(rhr)} bpm · HRV {f(hrv)} ms",
+         "tag": hrv_tag, "tagColor": hrv_col,
+         "rows": [["Latest heart rate", f(hr, 0, " bpm")], ["Resting heart rate", f(rhr, 0, " bpm")],
+                  ["HRV (latest)", f(hrv, 0, " ms")], ["HRV (average)", f(hrv_avg, 0, " ms")],
+                  ["Recovery after 1 min", f(hrr, 0, " bpm")]],
+         "note": "Heart rate and HRV come from the Watch's optical heart sensor. Higher HRV usually means a more recovered body."},
+        {"id": "lungs", "name": "Lungs", "color": "#4fd8ff",
+         "v": f(rr) if ok(rr) else f(spo2), "u": "br/min" if ok(rr) else "% SpO₂", "s": f"VO₂ max {f(vo2, 1)}",
+         "tag": lung_tag, "tagColor": lung_col,
+         "rows": [["Respiratory rate", f(rr, 0, " br/min")], ["Blood oxygen", f(spo2, 0, "%")], ["VO₂ max", f(vo2, 1)]],
+         "note": "Breathing rate and blood oxygen are estimated by the Watch, mostly while you sleep or sit still."},
+        {"id": "ears", "name": "Ears", "color": "#ffd166",
+         "v": f(noise), "u": "dB noise", "s": f"Average {f(noise_avg)} dB",
+         "tag": ear_tag, "tagColor": ear_col,
+         "rows": [["Ambient noise (latest)", f(noise, 0, " dB")], ["Ambient noise (average)", f(noise_avg, 0, " dB")],
+                  ["Headphone volume", f(hp, 0, " dB")]],
+         "note": "Noise exposure is measured with the Watch microphone and your headphones. Long stretches above about 80 dB can tire your hearing."},
+        {"id": "core", "name": "Energy", "color": "#ffa94d",
+         "v": f(kcal), "u": "kcal active", "s": f"{f(ex_min)} exercise min today",
+         "tag": f"{f(stand)} stand min", "tagColor": AMBER,
+         "rows": [["Active energy today", f(kcal, 0, " kcal")], ["Exercise today", f(ex_min, 0, " min")],
+                  ["Stand time today", f(stand, 0, " min")], ["Resting energy today", f(basal, 0, " kcal")]],
+         "note": "Active energy is the calories your movement burned. Resting energy is what your body burns just staying alive."},
+        {"id": "legs", "name": "Legs", "color": "#7dffb2",
+         "v": f(steps), "u": "steps", "s": f"{f(dist, 1)} km · {f(flights)} flights",
+         "tag": f"{f(speed, 1)} km/h walk", "tagColor": GREEN,
+         "rows": [["Steps today", f(steps)], ["Distance today", f(dist, 2, " km")],
+                  ["Flights climbed today", f(flights)], ["Walking speed (average)", f(speed, 1, " km/h")]],
+         "note": "Movement comes from the Watch's motion sensors. 'Today' means the newest day in your data."},
+        {"id": "wrist", "name": "Apple Watch", "color": "#3ddbb0",
+         "v": f"{n_rows:,}", "u": "samples", "s": f"{n_metrics} sensors tracked",
+         "tag": "Data source", "tagColor": GREEN,
+         "rows": [["Last sample", str(last_ts) if last_ts else "—"], ["Data since", str(first_date) if first_date else "—"],
+                  ["Sensors tracked", str(n_metrics)], ["Stored samples", f"{n_rows:,}"],
+                  ["Wrist temperature", f(wtemp, 2, (" " + wunit) if wunit else "")]],
+         "note": "Everything on this page was collected by your Watch and stored as 5-minute averages."},
+    ]
+
+    payload = {"organs": organs, "hr": hr if ok(hr) else 70.0, "rr": rr if ok(rr) else 15.0}
+
+    scores = (
+        f"<div class='bs-score' style='--c:{pred_bundle['badge_color']}'><div class='n'>{pred_bundle['readiness_score']}<small>%</small></div>"
+        f"<div><div class='l'>Energy readiness</div><span class='badge'>{pred_bundle['readiness_label']}</span></div></div>"
+        f"<div class='bs-score' style='--c:{stress_bundle['stress_color']}'><div class='n'>{stress_bundle['today_likelihood']}<small>%</small></div>"
+        f"<div><div class='l'>Stress load</div><span class='badge'>{stress_bundle['stress_label']}</span></div></div>"
+        f"<div class='bs-score' style='--c:{sleep_bundle['quality_color']}'><div class='n'>{sleep_bundle['latest_quality']}<small>%</small></div>"
+        f"<div><div class='l'>Sleep recovery</div><span class='badge'>{sleep_bundle['quality_label']}</span></div></div>"
+    )
+
+    html = BODY_SCENE_HTML.replace("__SCORES__", scores)
+    js = BODY_SCENE_JS.replace("__DATA__", json.dumps(payload, default=str))
+    return {"css": BODY_SCENE_CSS, "html": html, "js": js}
+
+
+# ------------------------------------------------------------------------------------------
+# Static assets (plain strings: normal braces, no doubling needed)
+# ------------------------------------------------------------------------------------------
+BODY_SCENE_HTML = r"""
+      <div class="bs-scores">__SCORES__</div>
+      <div class="bs-stage" id="bs_stage">
+        <canvas id="bs_canvas"></canvas>
+        <svg class="bs-lines" id="bs_lines"></svg>
+        <div class="bs-cards" id="bs_cards"></div>
+        <i class="bs-br tl"></i><i class="bs-br tr"></i><i class="bs-br bl"></i><i class="bs-br brr"></i>
+        <div class="bs-hint">BIO-SCAN · DRAG TO ROTATE · SCROLL OR PINCH TO ZOOM · TAP AN ORGAN</div>
+        <div class="bs-chips" id="bs_chips"></div>
+        <div class="bs-fb" id="bs_fb" hidden>The 3D view could not start (WebGL or the 3D library is blocked). Your data is still below.</div>
+      </div>
+      <div class="bs-inspect" id="bs_inspect"></div>
+"""
+
+BODY_SCENE_CSS = r"""
+  .bs-scores { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:22px; }
+  .bs-score { display:flex; align-items:center; gap:14px; min-width:0; background:var(--s1); border:1px solid var(--line); border-radius:16px; padding:14px 18px; }
+  .bs-score .n { font-size:30px; font-weight:800; letter-spacing:-.02em; line-height:1; color:var(--c); }
+  .bs-score .n small { font-size:14px; font-weight:600; color:var(--dim); margin-left:2px; }
+  .bs-score .l { font-size:13px; color:var(--dim); margin-bottom:4px; }
+
+  .bs-stage { position:relative; margin-top:14px; height:680px; border-radius:24px; overflow:hidden; border:1px solid rgba(88,200,255,.2);
+    background:radial-gradient(ellipse at 50% 36%, #10203d 0%, #080d19 58%, #04060b 100%); }
+  .bs-stage::before { content:''; position:absolute; inset:0; z-index:1; pointer-events:none;
+    background:repeating-linear-gradient(0deg, rgba(120,190,255,.04) 0 1px, transparent 1px 4px); }
+  #bs_canvas { position:absolute; inset:0; width:100%; height:100%; display:block; cursor:grab; z-index:0; }
+  #bs_canvas:active { cursor:grabbing; }
+  .bs-lines { position:absolute; inset:0; width:100%; height:100%; z-index:2; pointer-events:none; }
+  .bs-cards { position:absolute; inset:0; z-index:3; pointer-events:none; }
+  .bs-br { position:absolute; width:22px; height:22px; z-index:4; border:2px solid rgba(88,200,255,.55); pointer-events:none; }
+  .bs-br.tl { top:12px; left:12px; border-right:0; border-bottom:0; } .bs-br.tr { top:12px; right:12px; border-left:0; border-bottom:0; }
+  .bs-br.bl { bottom:12px; left:12px; border-right:0; border-top:0; } .bs-br.brr { bottom:12px; right:12px; border-left:0; border-top:0; }
+  .bs-hint { position:absolute; top:16px; left:0; right:0; text-align:center; z-index:4; pointer-events:none; font:600 10.5px ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.14em; color:rgba(140,190,230,.6); padding:0 40px; }
+
+  .bs-card { position:absolute; left:0; top:0; width:var(--cw,190px); padding:10px 14px 11px; pointer-events:auto; cursor:pointer; will-change:transform;
+    background:rgba(7,13,25,.74); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);
+    border:1px solid color-mix(in srgb, var(--c) 35%, transparent); border-left:3px solid var(--c); border-radius:10px;
+    transition:opacity .25s, background .2s, box-shadow .2s; }
+  .bs-card .t { font:700 10.5px ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.16em; text-transform:uppercase; color:var(--c); margin-bottom:6px; }
+  .bs-card .v { font-size:22px; font-weight:800; letter-spacing:-.02em; line-height:1.05; }
+  .bs-card .v small { font-size:11.5px; font-weight:600; color:var(--dim); margin-left:5px; letter-spacing:0; }
+  .bs-card .s { font-size:11.5px; color:var(--dim); margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .bs-card.back { opacity:.35; }
+  .bs-card.on { background:rgba(10,22,40,.93); box-shadow:0 0 0 1px var(--c), 0 0 26px color-mix(in srgb, var(--c) 35%, transparent); }
+  .bs-ring { transform-box:fill-box; transform-origin:center; animation:bsp 2.2s ease-out infinite; }
+  @keyframes bsp { from { transform:scale(.6); opacity:.9; } to { transform:scale(2.6); opacity:0; } }
+
+  .bs-chips { position:absolute; left:0; right:0; bottom:16px; z-index:5; display:flex; gap:8px; justify-content:center; flex-wrap:wrap; padding:0 44px; }
+  .bs-chips button { background:rgba(8,16,30,.78); color:var(--tx); border:1px solid rgba(120,180,230,.25); border-radius:99px; padding:7px 14px; font-size:12.5px; font-weight:600; cursor:pointer; backdrop-filter:blur(6px); }
+  .bs-chips button.on { border-color:var(--c, #58c8ff); color:var(--c, #58c8ff); }
+  .bs-chips .bs-lock { display:none; }
+  .bs-fb { position:absolute; inset:0; z-index:6; display:flex; align-items:center; justify-content:center; text-align:center; padding:40px; color:var(--dim); }
+  .bs-fb[hidden] { display:none; }
+
+  .bs-inspect { margin-top:14px; background:var(--s1); border:1px solid var(--line); border-radius:20px; padding:20px 24px; }
+  .bs-i-head { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+  .bs-i-head h3 { margin:0; font-size:18px; color:var(--c); }
+  .bs-tag { display:inline-block; padding:3px 11px; border-radius:99px; font-size:12px; font-weight:700; color:var(--c); background:color-mix(in srgb, var(--c) 14%, transparent); }
+  .bs-i-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px 22px; }
+  .bs-i-grid span { display:block; font-size:12px; color:var(--dim); }
+  .bs-i-grid b { font-size:16px; font-weight:700; }
+  .bs-i-note { margin:14px 0 0; font-size:13px; color:var(--dim); max-width:80ch; }
+  .bs-i-empty { color:var(--dim); font-size:14px; }
+
+  @media (max-width:860px) {
+    .bs-stage { height:580px; --cw:108px; }
+    .bs-score { flex-direction:column; align-items:flex-start; gap:6px; padding:12px; }
+    .bs-score .n { font-size:24px; }
+    .bs-card { padding:8px 9px 9px; }
+    .bs-card .t { font-size:9px; letter-spacing:.1em; margin-bottom:4px; }
+    .bs-card .v { font-size:17px; }
+    .bs-card .v small { display:block; margin:2px 0 0; font-size:10px; }
+    .bs-card .s { display:none; }
+    .bs-hint { font-size:9px; padding:0 30px; }
+    .bs-chips { bottom:12px; padding:0 14px; gap:6px; }
+    .bs-chips button { padding:6px 10px; font-size:11.5px; }
+    .bs-chips .bs-lock { display:inline-block; }
+    .bs-inspect { padding:16px; }
+  }
+"""
+
+BODY_SCENE_JS = r"""
+  // ===================== 3D BODY SCAN =====================
+  (function () {
+    var BS = __DATA__;
+    var started = false;
+    var ANCH = {
+      brain: { a: [0, 1.56, 0.06],  f: [0, 1.5, 0],   d: 2.6 },
+      ears:  { a: [0.3, 1.5, 0],    f: [0.1, 1.5, 0], d: 2.6 },
+      heart: { a: [0.1, 0.62, 0.12], f: [0.05, 0.62, 0], d: 2.7 },
+      lungs: { a: [-0.24, 0.72, 0.06], f: [0, 0.68, 0], d: 3.1 },
+      core:  { a: [-0.1, 0.2, 0.1], f: [0, 0.12, 0],  d: 3.3 },
+      legs:  { a: [0.2, -1.1, 0.14], f: [0, -0.95, 0], d: 4.6 },
+      wrist: { a: [0.86, -0.12, 0.12], f: [0.78, -0.1, 0], d: 2.6 }
+    };
+    var SIDE0 = { brain: 'L', lungs: 'L', core: 'L', ears: 'R', heart: 'R', legs: 'R', wrist: 'R' };
+
+    window.initBodyScene = function () {
+      if (started) return;
+      started = true;
+      var stage = document.getElementById('bs_stage');
+      if (!stage) return;
+      if (typeof THREE === 'undefined' || !THREE.OrbitControls) { document.getElementById('bs_fb').hidden = false; return; }
+      try { build(stage); } catch (e) { console.error('Body scene failed', e); document.getElementById('bs_fb').hidden = false; }
+    };
+
+    function build(stage) {
+      var canvas = document.getElementById('bs_canvas');
+      var cardsEl = document.getElementById('bs_cards');
+      var svg = document.getElementById('bs_lines');
+      var chipsEl = document.getElementById('bs_chips');
+      var NS = 'http://www.w3.org/2000/svg';
+      var orgById = {};
+      BS.organs.forEach(function (o) { orgById[o.id] = o; });
+
+      var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setClearColor(0x000000, 0);
+      var scene = new THREE.Scene();
+      var camera = new THREE.PerspectiveCamera(36, 1, 0.1, 100);
+      var controls = new THREE.OrbitControls(camera, canvas);
+      controls.enableDamping = true; controls.dampingFactor = 0.07; controls.enablePan = false;
+      controls.minDistance = 1.6; controls.maxDistance = 14;
+      controls.minPolarAngle = Math.PI * 0.25; controls.maxPolarAngle = Math.PI * 0.62;
+      controls.autoRotate = true; controls.autoRotateSpeed = 0.7;
+      var reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (reduce) controls.autoRotate = false;
+
+      var body = new THREE.Group();
+      scene.add(body);
+
+      // ---------- materials ----------
+      var shellMat = new THREE.ShaderMaterial({
+        uniforms: { uColor: { value: new THREE.Color('#58c8ff') }, uTime: { value: 0 }, uScan: { value: 0 } },
+        vertexShader: 'varying vec3 vN; varying vec3 vW; void main(){ vN = normalize(normalMatrix*normal); vec4 w = modelMatrix*vec4(position,1.0); vW = w.xyz; gl_Position = projectionMatrix*viewMatrix*w; }',
+        fragmentShader: 'uniform vec3 uColor; uniform float uTime; uniform float uScan; varying vec3 vN; varying vec3 vW;' +
+          'void main(){ float f = pow(1.0-abs(normalize(vN).z), 2.0); float scan = smoothstep(0.14, 0.0, abs(vW.y-uScan));' +
+          'float lines = 0.5+0.5*sin(vW.y*70.0-uTime*1.5); float a = 0.05+f*0.5+scan*0.45+lines*0.025;' +
+          'gl_FragColor = vec4(uColor*(0.55+f*0.9+scan), a); }',
+        transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending
+      });
+      var wireMat = new THREE.LineBasicMaterial({ color: 0x2f86c0, transparent: true, opacity: 0.2, blending: THREE.AdditiveBlending, depthWrite: false });
+
+      function glow(color, base, pw) {
+        return new THREE.ShaderMaterial({
+          uniforms: { uColor: { value: new THREE.Color(color) }, uBase: { value: base }, uPow: { value: pw || 1.6 }, uBoost: { value: 1 } },
+          vertexShader: 'varying vec3 vN; void main(){ vN = normalize(normalMatrix*normal); gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+          fragmentShader: 'uniform vec3 uColor; uniform float uBase; uniform float uPow; uniform float uBoost; varying vec3 vN;' +
+            'void main(){ float f = pow(1.0-abs(normalize(vN).z), uPow); float a = (uBase+f*0.75)*uBoost; gl_FragColor = vec4(uColor*(0.7+f*1.1)*uBoost, clamp(a,0.0,1.0)); }',
+          transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending
+        });
+      }
+      function col(id) { return (orgById[id] || {}).color || '#58c8ff'; }
+
+      // ---------- body shell ----------
+      var pickables = [];
+      function shell(geo, id) {
+        var m = new THREE.Mesh(geo, shellMat);
+        m.add(new THREE.LineSegments(new THREE.WireframeGeometry(geo), wireMat));
+        body.add(m);
+        if (id) { m.userData.id = id; pickables.push(m); }
+        return m;
+      }
+      function ball(r, pos, sc, id) {
+        var m = shell(new THREE.SphereGeometry(r, 16, 12), id);
+        m.position.set(pos[0], pos[1], pos[2]);
+        if (sc) m.scale.set(sc[0], sc[1], sc[2]);
+        return m;
+      }
+      function limb(a, b, r1, r2, id) {
+        var A = new THREE.Vector3(a[0], a[1], a[2]), B = new THREE.Vector3(b[0], b[1], b[2]);
+        var m = shell(new THREE.CylinderGeometry(r2, r1, A.distanceTo(B), 14, 1, true), id);
+        m.position.copy(A).add(B).multiplyScalar(0.5);
+        m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), B.clone().sub(A).normalize());
+        return m;
+      }
+      var prof = [[0, 1.08], [0.17, 1.07], [0.33, 1.0], [0.39, 0.86], [0.37, 0.6], [0.31, 0.3], [0.29, 0.08], [0.33, -0.12], [0.35, -0.26], [0.3, -0.38], [0, -0.42]]
+        .map(function (p) { return new THREE.Vector2(p[0], p[1]); });
+      var torso = shell(new THREE.LatheGeometry(prof, 28)); torso.scale.set(1, 1, 0.62);
+      ball(0.26, [0, 1.5, 0], [1, 1.18, 1.02], 'brain');             // head (clicking it selects the brain)
+      limb([0, 1.1, 0], [0, 1.24, 0], 0.1, 0.09);                    // neck
+      [-1, 1].forEach(function (s) {
+        ball(0.1, [0.47 * s, 0.96, 0]);                               // shoulder
+        limb([0.47 * s, 0.96, 0], [0.68 * s, 0.42, 0], 0.085, 0.07);  // upper arm
+        ball(0.07, [0.68 * s, 0.42, 0]);                              // elbow
+        limb([0.68 * s, 0.42, 0], [0.83 * s, -0.12, 0.05], 0.068, 0.05, s > 0 ? 'wrist' : null); // forearm
+        ball(0.06, [0.86 * s, -0.27, 0.06], [1, 1.5, 0.8]);           // hand
+        limb([0.17 * s, -0.34, 0], [0.2 * s, -1.1, 0.02], 0.15, 0.1, 'legs');   // thigh
+        ball(0.1, [0.2 * s, -1.1, 0.02], null, 'legs');               // knee
+        limb([0.2 * s, -1.1, 0.02], [0.2 * s, -1.76, 0], 0.095, 0.06, 'legs');  // shin
+        ball(0.07, [0.2 * s, -1.84, 0.08], [1, 0.7, 2.3], 'legs');    // foot
+      });
+
+      // skeleton lines
+      var boneMat = new THREE.LineBasicMaterial({ color: 0x9ad7ff, transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false });
+      function bone(pts) {
+        body.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts.map(function (p) { return new THREE.Vector3(p[0], p[1], p[2]); })), boneMat));
+      }
+      var spine = []; for (var i = 0; i <= 18; i++) { var t = i / 18; spine.push([0, 1.1 - t * 1.4, -0.1 - 0.05 * Math.sin(t * Math.PI)]); }
+      bone(spine); bone([[-0.45, 0.95, 0], [0, 1.0, 0.02], [0.45, 0.95, 0]]);
+      bone([[0.17, -0.34, 0], [0.2, -1.1, 0.02], [0.2, -1.76, 0]]); bone([[-0.17, -0.34, 0], [-0.2, -1.1, 0.02], [-0.2, -1.76, 0]]);
+      bone([[0.47, 0.96, 0], [0.68, 0.42, 0], [0.83, -0.12, 0.05]]); bone([[-0.47, 0.96, 0], [-0.68, 0.42, 0], [-0.83, -0.12, 0.05]]);
+      for (var r = 0; r < 6; r++) { var ry = 0.9 - r * 0.1, rw = 0.3 - r * 0.012; bone([[-rw, ry - 0.08, 0.08], [-rw * 0.6, ry, 0.15], [0, ry + 0.02, 0.17], [rw * 0.6, ry, 0.15], [rw, ry - 0.08, 0.08]]); }
+
+      // ---------- organs ----------
+      var mats = {}; function reg(id, m) { (mats[id] = mats[id] || []).push(m); }
+      function organMesh(geo, id, color, base, pw, wire) {
+        var m = new THREE.Mesh(geo, glow(color, base, pw));
+        m.renderOrder = 2; m.userData.id = id; pickables.push(m); reg(id, m.material);
+        if (wire) { var w = new THREE.LineSegments(new THREE.WireframeGeometry(geo), new THREE.LineBasicMaterial({ color: color, transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false })); m.add(w); }
+        body.add(m);
+        return m;
+      }
+
+      // brain (folded sphere with a central fissure)
+      var bg = new THREE.IcosahedronGeometry(0.2, 3), bp = bg.attributes.position, bv = new THREE.Vector3();
+      for (var k = 0; k < bp.count; k++) {
+        bv.fromBufferAttribute(bp, k).normalize();
+        var g = 1 + 0.07 * Math.sin(bv.x * 9) * Math.sin(bv.y * 9 + 1) * Math.sin(bv.z * 9 + 2) + 0.03 * Math.sin(bv.x * 21 + bv.z * 17);
+        var fis = 1 - 0.14 * Math.exp(-bv.x * bv.x * 90) * Math.max(0, bv.y + 0.1);
+        bv.multiplyScalar(0.2 * g * fis); bp.setXYZ(k, bv.x, bv.y, bv.z);
+      }
+      bg.computeVertexNormals();
+      var brain = organMesh(bg, 'brain', col('brain'), 0.16, 1.5, true);
+      brain.position.set(0, 1.52, 0); brain.scale.set(1.12, 0.9, 1.28);
+
+      // heart (extruded heart curve) – pulses at your real heart rate
+      var hs = new THREE.Shape();
+      for (var h = 0; h <= 64; h++) {
+        var ht = h / 64 * Math.PI * 2, hx = 16 * Math.pow(Math.sin(ht), 3);
+        var hy = 13 * Math.cos(ht) - 5 * Math.cos(2 * ht) - 2 * Math.cos(3 * ht) - Math.cos(4 * ht);
+        if (h) hs.lineTo(hx, hy); else hs.moveTo(hx, hy);
+      }
+      var hgeo = new THREE.ExtrudeGeometry(hs, { depth: 8, bevelEnabled: true, bevelThickness: 3, bevelSize: 2.5, bevelSegments: 4, curveSegments: 24 });
+      hgeo.center(); hgeo.scale(0.0125, 0.0125, 0.0125);
+      var heart = organMesh(hgeo, 'heart', col('heart'), 0.28, 1.3, false);
+      heart.position.set(0.09, 0.62, 0.07); heart.rotation.y = -0.35; heart.rotation.z = 0.12;
+
+      // lungs + airway
+      var lungs = [];
+      [-1, 1].forEach(function (s) {
+        var l = organMesh(new THREE.SphereGeometry(0.2, 22, 16), 'lungs', col('lungs'), 0.1, 1.5, true);
+        l.position.set(0.21 * s, 0.68, -0.02); l.scale.set(0.8, 1.45, 0.75); l.rotation.z = -0.1 * s; lungs.push(l);
+      });
+      var airMat = new THREE.LineBasicMaterial({ color: col('lungs'), transparent: true, opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false });
+      [[[0, 1.14, 0], [0, 0.86, 0]], [[0, 0.86, 0], [-0.13, 0.7, 0]], [[0, 0.86, 0], [0.13, 0.7, 0]]].forEach(function (seg) {
+        body.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(seg.map(function (p) { return new THREE.Vector3(p[0], p[1], p[2]); })), airMat));
+      });
+
+      // energy core (stomach + gut)
+      var stomach = organMesh(new THREE.SphereGeometry(0.12, 18, 14), 'core', col('core'), 0.2, 1.4, true);
+      stomach.position.set(-0.1, 0.22, 0.05); stomach.scale.set(1.1, 0.8, 0.7);
+      var gut = organMesh(new THREE.TorusKnotGeometry(0.1, 0.028, 80, 8, 2, 3), 'core', col('core'), 0.22, 1.2, false);
+      gut.position.set(0, -0.06, 0.03);
+
+      // ears
+      [-1, 1].forEach(function (s) {
+        var e = organMesh(new THREE.TorusGeometry(0.07, 0.014, 8, 24), 'ears', col('ears'), 0.5, 1.2, false);
+        e.position.set(0.27 * s, 1.5, 0); e.rotation.y = Math.PI / 2;
+      });
+
+      // leg bands (steps)
+      [-1, 1].forEach(function (s) {
+        [-1.1, -1.5].forEach(function (y) {
+          var b = organMesh(new THREE.TorusGeometry(0.115, 0.011, 8, 28), 'legs', col('legs'), 0.6, 1.2, false);
+          b.position.set(0.2 * s, y, 0.02); b.rotation.x = Math.PI / 2;
+        });
+      });
+
+      // Apple Watch on the left wrist (viewer's right)
+      var wd = new THREE.Vector3(0.68, 0.42, 0).sub(new THREE.Vector3(0.83, -0.12, 0.05)).normalize(); // wrist -> elbow, keeps the watch face toward the viewer
+      var wrist = new THREE.Group(); wrist.position.set(0.82, -0.1, 0.05);
+      wrist.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), wd);
+      var wbody = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.2, 0.05), glow(col('wrist'), 0.5, 1.2));
+      wbody.position.z = 0.07; wbody.userData.id = 'wrist'; pickables.push(wbody); reg('wrist', wbody.material); wrist.add(wbody);
+      var band = new THREE.Mesh(new THREE.TorusGeometry(0.075, 0.016, 8, 24), glow(col('wrist'), 0.35, 1.2));
+      band.rotation.x = Math.PI / 2; band.userData.id = 'wrist'; pickables.push(band); reg('wrist', band.material); wrist.add(band);
+      var fc = document.createElement('canvas'); fc.width = fc.height = 128;
+      var g2 = fc.getContext('2d');
+      g2.fillStyle = '#04120c'; g2.fillRect(0, 0, 128, 128);
+      g2.strokeStyle = '#3ddbb0'; g2.lineWidth = 8; g2.beginPath(); g2.arc(64, 64, 48, -Math.PI / 2, -Math.PI / 2 + Math.PI * 1.6); g2.stroke();
+      g2.fillStyle = '#eafff6'; g2.font = 'bold 34px sans-serif'; g2.textAlign = 'center'; g2.fillText(String(Math.round(BS.hr)), 64, 74);
+      g2.font = '14px sans-serif'; g2.fillStyle = '#7dd3b5'; g2.fillText('BPM', 64, 98);
+      var face = new THREE.Mesh(new THREE.PlaneGeometry(0.13, 0.15), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(fc) }));
+      face.position.z = 0.0955; wrist.add(face);
+      body.add(wrist);
+
+      // data streams: watch -> heart -> brain
+      function stream(pts, color, n, speed) {
+        var curve = new THREE.CatmullRomCurve3(pts.map(function (p) { return new THREE.Vector3(p[0], p[1], p[2]); }));
+        var pos = new Float32Array(n * 3), geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        body.add(new THREE.Points(geo, new THREE.PointsMaterial({ color: color, size: 0.055, transparent: true, opacity: 0.95, depthWrite: false, blending: THREE.AdditiveBlending })));
+        var tmp = new THREE.Vector3();
+        return function (t) {
+          for (var q = 0; q < n; q++) { curve.getPoint((t * speed + q / n) % 1, tmp); pos[q * 3] = tmp.x; pos[q * 3 + 1] = tmp.y; pos[q * 3 + 2] = tmp.z; }
+          geo.attributes.position.needsUpdate = true;
+        };
+      }
+      var s1 = stream([[0.83, -0.12, 0.1], [0.68, 0.42, 0.06], [0.47, 0.95, 0.06], [0.12, 0.65, 0.12]], 0x3ddbb0, 36, 0.16);
+      var s2 = stream([[0.1, 0.7, 0.1], [0.03, 1.1, 0.05], [0, 1.52, 0.05]], 0xb88cff, 24, 0.2);
+
+      // floor
+      var grid = new THREE.GridHelper(9, 36, 0x1f6fa8, 0x123a5c); grid.position.y = -1.9;
+      grid.material.transparent = true; grid.material.opacity = 0.3; scene.add(grid);
+      var ringMat = new THREE.MeshBasicMaterial({ color: 0x58c8ff, transparent: true, opacity: 0.5, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false });
+      var ring1 = new THREE.Mesh(new THREE.RingGeometry(1.34, 1.37, 96), ringMat); ring1.rotation.x = -Math.PI / 2; ring1.position.y = -1.89; scene.add(ring1);
+      var ring2 = new THREE.Mesh(new THREE.RingGeometry(1.6, 1.63, 64, 1, 0, Math.PI * 0.6), ringMat); ring2.rotation.x = -Math.PI / 2; ring2.position.y = -1.89; scene.add(ring2);
+      var rippleMat = new THREE.MeshBasicMaterial({ color: 0x7dffb2, transparent: true, opacity: 0.4, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false });
+      var ripple = new THREE.Mesh(new THREE.RingGeometry(0.95, 1, 64), rippleMat); ripple.rotation.x = -Math.PI / 2; ripple.position.y = -1.88; scene.add(ripple);
+
+      // ---------- labels ----------
+      var items = [];
+      BS.organs.forEach(function (o) {
+        var el = document.createElement('div');
+        el.className = 'bs-card'; el.style.setProperty('--c', o.color);
+        el.innerHTML = '<div class="t">' + o.name + '</div><div class="v">' + o.v + '<small>' + o.u + '</small></div><div class="s">' + o.s + '</div>';
+        el.addEventListener('click', function () { select(selected === o.id ? null : o.id); });
+        cardsEl.appendChild(el);
+        var line = document.createElementNS(NS, 'polyline');
+        line.setAttribute('fill', 'none'); line.setAttribute('stroke', o.color); line.setAttribute('stroke-width', '1');
+        var dot = document.createElementNS(NS, 'circle'); dot.setAttribute('r', '3.5'); dot.setAttribute('fill', o.color);
+        var pr = document.createElementNS(NS, 'circle'); pr.setAttribute('r', '5'); pr.setAttribute('fill', 'none'); pr.setAttribute('stroke', o.color); pr.setAttribute('class', 'bs-ring');
+        svg.appendChild(line); svg.appendChild(pr); svg.appendChild(dot);
+        items.push({ id: o.id, el: el, line: line, dot: dot, pr: pr, a: ANCH[o.id].a, side: SIDE0[o.id] || 'L', sx: 0, sy: 0, cy: 0, behind: false });
+
+        var chip = document.createElement('button');
+        chip.textContent = o.name; chip.dataset.id = o.id; chip.style.setProperty('--c', o.color);
+        chip.addEventListener('click', function () { select(selected === o.id ? null : o.id); });
+        chipsEl.appendChild(chip);
+      });
+      var full = document.createElement('button'); full.textContent = 'Full body';
+      full.addEventListener('click', function () { select(null); }); chipsEl.insertBefore(full, chipsEl.firstChild);
+      var lock = document.createElement('button'); lock.className = 'bs-lock'; chipsEl.appendChild(lock);
+
+      // ---------- selection / focus ----------
+      var selected = null, focus = null, idleT = null;
+      var FRONT = new THREE.Vector3(0.15, 0.1, 1).normalize();
+      function fitDist() {
+        var vf = THREE.MathUtils.degToRad(camera.fov), w = camera.aspect < 0.9 ? 4.8 : 3.4;
+        return Math.max((4.4 / 2) / Math.tan(vf / 2), (w / 2) / (Math.tan(vf / 2) * camera.aspect)) * 1.04;
+      }
+      function renderInspector(o) {
+        var el = document.getElementById('bs_inspect');
+        if (!o) { el.innerHTML = '<div class="bs-i-empty">Tap an organ, a label or a button above to inspect it. Drag to turn the body, scroll or pinch to zoom.</div>'; return; }
+        el.innerHTML = '<div class="bs-i-head" style="--c:' + o.color + '"><h3>' + o.name + '</h3><span class="bs-tag" style="--c:' + o.tagColor + '">' + o.tag + '</span></div>' +
+          '<div class="bs-i-grid">' + o.rows.map(function (r) { return '<div><span>' + r[0] + '</span><b>' + r[1] + '</b></div>'; }).join('') + '</div>' +
+          '<p class="bs-i-note">' + o.note + '</p>';
+      }
+      function select(id) {
+        selected = id;
+        items.forEach(function (it) { it.el.classList.toggle('on', it.id === id); it.line.setAttribute('stroke-width', it.id === id ? '1.8' : '1'); });
+        Array.prototype.forEach.call(chipsEl.querySelectorAll('button[data-id]'), function (b) { b.classList.toggle('on', b.dataset.id === id); });
+        Object.keys(mats).forEach(function (k) { mats[k].forEach(function (m) { m.uniforms.uBoost.value = id ? (k === id ? 1.3 : 0.6) : 1; }); });
+        renderInspector(id ? orgById[id] : null);
+        controls.autoRotate = false;
+        var A = id ? ANCH[id] : null;
+        focus = { t: A ? new THREE.Vector3(A.f[0], A.f[1], A.f[2]) : new THREE.Vector3(0, 0, 0), d: A ? A.d : fitDist() };
+      }
+      controls.addEventListener('start', function () { focus = null; controls.autoRotate = false; clearTimeout(idleT); });
+      controls.addEventListener('end', function () { clearTimeout(idleT); idleT = setTimeout(function () { if (!selected && !reduce) controls.autoRotate = true; }, 7000); });
+      renderInspector(null);
+
+      // touch screens: let the page scroll until the 3D view is unlocked
+      var coarse = window.matchMedia && matchMedia('(pointer: coarse)').matches;
+      function setLock(on) {
+        controls.enabled = !on; canvas.style.touchAction = on ? 'pan-y' : 'none';
+        lock.textContent = on ? 'Unlock 3D' : 'Lock 3D (scroll page)';
+      }
+      if (coarse) setLock(true);
+      lock.addEventListener('click', function () { setLock(controls.enabled); });
+
+      // tap an organ
+      var ray = new THREE.Raycaster(), ndc = new THREE.Vector2(), down = null;
+      canvas.addEventListener('pointerdown', function (e) { down = { x: e.clientX, y: e.clientY, t: performance.now() }; });
+      canvas.addEventListener('pointerup', function (e) {
+        if (!down) return;
+        var moved = Math.hypot(e.clientX - down.x, e.clientY - down.y), dt = performance.now() - down.t; down = null;
+        if (moved > 6 || dt > 500) return;
+        var r = canvas.getBoundingClientRect();
+        ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+        ray.setFromCamera(ndc, camera);
+        var hit = ray.intersectObjects(pickables, false)[0];
+        if (hit) select(hit.object.userData.id); else if (selected) select(null);
+      });
+
+      // ---------- size ----------
+      var cw = 190, ch = 74, W = 1, H = 1;
+      function resize() {
+        W = stage.clientWidth; H = stage.clientHeight; if (!W || !H) return;
+        renderer.setSize(W, H, false); camera.aspect = W / H; camera.updateProjectionMatrix();
+        svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+        cw = items[0].el.offsetWidth; ch = items[0].el.offsetHeight;
+        if (!resize.done) { resize.done = true; camera.position.copy(FRONT).multiplyScalar(fitDist()); controls.update(); }
+      }
+      if (window.ResizeObserver) new ResizeObserver(resize).observe(stage); else window.addEventListener('resize', resize);
+      resize();
+
+      // ---------- labels each frame ----------
+      var v3 = new THREE.Vector3(), vv = new THREE.Vector3();
+      function updateLabels() {
+        var camDist = camera.position.distanceTo(controls.target);
+        items.forEach(function (it) {
+          v3.set(it.a[0], it.a[1], it.a[2]);
+          vv.copy(v3).applyMatrix4(camera.matrixWorldInverse);
+          it.behind = vv.z < -camDist - 0.28;
+          v3.project(camera);
+          it.sx = (v3.x * 0.5 + 0.5) * W; it.sy = (-v3.y * 0.5 + 0.5) * H;
+          if (it.sx < W * 0.4) it.side = 'L'; else if (it.sx > W * 0.6) it.side = 'R';
+        });
+        ['L', 'R'].forEach(function (side) {
+          var arr = items.filter(function (i) { return i.side === side; }).sort(function (a, b) { return a.sy - b.sy; });
+          var y = 44;
+          arr.forEach(function (i) { i.cy = Math.max(i.sy - ch / 2, y); y = i.cy + ch + 10; });
+          var lim = H - 62 - ch;
+          for (var k = arr.length - 1; k >= 0; k--) { arr[k].cy = Math.min(arr[k].cy, lim); lim = arr[k].cy - ch - 10; }
+        });
+        items.forEach(function (it) {
+          var x = it.side === 'L' ? 12 : W - 12 - cw, ex = it.side === 'L' ? x + cw : x, ey = it.cy + ch / 2, mx = ex + (it.side === 'L' ? 26 : -26);
+          it.el.style.transform = 'translate(' + x + 'px,' + it.cy + 'px)';
+          it.el.classList.toggle('back', it.behind);
+          it.line.setAttribute('points', it.sx + ',' + it.sy + ' ' + mx + ',' + ey + ' ' + ex + ',' + ey);
+          var op = it.behind ? 0.25 : 1;
+          it.line.setAttribute('opacity', op); it.dot.setAttribute('opacity', op);
+          it.dot.setAttribute('cx', it.sx); it.dot.setAttribute('cy', it.sy); it.pr.setAttribute('cx', it.sx); it.pr.setAttribute('cy', it.sy);
+          it.pr.setAttribute('opacity', it.behind ? 0 : 1);
+        });
+      }
+
+      // ---------- animation ----------
+      var clock = new THREE.Clock(), T = 0;
+      var period = 60 / Math.max(40, Math.min(180, BS.hr)), brPeriod = 60 / Math.max(8, Math.min(30, BS.rr));
+      function bump(p, c, w) { var x = (p - c) / w; return Math.exp(-x * x); }
+      function visible() { return stage.offsetParent !== null && !document.hidden; }
+      function frame() {
+        requestAnimationFrame(frame);
+        if (!visible()) return;
+        if (!W || !H) { resize(); if (!W) return; }
+        var dt = Math.min(clock.getDelta(), 0.05); T += dt;
+
+        var ph = (T % period) / period;
+        var beat = 1 + 0.15 * bump(ph, 0.04, 0.05) + 0.09 * bump(ph, 0.3, 0.06);
+        heart.scale.set(beat, beat, beat);
+        heart.material.uniforms.uBoost.value = (selected === 'heart' ? 1.3 : selected ? 0.6 : 1) * (0.85 + 0.4 * bump(ph, 0.04, 0.07));
+        var br = 1 + 0.06 * Math.sin(T * 2 * Math.PI / brPeriod);
+        lungs.forEach(function (l, i) { l.scale.set(0.8 * br, 1.45 * (1 + (br - 1) * 0.6), 0.75 * br); });
+        brain.rotation.y = Math.sin(T * 0.3) * 0.04;
+
+        shellMat.uniforms.uTime.value = T;
+        shellMat.uniforms.uScan.value = -1.95 + ((T * 0.4) % 1) * 4.0;
+        s1(T); s2(T);
+        ring2.rotation.z += dt * 0.6; ring1.rotation.z -= dt * 0.15;
+        var u = (T * 0.5) % 1; ripple.scale.setScalar(0.35 + u * 1.2); rippleMat.opacity = 0.45 * (1 - u);
+
+        if (focus) {
+          controls.target.lerp(focus.t, 0.09);
+          var dir = camera.position.clone().sub(controls.target).normalize();
+          dir.lerp(FRONT, 0.05).normalize();
+          var cur = camera.position.distanceTo(controls.target), d = cur + (focus.d - cur) * 0.09;
+          camera.position.copy(controls.target).addScaledVector(dir, d);
+          if (controls.target.distanceTo(focus.t) < 0.01 && Math.abs(d - focus.d) < 0.02) { focus = null; if (!selected && !reduce) controls.autoRotate = true; }
+        }
+        controls.update();
+        renderer.render(scene, camera);
+        updateLabels();
+      }
+      frame();
+    }
+  })();
+"""
 
 def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=None):
     print("[5/6] Building Bio Lab dashboard (Home + Stress + Energy + Sleep)...")
