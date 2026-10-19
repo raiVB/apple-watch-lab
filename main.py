@@ -29,6 +29,14 @@ class CheckInRecord(BaseModel):
     skipped: bool = False
     client_timezone_offset: Optional[int] = None
 
+class ClassAttendanceRecord(BaseModel):
+    class_id: str
+    status: str
+    actual_start: Optional[str] = None
+    actual_end: Optional[str] = None
+    notes: Optional[str] = None
+    client_timezone_offset: Optional[int] = None
+
 # ------------------------------------------------------------------------------
 # Render environment variables
 #   MONGO_URI       required
@@ -140,6 +148,21 @@ def save_checkin(record: CheckInRecord, request: Request):
     db.psych_checkins.insert_one(doc)
     return {"status": "recorded", "skipped": doc["skipped"]}
 
+@app.post("/api/class-attendance")
+def save_class_attendance(record: ClassAttendanceRecord, request: Request):
+    check_token(request)
+
+    allowed_statuses = {"attended", "late", "missed", "unsure"}
+    if record.status not in allowed_statuses:
+        raise HTTPException(status_code=422, detail="Invalid attendance status")
+
+    doc = record.model_dump()
+    doc["server_timestamp"] = datetime.utcnow().isoformat() + "Z"
+    doc["schema_version"] = "1.0"
+
+    db.class_attendance.insert_one(doc)
+
+    return {"status": "recorded", "class_id": doc["class_id"]}
 
 @app.get("/stats")
 
