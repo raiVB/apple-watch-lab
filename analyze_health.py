@@ -137,15 +137,6 @@ def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
 
 
-def chi2_survival_prob(d2, k):
-    """Wilson-Hilferty cube-root normal transformation for Chi-Square percentile."""
-    if k <= 0 or pd.isna(d2) or d2 <= 0:
-        return 0.0
-    ratio = max(float(d2) / float(k), 1e-9)
-    mu = 1.0 - (2.0 / (9.0 * k))
-    sigma = math.sqrt(2.0 / (9.0 * k))
-    z_wh = ((ratio ** (1.0 / 3.0)) - mu) / sigma
-    return float(np.clip(100.0 * norm_cdf(z_wh), 0.0, 99.9))
 
 
 def subspace_mahalanobis_d2(z_vec, R_prior):
@@ -753,9 +744,13 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         z6_wtemp = z_val_or_nan(s_wtemp.get(d, np.nan), s_wtemp, 36.4, 0.22)
         z7_noise = z_val_or_nan(s_noise.get(d, np.nan), s_noise, 66.0, 6.5)
 
-        z_vec = [z0_non_met_hr, z1_vagal_supp, z2_rhr_elev, z3_resp_elev, z4_slp_frag, z5_dip_blunt, z6_wtemp, z7_noise]
+     z_vec = [z0_non_met_hr, z1_vagal_supp, z2_rhr_elev, z3_resp_elev, z4_slp_frag, z5_dip_blunt, z6_wtemp, z7_noise]
         d2, k_obs = subspace_mahalanobis_d2(z_vec, R_prior_8x8)
-        anomaly_score = chi2_survival_prob(d2, k_obs)
+        
+        # Mathematical Correction: D2 does not follow a strict Chi-Square distribution here 
+        # because the covariance matrix R_prior_8x8 is heuristically authored, not empirically fit.
+        # We replace the invalid probability with the Root-Mean-Square Mahalanobis (RMS-M) distance.
+        anomaly_magnitude = math.sqrt(d2 / max(k_obs, 1)) if k_obs > 0 else 0.0
 
         prior_w = np.array([0.32, 0.34, 0.24, 0.14, 0.22, 0.18, 0.12, 0.14], dtype=float)
         valid_idx = [i for i, v in enumerate(z_vec) if not pd.isna(v)]
@@ -769,15 +764,12 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         else:
             stress_likelihood = 50.0
 
-        coverage_ratio = len(valid_idx) / 8.0
-        history_factor = 1.0 - math.exp(-max(1, len(all_dates)) / 5.5)
-        confidence_pct = float(np.clip(100.0 * (0.65 * coverage_ratio + 0.35 * history_factor), 25.0, 98.0))
-        uncertainty_margin = round(float(28.0 * (1.0 - confidence_pct / 100.0)), 1)
+coverage_ratio = len(valid_idx) / 8.0
 
         daily_stress_rows.append({
             "date": str(d), "stress_likelihood": round(stress_likelihood, 1),
-            "uncertainty_margin": uncertainty_margin, "confidence_pct": round(confidence_pct, 1),
-            "anomaly_score": round(anomaly_score, 1), "k_sensors": k_obs,
+            "coverage_ratio": round(coverage_ratio, 2),
+            "anomaly_magnitude": round(anomaly_magnitude, 2), "k_sensors": k_obs,
             "z0_non_met_hr": z0_non_met_hr, "z1_vagal_supp": z1_vagal_supp,
             "z2_rhr_elev": z2_rhr_elev, "z3_resp_elev": z3_resp_elev,
             "z4_slp_frag": z4_slp_frag, "z5_dip_blunt": z5_dip_blunt,
@@ -818,15 +810,15 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
     else:
         s_label, s_color = "Low Stress (Parasympathetic Dominance)", "#10b981"
 
-    return {
-        "today_likelihood": s_like, "today_uncertainty": float(today_s["uncertainty_margin"]),
-        "today_confidence": float(today_s["confidence_pct"]), "today_anomaly": float(today_s["anomaly_score"]),
-        "today_k_sensors": int(today_s["k_sensors"]), "stress_label": s_label, "stress_color": s_color,
+  return {
+        "today_likelihood": s_like, 
+        "today_coverage": float(today_s["coverage_ratio"]),
+        "today_anomaly_mag": float(today_s["anomaly_magnitude"]),
+        "today_k_sensors": int(today_s["k_sensors"]), 
+        "stress_label": s_label, "stress_color": s_color,
         "daily_dates": df_stress_daily["date"].tolist(),
         "daily_likelihood": [round(float(x), 1) for x in df_stress_daily["stress_likelihood"].tolist()],
-        "daily_ci_upper": [round(min(99.0, float(x + u)), 1) for x, u in zip(df_stress_daily["stress_likelihood"], df_stress_daily["uncertainty_margin"])],
-        "daily_ci_lower": [round(max(1.0, float(x - u)), 1) for x, u in zip(df_stress_daily["stress_likelihood"], df_stress_daily["uncertainty_margin"])],
-        "daily_anomaly": [round(float(x), 1) for x in df_stress_daily["anomaly_score"].tolist()],
+        "daily_anomaly_mag": [round(float(x), 2) for x in df_stress_daily["anomaly_magnitude"].tolist()],
         "intraday_ts": [r["timestamp"] for r in intraday_rows[-350:]],
         "intraday_hr_raw": [r["hr_raw"] for r in intraday_rows[-350:]],
         "intraday_hr_exp": [r["hr_expected_met"] for r in intraday_rows[-350:]],
@@ -2351,8 +2343,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         "b_hours": pred_bundle["hours_grid"], "b_alert": pred_bundle["alertness_curve"],
         "b_adeno": pred_bundle["adenosine_curve"], "b_circ": pred_bundle["circadian_curve"],
         "st_dates": stress_bundle["daily_dates"], "st_like": stress_bundle["daily_likelihood"],
-        "st_ci_up": stress_bundle["daily_ci_upper"], "st_ci_dn": stress_bundle["daily_ci_lower"],
-        "st_anom": stress_bundle["daily_anomaly"],
+        "st_anom": stress_bundle["daily_anomaly_mag"],
         "in_ts": stress_bundle["intraday_ts"], "in_hr_raw": stress_bundle["intraday_hr_raw"],
         "in_hr_exp": stress_bundle["intraday_hr_exp"], "in_stress": stress_bundle["intraday_stress"],
         "in_state": stress_bundle["intraday_state"],
