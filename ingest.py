@@ -186,13 +186,15 @@ class Ingestor:
 
     def record_docs(self):
         for (metric, ep), (total, n, unit) in self.bins.items():
-            bs = EPOCH0 + timedelta(seconds=ep * 300)
+            # Convert the true UTC epoch back to India Standard Time (+05:30) for dashboard displays
+            bs_utc = EPOCH0 + timedelta(seconds=ep * 300)
+            bs_ist = bs_utc + timedelta(hours=5, minutes=30)
             yield {
-                "metric": metric, "timestamp": bs.strftime("%Y-%m-%d %H:%M:%S"), "date": bs.strftime("%Y-%m-%d"),
-                "hour": round(bs.hour + bs.minute / 60.0, 2), "epoch_5m": ep,
+                "metric": metric, "timestamp": bs_ist.strftime("%Y-%m-%d %H:%M:%S"), "date": bs_ist.strftime("%Y-%m-%d"),
+                "hour": round(bs_ist.hour + bs_ist.minute / 60.0, 2), "epoch_5m": ep,
                 "value": round(total if metric in SUM_METRICS else total / n, 4), "unit": unit,
             }
-
+          
     def _sleep(self, item):
         s19 = str(item.get("start") or item.get("startDate") or "")[:19]
         e19 = str(item.get("end") or item.get("endDate") or "")[:19]
