@@ -60,17 +60,27 @@ EPOCH0 = datetime(1970, 1, 1)
 
 
 def parse_ts(s):
-    s = str(s)[:19]
+    """Parse an ISO timestamp, preserving timezone information."""
+    if not s:
+        return None
+
     try:
-        return datetime.fromisoformat(s)
-    except ValueError:
-        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return datetime.fromisoformat(str(s).strip())
+    except (ValueError, TypeError):
+        return None
 
 
 def to_epoch(dt):
-    # Wall-clock time treated as UTC, same convention the old pandas code used.
-    return calendar.timegm(dt.timetuple())
+    """Convert a datetime to Unix seconds without losing its timezone."""
+    if dt is None:
+        return None
 
+    if dt.tzinfo is None:
+        # Explicit policy for timezone-naive timestamps:
+        # interpret them as UTC until their source timezone is known.
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+
+    return dt.timestamp()
 
 def _compact(item):
     """Tiny stand-in for an item whose group name isn't known yet (keeps RAM low)."""
