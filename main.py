@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 import certifi
 import numpy as np
 import pandas as pd
+from typing import Optional
+from pydantic import BaseModel
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse
 from pymongo import MongoClient
@@ -18,6 +20,14 @@ import analyze_health
 import ingest
 
 app = FastAPI()
+
+class CheckInRecord(BaseModel):
+    stress: Optional[int] = None
+    arousal: Optional[int] = None
+    valence: Optional[str] = None
+    context: Optional[str] = None
+    skipped: bool = False
+    client_timezone_offset: Optional[int] = None
 
 # ------------------------------------------------------------------------------
 # Render environment variables
@@ -108,6 +118,27 @@ async def receive_health_data(request: Request, background: BackgroundTasks):
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.post("/api/checkin")
+def save_checkin(record: CheckInRecord, request: Request):
+    """
+    Persists momentary ecological momentary assessment (EMA) check-ins.
+    A skipped check-in explicitly prevents manufacturing a 'zero' stress label.
+    """
+    check_token(request)
+    doc = record.model_dump()
+    doc["server_timestamp"] = datetime.utcnow().isoformat() + "Z"
+    doc["schema_version"] = "1.0"
+    
+    # Do not treat 'skipped' as a physiological baseline of 0
+    if doc["skipped"]:
+        doc["stress"] = None
+        doc["arousal"] = None
+        doc["valence"] = None
+        doc["context"] = None
+        
+    db.psych_checkins.insert_one(doc)
+    return {"status": "recorded", "skipped": doc["skipped"]}
 
 
 @app.get("/stats")
