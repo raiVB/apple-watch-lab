@@ -60,15 +60,16 @@ EPOCH0 = datetime(1970, 1, 1)
 
 
 def parse_ts(s):
-    """Parse an ISO timestamp, preserving timezone information."""
+    """Parse an ISO timestamp, preserving timezone information and handling 'Z'."""
     if not s:
         return None
 
     try:
-        return datetime.fromisoformat(str(s).strip())
+        # Safely handle 'Z' for UTC to ensure broad Python version compatibility
+        s_str = str(s).strip().replace("Z", "+00:00")
+        return datetime.fromisoformat(s_str)
     except (ValueError, TypeError):
         return None
-
 
 def to_epoch(dt):
     """Convert a datetime to Unix seconds without losing its timezone."""
@@ -77,8 +78,10 @@ def to_epoch(dt):
 
     if dt.tzinfo is None:
         # Explicit policy for timezone-naive timestamps:
-        # interpret them as UTC until their source timezone is known.
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
+        # Default to India Standard Time (+05:30) to preserve wall-clock alignment
+        # rather than defaulting to UTC and shifting the user's day by 5.5 hours.
+        ist_offset = timezone(timedelta(hours=5, minutes=30))
+        dt = dt.replace(tzinfo=ist_offset)
 
     return dt.timestamp()
 
