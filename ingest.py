@@ -9,7 +9,7 @@ Shared by main.py (Render) and backfill.py (your computer).
 """
 import calendar
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import ijson
 from ijson.common import ObjectBuilder
