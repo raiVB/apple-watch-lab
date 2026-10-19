@@ -744,7 +744,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         z6_wtemp = z_val_or_nan(s_wtemp.get(d, np.nan), s_wtemp, 36.4, 0.22)
         z7_noise = z_val_or_nan(s_noise.get(d, np.nan), s_noise, 66.0, 6.5)
 
-     z_vec = [z0_non_met_hr, z1_vagal_supp, z2_rhr_elev, z3_resp_elev, z4_slp_frag, z5_dip_blunt, z6_wtemp, z7_noise]
+        z_vec = [z0_non_met_hr, z1_vagal_supp, z2_rhr_elev, z3_resp_elev, z4_slp_frag, z5_dip_blunt, z6_wtemp, z7_noise]
         d2, k_obs = subspace_mahalanobis_d2(z_vec, R_prior_8x8)
         
         # Mathematical Correction: D2 does not follow a strict Chi-Square distribution here 
