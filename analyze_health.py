@@ -3657,7 +3657,7 @@ await loadDataPage(1);
       ], {{
         ...base, margin: {{ ...base.margin, t: 24 }},
         xaxis: {{ ...base.xaxis, title: {{ text: 'NN_k (ms)' }} }},
-        yaxis: {{ ...base.yaxis, title: {{ text: 'NN_{k+1} (ms)' }} }}
+        yaxis: {{ ...base.yaxis, title: {{ text: 'NN_{{k+1}} (ms)' }} }}
       }}, cfg);
 
       document.getElementById('ecg_hrv_summary').innerHTML = hv.valid
