@@ -571,7 +571,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
     intraday_rows = []
     detected_episodes = []
 
-    if not hr_epochs.empty:
+if not hr_epochs.empty:
         ep_indices = hr_epochs.index.tolist()
         step_map = steps_5m.to_dict()
         kcal_map = kcal_5m.to_dict()
@@ -579,6 +579,44 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         fl_map = flights_5m.to_dict()
         hrv_map = hrv_5m.to_dict()
         ns_map = noise_5m.to_dict()
+
+        # --- PHASE 3: PERSONALIZED PHYSIOLOGICAL BASELINE ---
+        latest_dt = str(hr_epochs["date"].max())
+        X_train_list, y_train_list = [], []
+        
+        for ep in ep_indices:
+            r_date = str(hr_epochs.loc[ep, "date"])
+            if r_date >= latest_dt:
+                continue # Strict chronological separation: only train on past days
+                
+            is_s, _ = is_sleeping_epoch(ep)
+            is_w, _ = is_workout_epoch(ep)
+            
+            c_ex = sum(ex_map.get(ep - l, 0.0) * math.exp(-l / tau_buckets) for l in range(5))
+            if is_s or is_w or c_ex >= 1.0:
+                continue # Train only on clean, waking, non-exercise periods
+                
+            c_st = sum(step_map.get(ep - l, 0.0) * math.exp(-l / tau_buckets) for l in range(5))
+            c_kc = sum(kcal_map.get(ep - l, 0.0) * math.exp(-l / tau_buckets) for l in range(5))
+            c_fl = sum(fl_map.get(ep - l, 0.0) * math.exp(-l / tau_buckets) for l in range(5))
+            
+            h = float(hr_epochs.loc[ep, "hour"])
+            c_cos = math.cos(2.0 * math.pi * (h - 3.5) / 24.0)
+            ortho = 1.0 if (8.0 <= h <= 22.5) else 0.0
+            
+            X_train_list.append([c_cos, ortho, c_st, c_kc, c_fl])
+            y_train_list.append(float(hr_epochs.loc[ep, "hr"]) - base_rhr)
+
+        beta_prior = np.array([-6.0, 6.5, 0.095, 0.42, 4.5], dtype=float)
+        if len(X_train_list) >= 40:
+            X_mat = np.array(X_train_list, dtype=float)
+            y_vec = np.array(y_train_list, dtype=float)
+            lam = 15.0 # Regularization strength
+            beta_map = np.linalg.solve(X_mat.T @ X_mat + lam * np.eye(5), X_mat.T @ y_vec + lam * beta_prior)
+        else:
+            beta_map = beta_prior
+            
+        w_circ, w_ortho, w_steps, w_kcal, w_flights = beta_map
 
         for ep in ep_indices:
             row = hr_epochs.loc[ep]
@@ -596,9 +634,11 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
             is_slp, slp_stage = is_sleeping_epoch(ep)
             is_wk, wk_name = is_workout_epoch(ep)
 
-            circ_mod = -6.0 * math.cos(2.0 * math.pi * (hr_hour - 3.5) / 24.0) if not is_slp else -8.5
-            orthostatic_mod = 6.5 if (not is_slp and 8.0 <= hr_hour <= 22.5) else 0.0
-            metabolic_hr_lift = 0.095 * conv_steps + 0.42 * conv_kcal + 4.5 * conv_flights
+            # Apply personalized weights
+            c_cos = math.cos(2.0 * math.pi * (hr_hour - 3.5) / 24.0)
+            circ_mod = w_circ * c_cos if not is_slp else -8.5
+            orthostatic_mod = w_ortho if (not is_slp and 8.0 <= hr_hour <= 22.5) else 0.0
+            metabolic_hr_lift = w_steps * conv_steps + w_kcal * conv_kcal + w_flights * conv_flights
 
             expected_hr = base_rhr + circ_mod + orthostatic_mod + metabolic_hr_lift
             non_met_residual = hr_val - expected_hr
