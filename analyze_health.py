@@ -2637,6 +2637,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     <button class="nav-btn" data-tab="stress" onclick="openTab('stress')"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Stress</button>
     <button class="nav-btn" data-tab="energy" onclick="openTab('energy')"><svg viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg>Energy</button>
     <button class="nav-btn" data-tab="sleep" onclick="openTab('sleep')"><svg viewBox="0 0 24 24"><path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/></svg>Sleep</button>
+    <button class="nav-btn" data-tab="cardio" onclick="openTab('cardio')"><svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Cardio Lab</button>
     <button class="nav-btn" data-tab="data" onclick="openTab('data')">📊 Data Explorer</button>
   </nav>
 
@@ -2792,6 +2793,218 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         </div>
       </div>
     </section>
+<!-- CARDIOVASCULAR RESEARCH LAB -->
+<section id="tab-cardio" class="tab">
+  <header class="ph">
+    <div>
+      <h1>Cardiovascular Research Lab</h1>
+      <p>Single-lead ECG signal processing, Pan&ndash;Tompkins beat detection, ultra-short HRV, longitudinal baselines, and anomaly modeling.</p>
+    </div>
+    <label class="up-btn">
+      <span id="ecg_up_txt">Upload Apple Health ECG (.json)</span>
+      <input type="file" accept=".json,application/json" hidden onchange="uploadEcgJsonFile(this)">
+    </label>
+  </header>
+
+  <div class="panel" style="margin-top:18px;border-color:rgba(245,184,74,.35);background:rgba(245,184,74,.06);padding:16px 22px;">
+    <b style="color:var(--warn);font-size:13px;text-transform:uppercase;letter-spacing:.06em;">Research &amp; Personal-Monitoring System Only &mdash; Not a Medical Diagnostic Device</b>
+    <p id="cardio_disclaimer" style="margin:6px 0 0;font-size:13px;color:var(--dim);">
+      Loading cardiovascular laboratory overview&hellip;
+    </p>
+  </div>
+
+  <!-- RECORDING SELECTOR & PROTOCOL CONTEXT LOGGER -->
+  <div class="row r2">
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>ECG Recording History &amp; Selector</h3>
+          <p>Select a 30-second Apple Watch Series 11 recording to inspect its raw and filtered waveform.</p>
+        </div>
+        <span id="ecg_count_badge" class="badge" style="--c:var(--hr)">0 ECGs</span>
+      </div>
+      <select id="ecg_select" class="ema-select" onchange="loadSelectedEcg(this.value)" style="margin-bottom:14px;">
+        <option value="">No ECG recordings loaded yet</option>
+      </select>
+      <div class="scroll" style="max-height:240px;">
+        <table class="tbl" style="min-width:540px;">
+          <thead>
+            <tr><th>Timestamp</th><th>Apple Watch Label</th><th>Verified fs</th><th>SQI</th><th>Beats / HR</th><th>RMSSD</th></tr>
+          </thead>
+          <tbody id="ecg_history_rows"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>ECG Data Collection Protocol &amp; Context Logger</h3>
+          <p>Distinguish scheduled baseline anchors from diurnal or symptom-triggered recordings.</p>
+        </div>
+      </div>
+      <div class="row r2" style="margin-top:8px;gap:10px;">
+        <label style="font-size:12.5px;color:var(--dim);">Recording Type
+          <select id="ecg_ctx_type" class="ema-select" style="margin-top:4px;">
+            <option value="scheduled_baseline">Tier 1: Scheduled Morning Anchor (Resting)</option>
+            <option value="diurnal_second">Tier 2: Scheduled Evening Contrast</option>
+            <option value="hypothesis_context">Tier 3: Hypothesis Context (Post-Walk / Study)</option>
+            <option value="symptom_triggered">Unscheduled: Symptom-Triggered</option>
+          </select>
+        </label>
+        <label style="font-size:12.5px;color:var(--dim);">Posture
+          <select id="ecg_ctx_posture" class="ema-select" style="margin-top:4px;">
+            <option value="Seated quietly (arms rested)">Seated quietly (arms rested)</option>
+            <option value="Supine (lying down)">Supine (lying down)</option>
+            <option value="Standing">Standing</option>
+          </select>
+        </label>
+      </div>
+      <div class="row r2" style="margin-top:10px;gap:10px;">
+        <label style="font-size:12.5px;color:var(--dim);">Recent Exercise
+          <select id="ecg_ctx_ex" class="ema-select" style="margin-top:4px;">
+            <option value="None in past 2 hours">None in past 2 hours</option>
+            <option value="Within 5-30 mins post-walk/workout">Within 5&ndash;30 mins post-workout</option>
+            <option value="Within 1-2 hours post-workout">Within 1&ndash;2 hours post-workout</option>
+          </select>
+        </label>
+        <label style="font-size:12.5px;color:var(--dim);">Caffeine &amp; Notes
+          <input id="ecg_ctx_notes" type="text" class="ema-select" style="margin-top:4px;" placeholder="e.g. Fasted morning, 0 caffeine, calm">
+        </label>
+      </div>
+      <div style="margin-top:14px;display:flex;align-items:center;gap:12px;">
+        <button type="button" class="up-btn" onclick="saveEcgProtocolContext()">Save Recording Context</button>
+        <span id="ecg_ctx_msg" style="font-size:12.5px;color:var(--dim);"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODULE A: ECG SIGNAL LABORATORY -->
+  <div class="row">
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>Module A &mdash; ECG Signal Laboratory (Raw vs. Zero-Phase Filtered Waveform)</h3>
+          <p>Reconstructed from individual sample timestamps. Gaps &gt;100 ms are explicitly broken rather than interpolated.</p>
+        </div>
+        <span id="ecg_sqi_chip" class="chip" hidden></span>
+      </div>
+      <div id="c_ecg_wave" class="chart" style="height:380px;"></div>
+      <div id="ecg_dsp_stats" class="stats" style="margin-top:16px;"></div>
+      <p id="ecg_filter_doc" style="margin:14px 0 0;font-size:12.5px;color:var(--dim);"></p>
+    </div>
+  </div>
+
+  <!-- MODULE B & C: BEAT DETECTION, MORPHOLOGY & MATHEMATICAL HRV -->
+  <div class="row r2">
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>Module B &mdash; Beat Detection &amp; Median P-QRS-T Ensemble</h3>
+          <p>Pan&ndash;Tompkins QRS detection with 200 ms refractory &amp; T-wave slope discrimination.</p>
+        </div>
+      </div>
+      <div id="c_ecg_template" class="chart" style="height:280px;"></div>
+      <div id="ecg_beat_summary" style="margin-top:12px;font-size:13px;color:var(--dim);"></div>
+    </div>
+
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>Module C &mdash; Ultra-Short-Term ECG HRV &amp; Poincar&eacute; Geometry</h3>
+          <p>Calculated strictly on artifact-free contiguous Normal-to-Normal (NN) intervals (kept separate from PPG HRV).</p>
+        </div>
+      </div>
+      <div id="c_ecg_poincare" class="chart" style="height:280px;"></div>
+      <div id="ecg_hrv_summary" style="margin-top:12px;font-size:13px;color:var(--dim);"></div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>RR-Interval Time Series &amp; Candidate Premature Beat Check</h3>
+          <p>Inspect beat-to-beat interval stability and conservative prematurity flags (&gt;20% shorter than local median RR).</p>
+        </div>
+      </div>
+      <div id="c_ecg_rr" class="chart" style="height:260px;"></div>
+      <div id="ecg_ectopy_box" style="margin-top:12px;font-size:13px;color:var(--dim);"></div>
+    </div>
+  </div>
+
+  <!-- MODULE D: LONGITUDINAL PERSONAL CARDIOVASCULAR BASELINE -->
+  <div class="row">
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>Module D &mdash; Longitudinal Personal Cardiovascular Baseline</h3>
+          <p>Context-separated Resting Heart Rate, Apple Health PPG HRV, and ECG-derived RMSSD with 7-day EWMA and CUSUM regime shifts.</p>
+        </div>
+        <span id="cardio_maturity_badge" class="badge" style="--c:var(--energy)">Baseline</span>
+      </div>
+      <div id="c_cardio_base" class="chart" style="height:340px;"></div>
+      <div class="scroll" style="margin-top:18px;max-height:320px;">
+        <table class="tbl">
+          <thead>
+            <tr><th>Sensor</th><th>Status / Days</th><th>Samples</th><th>Latest</th><th>Personal Median &plusmn; MAD</th><th>P10 &ndash; P90</th><th>Robust Z</th></tr>
+          </thead>
+          <tbody id="cardio_sensor_audit_rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODULE E & F: ANOMALY DETECTION & POST-EXERCISE RECOVERY -->
+  <div class="row r2">
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>Module E &mdash; Personalized Anomaly Detection</h3>
+          <p>Univariate Robust-Z, Regularized Subspace Mahalanobis, and Pure-NumPy Isolation Forest.</p>
+        </div>
+        <span id="cardio_anom_badge" class="badge" style="--c:var(--stress)">0 Flags</span>
+      </div>
+      <div id="cardio_anom_list" class="scroll" style="max-height:420px;"></div>
+    </div>
+
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>Module F &mdash; Post-Exercise Heart-Rate Recovery</h3>
+          <p>Empirical mono-exponential decay fit HR(t) = HR_rest + A&middot;exp(&minus;t/&tau;) across comparable workout bouts.</p>
+        </div>
+      </div>
+      <div id="c_cardio_rec" class="chart" style="height:290px;"></div>
+      <div id="cardio_rec_summary" style="margin-top:12px;font-size:13px;color:var(--dim);"></div>
+    </div>
+  </div>
+
+  <!-- MODULE G & SCIENTIFIC METHODOLOGY / LIMITATIONS -->
+  <div class="row r2">
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>Module G &mdash; Multimodal Hypotheses &amp; Sampling Protocol</h3>
+          <p>Observational regressions with Benjamini&ndash;Hochberg FDR control and intermittent ECG sampling math.</p>
+        </div>
+      </div>
+      <div id="cardio_hyp_list"></div>
+      <div id="cardio_protocol_box" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line);font-size:13px;color:var(--dim);"></div>
+    </div>
+
+    <div class="panel">
+      <div class="pt">
+        <div>
+          <h3>Research Methodology, Capabilities &amp; Limitations</h3>
+          <p>Clear separation of direct measurements, statistical estimates, and non-inferable clinical endpoints.</p>
+        </div>
+        <span id="cardio_selftest_badge" class="badge" style="--c:var(--energy)">Self-Tests</span>
+      </div>
+      <div id="cardio_methodology_box" class="scroll" style="max-height:460px;font-size:13px;color:var(--dim);"></div>
+    </div>
+  </div>
+</section>
 
 <!-- DATA EXPLORER -->
 <section id="tab-data" class="tab">
@@ -2820,7 +3033,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     lbl.innerText = 'Uploading...';
     try {{
       const text = await file.text();
-      const res = await fetch('/webhook', {{
+      const res = await fetch('/webhook' + window.location.search, {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
         body: text
@@ -3286,6 +3499,7 @@ if (typeof initBodyScene === 'function') initBodyScene();
   summary.textContent = 'Loading…';
 
   try {{
+    if (tokenParams) params.set('token', tokenParams);
     const response = await fetch('/api/records?' + params.toString());
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const result = await response.json();
@@ -3323,8 +3537,298 @@ if (typeof initBodyScene === 'function') initBodyScene();
 
 await loadDataPage(1);
 }}
+  // ---------- CARDIOVASCULAR RESEARCH LAB ----------
+  let CARDIO_OVERVIEW = null;
+
+  async function uploadEcgJsonFile(input) {{
+    const file = input.files && input.files[0];
+    if (!file) return;
+    const lbl = document.getElementById('ecg_up_txt');
+    lbl.innerText = 'Processing ECG DSP...';
+    try {{
+      const text = await file.text();
+      const res = await fetch('/api/ecg/upload' + window.location.search, {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: text
+      }});
+      const out = await res.json();
+      if (res.ok) {{
+        lbl.innerText = 'Saved ' + (out.ecg_saved || 0) + ' ECG(s)! Reloading...';
+        RENDERED['cardio'] = false;
+        await renderCardio();
+      }} else {{
+        lbl.innerText = 'Upload failed';
+      }}
+    }} catch (e) {{
+      lbl.innerText = 'Error uploading ECG JSON';
+    }}
+  }}
+
+  async function saveEcgProtocolContext() {{
+    const msg = document.getElementById('ecg_ctx_msg');
+    msg.innerText = 'Saving...';
+    const sel = document.getElementById('ecg_select');
+    const payload = {{
+      ecg_id: sel ? (sel.value || null) : null,
+      recording_type: document.getElementById('ecg_ctx_type').value,
+      posture: document.getElementById('ecg_ctx_posture').value,
+      recent_exercise: document.getElementById('ecg_ctx_ex').value,
+      notes: document.getElementById('ecg_ctx_notes').value,
+      client_timezone_offset: new Date().getTimezoneOffset()
+    }};
+    try {{
+      const res = await fetch('/api/ecg/protocol-log' + window.location.search, {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(payload)
+      }});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      msg.innerText = 'Protocol context logged.';
+    }} catch (e) {{
+      msg.innerText = 'Could not save: ' + e.message;
+    }}
+  }}
+
+  async function loadSelectedEcg(ecgId) {{
+    if (!ecgId) return;
+    try {{
+      const res = await fetch('/api/ecg/recording/' + encodeURIComponent(ecgId) + window.location.search);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const rec = await res.json();
+      const base = getBase();
+      const sq = rec.signal_quality || {{}};
+      const smp = rec.sampling || {{}};
+      const fd = rec.filter_documentation || {{}};
+      const bt = rec.beats || {{}};
+      const hv = rec.hrv || {{}};
+      const wf = rec.waveform || {{}};
+
+      chip('ecg_sqi_chip', 'SQI ' + (sq.sqi_score ?? '—') + '% · ' + (sq.sqi_label || ''), sq.sqi_color || C.hr);
+
+      // Peak coordinates for overlay on filtered ECG
+      const pkT = bt.peak_times_s || [];
+      const pkV = bt.peak_voltages_mv || [];
+
+      Plotly.newPlot('c_ecg_wave', [
+        {{ x: wf.t_sec || [], y: wf.raw_mv || [], mode: 'lines', connectgaps: false, line: {{ color: 'rgba(140,149,166,0.42)', width: 1 }}, name: 'Raw ECG (mV)' }},
+        {{ x: wf.t_sec || [], y: wf.filtered_mv || [], mode: 'lines', connectgaps: false, line: {{ color: C.hr, width: 1.8 }}, name: 'Zero-Phase Filtered (0.5–40 Hz)' }},
+        {{ x: pkT, y: pkV, mode: 'markers', marker: {{ color: C.stress, size: 7, symbol: 'circle' }}, name: 'Detected R-Peaks (' + (bt.detected_beats || 0) + ')' }}
+      ], {{
+        ...base, hovermode: 'x unified',
+        xaxis: {{ ...base.xaxis, title: {{ text: 'Recording Time (seconds, pan/zoom enabled)' }}, rangeslider: {{ visible: true, thickness: 0.08 }} }},
+        yaxis: {{ ...base.yaxis, title: {{ text: 'Potential (mV)' }} }}
+      }}, cfg);
+
+      document.getElementById('ecg_dsp_stats').innerHTML =
+        '<div class="stat"><span>Verified Sampling Rate</span><b>' + (smp.estimated_fs_hz ?? '—') + ' Hz</b></div>' +
+        '<div class="stat"><span>Median Δt &plusmn; IQR</span><b>' + (smp.median_dt_ms ?? '—') + ' &plusmn; ' + (smp.iqr_dt_ms ?? 0) + ' ms</b></div>' +
+        '<div class="stat"><span>Usable Duration</span><b>' + (sq.usable_duration_pct ?? '—') + '% (' + (sq.total_duration_s ?? 0) + 's)</b></div>' +
+        '<div class="stat"><span>Gaps &gt;100ms / Missing</span><b>' + (sq.large_gaps_count ?? 0) + ' gaps (' + (sq.estimated_missing_samples ?? 0) + ' pts)</b></div>' +
+        '<div class="stat"><span>Wander / HF Noise RMS</span><b>' + (sq.baseline_wander_rms_mv ?? 0) + ' / ' + (sq.hf_noise_rms_mv ?? 0) + ' mV</b></div>' +
+        '<div class="stat"><span>Kurtosis / QRS Ratio</span><b>' + (sq.kurtosis ?? '—') + ' / ' + (sq.inband_qrs_power_ratio ?? '—') + '</b></div>';
+
+      document.getElementById('ecg_filter_doc').innerHTML =
+        '<b>Filter &amp; Calibration Documentation:</b> ' + (fd.method || '') + ' | Passband: ' + (fd.highpass_hz || 0.5) + '&ndash;' + (fd.lowpass_hz || 40) +
+        ' Hz (' + (fd.order_effective || '') + ') | Phase distortion: ' + (fd.phase_distortion || '') + '. ' + (fd.clinical_waveform_caveat || '');
+
+      // Module B: Beat Ensemble Template
+      Plotly.newPlot('c_ecg_template', [
+        {{ x: bt.template_t_ms || [], y: bt.template_p75_mv || [], mode: 'lines', line: {{ width: 0 }}, showlegend: false, hoverinfo: 'skip' }},
+        {{ x: bt.template_t_ms || [], y: bt.template_p25_mv || [], mode: 'lines', fill: 'tonexty', fillcolor: 'rgba(124,196,255,0.16)', line: {{ width: 0 }}, name: 'IQR Band (P25–P75)' }},
+        {{ x: bt.template_t_ms || [], y: bt.template_median_mv || [], mode: 'lines', line: {{ color: C.hr, width: 2.5 }}, name: 'Median Beat Template (mV)' }}
+      ], {{
+        ...base, margin: {{ ...base.margin, t: 24 }},
+        xaxis: {{ ...base.xaxis, title: {{ text: 'Time relative to R-peak (ms)' }} }},
+        yaxis: {{ ...base.yaxis, title: {{ text: 'Amplitude (mV)' }} }}
+      }}, cfg);
+
+      document.getElementById('ecg_beat_summary').innerHTML =
+        '<b>Beats:</b> ' + (bt.detected_beats ?? 0) + ' (' + (bt.polarity_orientation || '') + ') &bull; ' +
+        '<b>Mean / Median HR:</b> ' + (bt.mean_hr_bpm ?? '—') + ' / ' + (bt.median_hr_bpm ?? '—') + ' bpm (range ' + (bt.min_hr_bpm ?? '—') + '&ndash;' + (bt.max_hr_bpm ?? '—') + ') &bull; ' +
+        '<b>Median QRS (est.):</b> ' + (bt.qrs_duration_median_ms ? (bt.qrs_duration_median_ms + ' ms') : 'Suppressed (SNR gate)') + ' &bull; ' +
+        '<b>Detection Confidence:</b> ' + (bt.beat_detection_confidence ?? '—') + '%<br>' +
+        '<span style="color:var(--faint);">' + (bt.morphology_limitations || '') + '</span>';
+
+      // Module C: Poincare Plot & Mathematical HRV
+      Plotly.newPlot('c_ecg_poincare', [
+        {{ x: hv.poincare_x || [], y: hv.poincare_y || [], mode: 'markers', marker: {{ color: C.energy, size: 8, opacity: 0.85 }}, name: 'Contiguous NN Pair' }},
+        {{ x: [400, 1400], y: [400, 1400], mode: 'lines', line: {{ color: 'rgba(255,255,255,0.18)', dash: 'dash', width: 1 }}, name: 'Identity (NN_k = NN_k+1)' }}
+      ], {{
+        ...base, margin: {{ ...base.margin, t: 24 }},
+        xaxis: {{ ...base.xaxis, title: {{ text: 'NN_k (ms)' }} }},
+        yaxis: {{ ...base.yaxis, title: {{ text: 'NN_{k+1} (ms)' }} }}
+      }}, cfg);
+
+      document.getElementById('ecg_hrv_summary').innerHTML = hv.valid
+        ? ('<b>Accepted NN:</b> ' + hv.accepted_nn_count + '/' + hv.raw_rr_count + ' (' + hv.removed_interval_count + ' artifacts rejected) &bull; ' +
+           '<b>Mean NN:</b> ' + hv.mean_nn_ms + ' ms &bull; <b>UST SDNN:</b> ' + hv.sdnn_ms + ' ms &bull; ' +
+           '<b>RMSSD:</b> <span style="color:var(--energy);font-weight:700;">' + hv.rmssd_ms + ' ms</span> (lnRMSSD ' + hv.ln_rmssd + ') &bull; ' +
+           '<b>pNN50:</b> ' + hv.pnn50_pct + '% &bull; <b>SD1/SD2:</b> ' + hv.sd1_ms + ' / ' + hv.sd2_ms + ' ms<br>' +
+           '<span style="color:var(--warn);">' + (hv.frequency_domain_status || '') + '</span>')
+        : ('<b>HRV Gated Out:</b> ' + (hv.reason || 'Insufficient clean NN intervals.'));
+
+      // RR Tachogram + Premature beat check
+      Plotly.newPlot('c_ecg_rr', [
+        {{ x: hv.nn_times_s || [], y: hv.nn_intervals_ms || [], mode: 'lines+markers', line: {{ color: C.sleep, width: 2 }}, marker: {{ size: 6 }}, name: 'Accepted NN Interval (ms)' }}
+      ], {{
+        ...base, margin: {{ ...base.margin, t: 20 }},
+        xaxis: {{ ...base.xaxis, title: {{ text: 'Beat Timestamp in Recording (s)' }} }},
+        yaxis: {{ ...base.yaxis, title: {{ text: 'Inter-Beat Interval (ms)' }} }}
+      }}, cfg);
+
+      const ect = bt.candidate_premature_beats || [];
+      document.getElementById('ecg_ectopy_box').innerHTML = ect.length
+        ? ('<b style="color:var(--warn);">Candidate Unusually Timed Beats (' + ect.length + ' observed):</b> ' +
+           ect.map(e => 'Beat #' + e.beat_number + ' at ' + e.peak_time_s + 's (RR = ' + e.coupling_interval_ms + ' ms, ' + e.prematurity_pct + '% premature vs local median ' + e.local_median_rr_ms + ' ms)').join(' | ') +
+           '<br><span style="color:var(--faint);">' + ect[0].note + '</span>')
+        : '<span style="color:var(--energy);">No premature beat candidates detected (&gt;20% RR prematurity threshold). Regular rhythm spacing observed.</span>';
+    }} catch (err) {{
+      console.error('Error loading ECG:', err);
+    }}
+  }}
+
+  async function renderCardio() {{
+    const base = getBase();
+    try {{
+      const res = await fetch('/api/ecg/lab-overview' + window.location.search);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      CARDIO_OVERVIEW = await res.json();
+    }} catch (e) {{
+      document.getElementById('cardio_disclaimer').innerText = 'Failed to load Cardio Lab overview: ' + e.message;
+      return;
+    }}
+
+    const ov = CARDIO_OVERVIEW;
+    const meth = ov.methodology || {{}};
+    document.getElementById('cardio_disclaimer').innerText = meth.disclaimer || '';
+    document.getElementById('ecg_count_badge').innerText = (ov.ecg_count || 0) + ' Stored ECGs';
+
+    // Populate ECG selector and history table
+    const ecgs = ov.ecg_recordings || [];
+    const sel = document.getElementById('ecg_select');
+    const tbody = document.getElementById('ecg_history_rows');
+    if (ecgs.length > 0) {{
+      sel.innerHTML = ecgs.map(e =>
+        '<option value="' + e.ecg_id + '">' + (e.start_timestamp || e.date) + ' — ' + (e.classification || 'ECG') +
+        ' (SQI ' + (e.signal_quality ? e.signal_quality.sqi_score : '—') + '%, HR ' + (e.beats ? (e.beats.mean_hr_bpm ?? '—') : '—') + ' bpm)</option>'
+      ).join('');
+      tbody.innerHTML = ecgs.map(e => {{
+        const sq = e.signal_quality || {{}};
+        const sm = e.sampling || {{}};
+        const bt = e.beats || {{}};
+        const hv = e.hrv || {{}};
+        return '<tr style="cursor:pointer;" onclick="document.getElementById(\'ecg_select\').value=\'' + e.ecg_id + '\';loadSelectedEcg(\'' + e.ecg_id + '\')">' +
+          '<td><b>' + (e.start_timestamp || '') + '</b></td>' +
+          '<td><span class="pill" style="--c:#3ddbb0">' + (e.classification || 'Unclassified') + '</span></td>' +
+          '<td>' + (sm.estimated_fs_hz ?? '—') + ' Hz (' + (sm.median_dt_ms ?? '—') + ' ms)</td>' +
+          '<td><span class="pill" style="--c:' + (sq.sqi_color || '#7cc4ff') + '">' + (sq.sqi_score ?? '—') + '%</span></td>' +
+          '<td>' + (bt.detected_beats ?? 0) + ' beats / ' + (bt.mean_hr_bpm ?? '—') + ' bpm</td>' +
+          '<td><b>' + (hv.rmssd_ms ? (hv.rmssd_ms + ' ms') : '—') + '</b></td></tr>';
+      }}).join('');
+      await loadSelectedEcg(ecgs[0].ecg_id);
+    }} else {{
+      sel.innerHTML = '<option value="">No ECGs uploaded yet — use "Upload Apple Health ECG (.json)" above</option>';
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">No ECG recordings in MongoDB yet. Upload your Apple Health export (.json) containing data.ecg[] using the top-right button.</td></tr>';
+      document.getElementById('c_ecg_wave').innerHTML = '<div class="empty" style="padding:80px 20px;text-align:center;">Upload an Apple Health ECG JSON file to inspect raw &amp; filtered microvolt waveforms, Pan&ndash;Tompkins R-peaks, and beat templates.</div>';
+    }}
+
+    // Module D: Longitudinal Personal Cardiovascular Baseline
+    const bl = ov.baseline || {{}};
+    document.getElementById('cardio_maturity_badge').innerText = bl.maturity || 'Baseline';
+    Plotly.newPlot('c_cardio_base', [
+      {{ x: bl.dates || [], y: bl.rhr_daily || [], mode: 'markers', marker: {{ color: 'rgba(255,122,107,0.45)', size: 6 }}, name: 'Daily RHR (bpm)' }},
+      {{ x: bl.dates || [], y: bl.rhr_ewma7 || [], mode: 'lines', line: {{ color: C.stress, width: 2.5 }}, name: 'RHR 7d EWMA (bpm)' }},
+      {{ x: bl.dates || [], y: bl.ppg_hrv_ewma7 || [], yaxis: 'y2', mode: 'lines', line: {{ color: C.hr, width: 2.2 }}, name: 'Apple Health PPG HRV 7d EWMA (ms)' }},
+      {{ x: bl.dates || [], y: bl.ecg_rmssd_daily || [], yaxis: 'y2', mode: 'markers', marker: {{ color: C.energy, size: 10, symbol: 'diamond' }}, name: 'ECG-Derived UST RMSSD (ms, Separate)' }}
+    ], {{
+      ...base, hovermode: 'x unified', margin: {{ ...base.margin, r: 56 }},
+      xaxis: {{ ...base.xaxis, title: {{ text: 'Date' }} }},
+      yaxis: {{ ...base.yaxis, title: {{ text: 'Resting Heart Rate (bpm)' }} }},
+      yaxis2: {{ overlaying: 'y', side: 'right', title: {{ text: 'HRV (ms)', font: {{ color: C.hr, size: 11 }} }}, showgrid: false, zeroline: false }}
+    }}, cfg);
+
+    document.getElementById('cardio_sensor_audit_rows').innerHTML = (bl.sensor_audit || []).map(s => {{
+      if (!s.available) {{
+        return '<tr><td><b>' + s.label + '</b></td><td><span class="pill" style="--c:#8c95a6">Unavailable (0 days)</span></td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>';
+      }}
+      const zCol = (s.latest_z_robust != null && Math.abs(s.latest_z_robust) >= 2.0) ? '#ff7a6b' : '#3ddbb0';
+      return '<tr><td><b>' + s.label + '</b></td>' +
+        '<td><span class="pill" style="--c:#3ddbb0">' + s.status + ' (' + s.days_present + 'd)</span></td>' +
+        '<td>' + s.sample_count.toLocaleString() + '</td>' +
+        '<td><b>' + (s.latest ?? '—') + ' ' + (s.unit || '') + '</b></td>' +
+        '<td>' + (s.median ?? '—') + ' &plusmn; ' + (s.mad ?? '—') + ' ' + (s.unit || '') + '</td>' +
+        '<td>' + (s.p10 ?? '—') + ' &ndash; ' + (s.p90 ?? '—') + '</td>' +
+        '<td><span class="pill" style="--c:' + zCol + '">' + (s.latest_z_robust != null ? (s.latest_z_robust + ' SD') : '—') + '</span></td></tr>';
+    }}).join('');
+
+    // Module E: Anomaly Reports
+    const an = ov.anomalies || {{}};
+    const anList = an.anomalies || [];
+    const anEval = an.evaluation || {{}};
+    document.getElementById('cardio_anom_badge').innerText = anList.length + ' Flags (' + (anEval.alerts_per_week ?? 0) + '/wk)';
+    document.getElementById('cardio_anom_list').innerHTML = anList.length
+      ? anList.map(a =>
+          '<div style="padding:14px 0;border-bottom:1px solid var(--line);font-size:13px;">' +
+          '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;"><b>' + a.time_and_duration + '</b><span class="pill" style="--c:#ff7a6b">' + a.model_confidence + '</span></div>' +
+          '<div style="margin-top:4px;color:var(--tx);"><b>Changed:</b> ' + a.measurements_changed + '</div>' +
+          '<div style="color:var(--dim);"><b>Magnitude:</b> ' + a.direction_and_magnitude + ' | <b>Persistence:</b> ' + a.persistence + '</div>' +
+          '<div style="color:var(--dim);"><b>Baseline &amp; Coverage:</b> ' + a.baseline_comparison + ' (' + a.data_quality_missingness + ') | <b>Context:</b> ' + a.physiological_context + '</div>' +
+          '<div style="color:var(--sleep);margin-top:2px;"><b>Non-Diagnostic Confounders:</b> ' + a.confounders_and_explanations + '</div></div>'
+        ).join('')
+      : '<div class="empty good">No multi-sensor baseline anomalies flagged across your recent history.</div>';
+
+    // Module F: Exercise Recovery
+    const rc = ov.recovery || {{}};
+    const bouts = rc.bouts || [];
+    if (bouts.length > 0) {{
+      const b0 = bouts[0];
+      Plotly.newPlot('c_cardio_rec', [
+        {{ x: b0.t_mins, y: b0.hr_observed, mode: 'markers+lines', marker: {{ size: 8, color: C.stress }}, line: {{ dash: 'dot', width: 1.5 }}, name: 'Observed Post-Workout HR (' + b0.date + ')' }},
+        {{ x: b0.t_mins, y: b0.hr_fitted, mode: 'lines', line: {{ color: C.energy, width: 3 }}, name: 'Exponential Fit (τ = ' + b0.tau_mins + 'm, R² = ' + b0.r2 + ')' }}
+      ], {{
+        ...base, margin: {{ ...base.margin, t: 24 }},
+        xaxis: {{ ...base.xaxis, title: {{ text: 'Minutes Post-Workout Peak (t)' }} }},
+        yaxis: {{ ...base.yaxis, title: {{ text: 'Heart Rate (bpm)' }} }}
+      }}, cfg);
+      document.getElementById('cardio_rec_summary').innerHTML =
+        '<b>Latest Bout (' + b0.timestamp + '):</b> Peak ' + b0.peak_hr_bpm + ' bpm &rarr; Asymptote ' + b0.asymptote_hr_bpm +
+        ' bpm | Decay constant <b>&tau; = ' + b0.tau_mins + ' mins</b> (R&sup2; = ' + b0.r2 + ', RMSE = ' + b0.rmse_bpm + ' bpm). ' +
+        '<b>Apple Watch 1-Min HRR Median:</b> ' + ((rc.hrr_1min_summary && rc.hrr_1min_summary.median_bpm) ? (rc.hrr_1min_summary.median_bpm + ' bpm') : 'Unavailable') +
+        '<br><span style="color:var(--faint);">' + (rc.model_note || '') + '</span>';
+    }} else {{
+      document.getElementById('c_cardio_rec').innerHTML = '<div class="empty">No high-exertion workout recovery windows (&ge;28 bpm above RHR) found in current 5-minute window history.</div>';
+      document.getElementById('cardio_rec_summary').innerText = rc.model_note || '';
+    }}
+
+    // Module G: Multimodal Research & Protocol
+    const mm = ov.multimodal || {{}};
+    document.getElementById('cardio_hyp_list').innerHTML = (mm.hypotheses || []).map(h =>
+      '<div style="padding:10px 0;border-bottom:1px solid var(--line);font-size:13px;">' +
+      '<b>' + h.title + '</b> <span style="color:var(--dim);">(N = ' + h.n_paired_days + ' paired days)</span><br>' +
+      '<span style="color:var(--tx);">' + h.effect + '</span><br>' +
+      '<span style="color:var(--energy);">' + h.verdict + '</span> | <span style="color:var(--faint);">Confounders: ' + h.confounders + '</span></div>'
+    ).join('');
+
+    const pr = mm.protocol || {{}};
+    document.getElementById('cardio_protocol_box').innerHTML =
+      '<b>Recommended Sampling Protocol:</b><br>' +
+      (pr.recommended_tiers || []).map(t => '&bull; <b>' + t.tier + ':</b> ' + t.schedule + ' <i>(' + t.scientific_purpose + ')</i>').join('<br>') +
+      '<br><br><b>Sampling Mathematics &amp; Limitations:</b> ' + (pr.sampling_mathematics_note || '');
+
+    // Methodology & Self-Tests
+    const st = ov.self_tests || {{}};
+    document.getElementById('cardio_selftest_badge').innerText = st.all_passed ? ('PASS (' + st.tests_run + '/' + st.tests_run + ' Tests)') : 'Check Tests';
+    const caps = meth.capabilities || {{}};
+    document.getElementById('cardio_methodology_box').innerHTML =
+      '<b>1. What This System Measures Directly:</b><ul>' + (caps.can_measure_directly || []).map(x => '<li>' + x + '</li>').join('') + '</ul>' +
+      '<b>2. What It Estimates Statistically:</b><ul>' + (caps.can_estimate_statistically || []).map(x => '<li>' + x + '</li>').join('') + '</ul>' +
+      '<b>3. What It Cannot Infer or Diagnose:</b><ul>' + (caps.cannot_infer_or_diagnose || []).map(x => '<li>' + x + '</li>').join('') + '</ul>' +
+      '<b>4. Peer-Reviewed Scientific References:</b><ul>' + (meth.references || []).map(r => '<li><b>' + r.topic + ':</b> ' + r.citation + ' — <i>' + r.application + '</i></li>').join('') + '</ul>';
+  }}
+
   // ---------- NAVIGATION ----------
-  const RENDER = {{ home:renderHome, stress:renderStress, energy:renderEnergy, sleep:renderSleep, data:renderData }};
+  const RENDER = {{ home:renderHome, stress:renderStress, energy:renderEnergy, sleep:renderSleep, data:renderData, cardio:renderCardio }};
   const RENDERED = {{}};
   function openTab(name) {{
     if (!RENDER[name]) name = 'home';
