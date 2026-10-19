@@ -144,7 +144,23 @@ async def receive_health_data(request: Request, background: BackgroundTasks):
 @app.get("/health")
 def health():
     return {"ok": True}
-
+@app.get("/api/system/sanitize")
+def sanitize_database(request: Request):
+    check_token(request)
+    
+    # 1. Drop the automated sensor collections (the corrupted data)
+    db.records.drop()
+    db.sleep.drop()
+    db.sleep_raw.drop()
+    
+    # NOTE: We are intentionally NOT dropping db.psych_checkins or db.class_attendance 
+    # so your manual EMA logs are perfectly safe.
+    
+    # 2. Reset the system so it builds fresh, clean indexes on your next upload
+    INDEXES["ready"] = False
+    ensure_indexes_once()
+    
+    return {"status": "Sanitization complete. Your old ghost data is cleared. Please re-upload your Apple Health export."}
 @app.post("/api/checkin")
 def save_checkin(record: CheckInRecord, request: Request):
     """
