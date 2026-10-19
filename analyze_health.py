@@ -2682,16 +2682,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       <label>
         Class
         <select id="class-subject">
-          <option value="">Choose a class</option>
-          <option value="BET">BET</option>
-          <option value="Maths">Maths</option>
-          <option value="Chemistry">Chemistry</option>
-          <option value="Engineering Graphics">Engineering Graphics</option>
-          <option value="Biology">Biology</option>
-          <option value="EVS">EVS</option>
-          <option value="PSUC">PSUC</option>
-          <option value="PSUC Lab">PSUC Lab</option>
-          <option value="Chemistry Lab">Chemistry Lab</option>
+          <option value="">Choose a date first</option>
         </select>
       </label>
     </div>
@@ -2985,6 +2976,90 @@ if (typeof initBodyScene === 'function') initBodyScene();
       yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], title:{{ text:'Stress (%)', font:{{ color:C.stress, size:11 }} }}, showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
     }}, cfg);
     updateStressSim();
+  }}
+
+  // Timetable: weekday numbers use JavaScript Date (Sunday = 0).
+  const CLASS_TIMETABLE = {{
+    1: [
+      {{ name: 'BET', start: '09:00', end: '10:00' }},
+      {{ name: 'Maths', start: '10:30', end: '11:30' }},
+      {{ name: 'Chemistry', start: '11:30', end: '12:30' }},
+      {{ name: 'Engineering Graphics', start: '14:00', end: '17:00' }}
+    ],
+    2: [
+      {{ name: 'Biology', start: '13:00', end: '14:00' }},
+      {{ name: 'Chemistry', start: '14:00', end: '15:00' }},
+      {{ name: 'EVS', start: '15:30', end: '16:30' }}
+    ],
+    3: [
+      {{ name: 'Maths', start: '08:00', end: '09:00' }},
+      {{ name: 'Biology', start: '09:00', end: '10:00' }},
+      {{ name: 'Chemistry', start: '10:30', end: '11:30' }},
+      {{ name: 'PSUC', start: '11:30', end: '12:30' }}
+    ],
+    4: [
+      {{ name: 'PSUC Lab', start: '09:00', end: '11:30' }},
+      {{ name: 'PSUC', start: '14:00', end: '15:00' }},
+      {{ name: 'BET', start: '15:30', end: '16:30' }}
+    ],
+    5: [
+      {{ name: 'EVS', start: '08:00', end: '10:00' }},
+      {{ name: 'PSUC', start: '10:30', end: '11:30' }},
+      {{ name: 'Maths', start: '11:30', end: '12:30' }},
+      {{ name: 'Chemistry Lab', start: '14:00', end: '16:30' }}
+    ],
+    6: [
+      {{ name: 'BET', start: '13:00', end: '14:00' }},
+      {{ name: 'Maths', start: '14:00', end: '15:00' }},
+      {{ name: 'Biology', start: '15:30', end: '16:30' }}
+    ]
+  }};
+
+  const classDateInput = document.getElementById('class-date');
+  const classSubjectSelect = document.getElementById('class-subject');
+
+  function updateClassSubjectOptions() {{
+    const previousSubject = classSubjectSelect.value;
+    const dateValue = classDateInput.value;
+
+    classSubjectSelect.replaceChildren();
+
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+
+    if (!dateValue) {{
+      placeholder.textContent = 'Choose a date first';
+      classSubjectSelect.appendChild(placeholder);
+      return;
+    }}
+
+    // Parse the date as a local calendar date, avoiding UTC date shifts.
+    const parts = dateValue.split('-').map(Number);
+    const selectedDate = new Date(parts[0], parts[1] - 1, parts[2]);
+    const weekday = selectedDate.getDay();
+    const classes = CLASS_TIMETABLE[weekday] || [];
+
+    placeholder.textContent = classes.length
+      ? 'Choose a class'
+      : 'No classes listed for this day';
+
+    classSubjectSelect.appendChild(placeholder);
+
+    classes.forEach(function (item) {{
+      const option = document.createElement('option');
+      option.value = item.name;
+      option.textContent = item.name + ' (' + item.start + '–' + item.end + ')';
+      classSubjectSelect.appendChild(option);
+    }});
+
+    if (classes.some(function (item) {{ return item.name === previousSubject; }})) {{
+      classSubjectSelect.value = previousSubject;
+    }}
+  }}
+
+  if (classDateInput && classSubjectSelect) {{
+    classDateInput.addEventListener('change', updateClassSubjectOptions);
+    updateClassSubjectOptions();
   }}
 
   // Class attendance form -> FastAPI backend
