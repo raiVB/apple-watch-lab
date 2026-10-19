@@ -279,13 +279,16 @@ def write(db, ing, chunk=2000):
             _bulk(db.records, ops); n_rec += len(ops); ops = []
     _bulk(db.records, ops); n_rec += len(ops)
 
-    # If a payload re-sends a stretch of sleep, replace that stretch (Apple can re-segment a night).
-    segs = [d for d in ing.raw.values() if d["s19"] and d["e19"]]
-    if segs:
-        db.sleep_raw.delete_many({"s19": {"$gte": min(d["s19"] for d in segs)}, "e19": {"$lte": max(d["e19"] for d in segs)}})
-    if ing.legacy_win:
-        db.sleep.delete_many({"start_epoch": {"$gte": min(w[0] for w in ing.legacy_win)},
-                              "end_epoch": {"$lte": max(w[1] for w in ing.legacy_win)}})
+# Safe Replacement Strategy: Delete previously stored sleep records strictly for the 
+    # specific dates present in this upload payload. This cleanly handles Apple's 
+    # re-segmentation of a night without risking deletion of unrelated historical data.
+    affected_raw_dates = list(set(d["d"] for d in ing.raw.values() if d.get("d")))
+    if affected_raw_dates:
+        db.sleep_raw.delete_many({"d": {"$in": affected_raw_dates}})
+        
+    affected_legacy_dates = list(set(d["date"] for d in ing.legacy.values() if d.get("date")))
+    if affected_legacy_dates:
+        db.sleep.delete_many({"date": {"$in": affected_legacy_dates}})
     raw_ops = [UpdateOne({"k": d["k"]}, {"$set": d}, upsert=True) for d in ing.raw.values()]
     leg_ops = [UpdateOne({"stage": d["stage"], "start_epoch": d["start_epoch"], "end_epoch": d["end_epoch"]}, {"$set": d}, upsert=True)
                for d in ing.legacy.values()]
