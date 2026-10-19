@@ -418,6 +418,29 @@ def backtest_dataset(request: Request):
         1 for row in results
         if row.get("usable_for_preliminary_analysis") is True
     )
+    
+    # Count usable observations for each stress label.
+    stress_label_summary = {}
+
+    for label in range(5):
+        label_rows = [
+            row for row in results
+            if row.get("stress_label") == label
+        ]
+        usable_rows = [
+            row for row in label_rows
+            if row.get("usable_for_preliminary_analysis") is True
+        ]
+
+        stress_label_summary[str(label)] = {
+            "total_observations": len(label_rows),
+            "usable_observations": len(usable_rows),
+            "observations_with_hrv": sum(
+                1 for row in usable_rows
+                if row.get("hrv_available") is True
+            ),
+        }
+
 
     return {
         "status": "dataset_prepared",
@@ -425,6 +448,7 @@ def backtest_dataset(request: Request):
         "checkins_with_heart_rate": matched,
         "checkins_without_heart_rate": len(results) - matched,
         "checkins_usable_for_preliminary_analysis": usable,
+        "stress_label_summary": stress_label_summary,
         "checkins_below_minimum_hr_samples": len(results) - usable,
         "minimum_hr_samples": MIN_HR_SAMPLES,
         "lookback_minutes": 60,
