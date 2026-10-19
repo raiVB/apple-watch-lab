@@ -3718,7 +3718,7 @@ await loadDataPage(1);
         const sm = e.sampling || {{}};
         const bt = e.beats || {{}};
         const hv = e.hrv || {{}};
-        return '<tr style="cursor:pointer;" onclick="document.getElementById(\'ecg_select\').value=\'' + e.ecg_id + '\';loadSelectedEcg(\'' + e.ecg_id + '\')">' +
+        return '<tr style="cursor:pointer;" data-ecg-id="' + (e.ecg_id || '') + '" onclick="document.getElementById(&quot;ecg_select&quot;).value=this.dataset.ecgId;loadSelectedEcg(this.dataset.ecgId)">' +
           '<td><b>' + (e.start_timestamp || '') + '</b></td>' +
           '<td><span class="pill" style="--c:#3ddbb0">' + (e.classification || 'Unclassified') + '</span></td>' +
           '<td>' + (sm.estimated_fs_hz ?? '—') + ' Hz (' + (sm.median_dt_ms ?? '—') + ' ms)</td>' +
