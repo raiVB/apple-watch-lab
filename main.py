@@ -18,6 +18,7 @@ from pymongo import MongoClient
 
 import analyze_health
 import ingest
+import cardio_lab
 
 app = FastAPI()
 
@@ -34,6 +35,17 @@ class ClassAttendanceRecord(BaseModel):
     status: str
     actual_start: Optional[str] = None
     actual_end: Optional[str] = None
+    notes: Optional[str] = None
+    client_timezone_offset: Optional[int] = None
+
+class ECGProtocolLogRecord(BaseModel):
+    ecg_id: Optional[str] = None
+    recording_type: str = "scheduled_baseline"  # scheduled_baseline | diurnal_second | hypothesis_context | symptom_triggered
+    posture: str = "Seated quietly"
+    recent_exercise: str = "None in past 2 hours"
+    caffeine_recent: str = "None in past 4 hours"
+    perceived_stress: Optional[int] = None
+    symptoms: Optional[str] = None
     notes: Optional[str] = None
     client_timezone_offset: Optional[int] = None
 
@@ -62,6 +74,9 @@ def ensure_indexes_once():
         return
     try:
         ingest.ensure_indexes(db)
+        db.ecg_recordings.create_index("ecg_id", unique=True)
+        db.ecg_recordings.create_index([("start_epoch", -1)])
+        db.ecg_recordings.create_index([("date", -1)])
         INDEXES.update(ready=True, error=None)
     except Exception as e:
         INDEXES["error"] = str(e)
@@ -95,6 +110,9 @@ def process_file(path: str, size: int):
             ing = ingest.Ingestor()
             ingest.ingest_file(path, ing)
             detail = ingest.write(db, ing)
+            ecg_detail = cardio_lab.ingest_ecg_from_json_file(path, db)
+            detail["ecg_found"] = ecg_detail.get("ecg_found", 0)
+            detail["ecg_saved"] = ecg_detail.get("ecg_saved", 0)
             detail["upload_mb"] = round(size / 1024 / 1024, 1)
             STATUS.update(ok=True, detail=detail)
         except Exception as e:
@@ -164,7 +182,6 @@ def save_class_attendance(record: ClassAttendanceRecord, request: Request):
 
     return {"status": "recorded", "class_id": doc["class_id"]}
 
-@app.get("/stats")
 
 @app.get("/api/records")
 def get_records(
@@ -224,6 +241,8 @@ def get_records(
         "data_type": "stored_5_minute_bins",
     }
 
+
+@app.get("/stats")
 def stats(request: Request):
     check_token(request)
     db_stats = db.command("dbstats")
@@ -233,6 +252,7 @@ def stats(request: Request):
         "records": db.records.estimated_document_count(),
         "sleep_rows": db.sleep.estimated_document_count(),
         "sleep_raw_rows": db.sleep_raw.estimated_document_count(),
+        "ecg_recordings": db.ecg_recordings.estimated_document_count(),
         "storage_mb": round(db_stats.get("storageSize", 0) / 1024 / 1024, 1),
     }
 
@@ -656,3 +676,120 @@ def backtest_dataset(request: Request):
             "reported separately because HRV samples may be sparse."
         ),
     }
+
+
+# ==============================================================================
+# CARDIOVASCULAR RESEARCH LAB ENDPOINTS (MODULES A - G)
+# ==============================================================================
+
+@app.post("/api/ecg/upload")
+async def upload_ecg_json(request: Request, background: BackgroundTasks):
+    """
+    Accepts an Apple Health JSON file containing `data.ecg[]` (and optionally other metrics),
+    immediately extracts and caches all ECG recordings into `db.ecg_recordings`, and schedules
+    standard health-record ingestion if additional metrics are present.
+    """
+    check_token(request)
+    fd, path = tempfile.mkstemp(suffix=".json")
+    size = 0
+    with os.fdopen(fd, "wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+            size += len(chunk)
+
+    ecg_res = cardio_lab.ingest_ecg_from_json_file(path, db)
+    background.add_task(process_file, path, size)
+    return {
+        "status": "processed",
+        "bytes": size,
+        "ecg_found": ecg_res.get("ecg_found", 0),
+        "ecg_saved": ecg_res.get("ecg_saved", 0),
+    }
+
+
+@app.post("/api/ecg/protocol-log")
+def save_ecg_protocol_log(record: ECGProtocolLogRecord, request: Request):
+    """
+    Persists contextual metadata for an ECG recording (scheduled baseline vs symptom-triggered,
+    posture, recent exercise, caffeine, perceived stress, and notes).
+    """
+    check_token(request)
+    allowed_types = {
+        "scheduled_baseline",
+        "diurnal_second",
+        "hypothesis_context",
+        "symptom_triggered",
+    }
+    if record.recording_type not in allowed_types:
+        raise HTTPException(status_code=422, detail="Invalid recording_type")
+
+    doc = record.model_dump()
+    doc["server_timestamp"] = datetime.utcnow().isoformat() + "Z"
+    doc["schema_version"] = "1.0"
+    db.ecg_protocol_logs.insert_one(doc)
+    return {"status": "recorded", "recording_type": doc["recording_type"]}
+
+
+@app.get("/api/ecg/recording/{ecg_id}")
+def get_single_ecg_recording(ecg_id: str, request: Request):
+    """
+    Returns the complete signal-processed ECG waveform (raw & filtered mV vs time),
+    Pan-Tompkins beat detections, P-QRS-T median ensemble template, and NN/HRV arrays
+    for a single selected recording.
+    """
+    check_token(request)
+    doc = db.ecg_recordings.find_one({"ecg_id": ecg_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="ECG recording not found")
+    return clean_nans(doc)
+
+
+@app.get("/api/ecg/lab-overview")
+def get_cardio_lab_overview(request: Request):
+    """
+    Returns the complete Cardiovascular Research Lab overview:
+      - Lightweight summary list of all stored ECG recordings (excluding bulk voltage arrays)
+      - Module D: Longitudinal Personal Cardiovascular Baseline & Sensor Availability Audit
+      - Module E: Personalized Anomaly Detection (Univariate Robust-Z, Mahalanobis, Isolation Forest)
+      - Module F: Cardiovascular Response & Post-Exercise Exponential Recovery Curves
+      - Module G: Multimodal Physiological Hypotheses (BH-FDR adjusted) & ECG Sampling Protocol
+      - Scientific Methodology, Limitations & Self-Test Verification
+    """
+    check_token(request)
+
+    # Fetch stored ECG summaries without the heavy `waveform` array so payload stays compact
+    ecg_docs = list(
+        db.ecg_recordings.find({}, {"_id": 0, "waveform": 0})
+        .sort([("start_epoch", -1)])
+        .limit(200)
+    )
+
+    latest_rec = db.records.find_one({}, {"date": 1, "_id": 0}, sort=[("date", -1)])
+    if latest_rec and latest_rec.get("date"):
+        cutoff = (datetime.strptime(latest_rec["date"], "%Y-%m-%d") - timedelta(days=DASH_DAYS)).strftime("%Y-%m-%d")
+        recs = list(db.records.find({"date": {"$gte": cutoff}}, {"_id": 0}))
+        df_raw = pd.DataFrame(recs).sort_values("timestamp", kind="stable").reset_index(drop=True) if recs else pd.DataFrame()
+        sleep_rows = list(db.sleep.find({"date": {"$gte": cutoff}}, {"_id": 0}))
+        df_sleep = pd.DataFrame(sleep_rows).drop_duplicates() if sleep_rows else pd.DataFrame()
+    else:
+        df_raw = pd.DataFrame()
+        df_sleep = pd.DataFrame()
+
+    baseline_bundle = cardio_lab.compute_longitudinal_baseline(df_raw, df_sleep, ecg_docs)
+    anomaly_bundle = cardio_lab.detect_cardio_anomalies(df_raw, df_sleep, ecg_docs)
+    recovery_bundle = cardio_lab.analyze_exercise_recovery(df_raw)
+    multimodal_bundle = cardio_lab.run_multimodal_research_and_protocol(df_raw, df_sleep, ecg_docs)
+    protocol_logs = list(db.ecg_protocol_logs.find({}, {"_id": 0}).sort([("server_timestamp", -1)]).limit(30))
+    self_tests = cardio_lab.run_cardio_lab_self_tests()
+
+    return clean_nans({
+        "ecg_count": len(ecg_docs),
+        "ecg_recordings": ecg_docs,
+        "baseline": baseline_bundle,
+        "anomalies": anomaly_bundle,
+        "recovery": recovery_bundle,
+        "multimodal": multimodal_bundle,
+        "protocol_logs": protocol_logs,
+        "methodology": cardio_lab.METHODOLOGY_REGISTRY,
+        "self_tests": self_tests,
+    })
