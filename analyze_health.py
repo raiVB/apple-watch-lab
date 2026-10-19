@@ -669,14 +669,18 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
                 epoch_stress_pct = float(np.clip(100.0 / (1.0 + math.exp(-1.25 * (lin_s - 0.35))), 8.0, 98.0))
 
             intraday_rows.append({
-                "epoch_5m": ep, "timestamp": str(row["ts"]),
+                "epoch_5m": ep,
+                "timestamp": str(row["ts"]),
+                "date": str(row["date"]),
+                "hour": float(row["hour"]),
                 "hr_raw": round(hr_val, 1),
                 "expected_hr": round(expected_hr, 1),
                 "hr_non_met_res": round(non_met_residual, 1),
                 "conv_steps": round(conv_steps, 0),
                 "hrv_ms": None if pd.isna(hrv_val) else round(hrv_val, 1),
                 "noise_db": None if pd.isna(amb_db) else round(amb_db, 1),
-                "state_tag": state_tag, "stress_pct": round(epoch_stress_pct, 1),
+                "state_tag": state_tag,
+                "stress_pct": round(epoch_stress_pct, 1),
             })
 
             if (not is_wk) and conv_steps < 90.0 and conv_ex < 1.0:
@@ -862,7 +866,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         "daily_anomaly_mag": [round(float(x), 2) for x in df_stress_daily["anomaly_magnitude"].tolist()],
         "intraday_ts": [r["timestamp"] for r in intraday_rows[-350:]],
         "intraday_hr_raw": [r["hr_raw"] for r in intraday_rows[-350:]],
-        "intraday_hr_exp": [r["hr_expected_met"] for r in intraday_rows[-350:]],
+        "intraday_hr_exp": [r["expected_hr"] for r in intraday_rows[-350:]],
         "intraday_stress": [r["stress_pct"] for r in intraday_rows[-350:]],
         "intraday_state": [r["state_tag"] for r in intraday_rows[-350:]],
         "contrib_names": contrib_names, "contrib_z": contrib_z,
