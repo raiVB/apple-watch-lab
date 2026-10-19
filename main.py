@@ -259,6 +259,7 @@ def serve_cockpit(request: Request):
     with open("biometric_science_lab.html", "r", encoding="utf-8") as f:
         return f.read()
 
+
 @app.get("/api/backtest/readiness")
 def backtest_readiness(request: Request):
     check_token(request)
@@ -266,40 +267,74 @@ def backtest_readiness(request: Request):
     # Count completed check-ins with valid stress labels.
     checkins = list(
         db.psych_checkins.find(
-            {"skipped": False, "stress": {"$gte": 0, "$lte": 4}},
-            {"_id": 0, "stress": 1, "server_timestamp": 1}
+            {
+                "skipped": False,
+                "stress": {"$gte": 0, "$lte": 4},
+                "server_timestamp": {"$exists": True},
+            },
+            {
+                "_id": 0,
+                "stress": 1,
+                "server_timestamp": 1,
+            },
         ).sort("server_timestamp", 1)
+    )
+
+    # Count observations at each stress level.
+    stress_label_counts = {
+        str(label): sum(
+            1 for c in checkins if c.get("stress") == label
+        )
+        for label in range(5)
+    }
+
+    represented_labels = sum(
+        1 for count in stress_label_counts.values() if count > 0
     )
 
     # Inspect the stored heart-rate date range.
     first_hr = db.records.find_one(
         {"metric": "HeartRate", "date": {"$exists": True}},
         {"_id": 0, "date": 1},
-        sort=[("date", 1)]
+        sort=[("date", 1)],
     )
+
     last_hr = db.records.find_one(
         {"metric": "HeartRate", "date": {"$exists": True}},
         {"_id": 0, "date": 1},
-        sort=[("date", -1)]
+        sort=[("date", -1)],
     )
 
+    # Preliminary screening only, not a model-validation standard.
+    if len(checkins) < 10:
+        status = "insufficient_data"
+    elif represented_labels < 2:
+        status = "insufficient_label_diversity"
+    else:
+        status = "data_available_for_initial_review"
+
     return {
-        "status": "insufficient_data" if len(checkins) < 10 else "data_available_for_review",
+        "status": status,
         "completed_stress_checkins": len(checkins),
         "minimum_checkins_for_initial_review": 10,
+        "stress_label_counts": stress_label_counts,
+        "represented_stress_labels": represented_labels,
         "heart_rate_first_date": first_hr.get("date") if first_hr else None,
         "heart_rate_last_date": last_hr.get("date") if last_hr else None,
         "checkins": [
             {
                 "timestamp": c.get("server_timestamp"),
-                "stress": c.get("stress")
+                "stress": c.get("stress"),
             }
             for c in checkins
         ],
         "note": (
-            "This endpoint checks data readiness only. "
-            "It does not calculate predictive accuracy or prove model validity."
-        )
+            "This endpoint checks preliminary data readiness only. "
+            "Ten check-ins and two represented labels are screening rules, "
+            "not validated minimums for model training. Sensor-window "
+            "coverage, label balance, and independent evaluation are "
+            "still required before assessing predictive performance."
+        ),
     }
 
 @app.get("/api/backtest/dataset")
