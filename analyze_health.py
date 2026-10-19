@@ -2671,6 +2671,21 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     <!-- STRESS -->
     <section id="tab-stress" class="tab">
       <header class="ph"><div><h1>Stress detective</h1><p>Tells stress apart from exercise by checking what your heart rate should be for how much you moved.</p></div></header>
+      <!-- PHASE 4 VALIDATION WIDGET -->
+      <div class="row">
+        <div class="panel" style="border-color:rgba(61, 219, 176, 0.35); background:rgba(61, 219, 176, 0.04); padding: 20px 26px;">
+          <div class="pt" style="margin-bottom:0;">
+            <div>
+              <h3 style="color:var(--energy)">Phase 4: Live Model Audit</h3>
+              <p>Real-time cross-validation of your custom physiological algorithm against your subjective EMA check-ins.</p>
+            </div>
+            <span id="val_badge" class="badge" style="--c:var(--dim)">Loading...</span>
+          </div>
+          <div id="val_metrics_box" style="margin-top:16px; font-size:13.5px; color:var(--dim);">
+            Fetching validation engine metrics...
+          </div>
+        </div>
+      </div>
         <div class="card" id="class-attendance-card">
     <h2>My class attendance</h2>
     <p>Log what actually happened. A scheduled class is not assumed to be attended.</p>
@@ -3178,6 +3193,25 @@ if (typeof initBodyScene === 'function') initBodyScene();
   // ---------- STRESS ----------
   function renderStress() {{
     const base = getBase();
+    // Fetch Phase 4 Validation Metrics
+    fetch('/api/backtest/evaluate' + window.location.search)
+      .then(r => r.json())
+      .then(data => {{
+        const b = document.getElementById('val_badge');
+        const m = document.getElementById('val_metrics_box');
+        if (data.status === 'insufficient_data') {{
+          b.innerText = 'Needs Data';
+          b.style.setProperty('--c', C.warn);
+          m.innerHTML = data.detail + ' Open this dashboard in a Private/Incognito window to log more check-ins.';
+        }} else if (data.status === 'validation_complete') {{
+          b.innerText = 'N = ' + data.n_samples_tested + ' Check-ins';
+          b.style.setProperty('--c', C.energy);
+          m.innerHTML = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">' +
+            '<div style="background:var(--s2);padding:14px;border-radius:14px;border:1px solid var(--line);"><b>Model RMSE (Error Rate)</b><br><span style="font-size:24px;font-weight:800;color:var(--tx);letter-spacing:-0.02em;">' + data.metrics.RMSE + '%</span></div>' +
+            '<div style="background:var(--s2);padding:14px;border-radius:14px;border:1px solid var(--line);"><b>Baseline Guessing RMSE</b><br><span style="font-size:24px;font-weight:800;color:var(--dim);letter-spacing:-0.02em;">' + data.metrics.Baseline_Guess_MAE + '%</span></div>' +
+            '</div><span style="color:var(--energy);font-weight:600;">' + data.interpretation + '</span>';
+        }}
+      }}).catch(e => console.error('Validation fetch error:', e));
     Plotly.newPlot('c_st_intra', [
       {{ x:D.in_ts, y:D.in_stress, yaxis:'y2', text:D.in_state, mode:'lines', fill:'tozeroy', fillcolor:'rgba(255,122,107,.10)', line:{{ color:C.stress, width:1.5 }}, name:'Stress', hovertemplate:'%{{y:.0f}}%<br>%{{text}}<extra>Stress</extra>' }},
       {{ x:D.in_ts, y:D.in_hr_exp, mode:'lines', line:{{ color:C.hr, width:2, dash:'dot' }}, name:'Expected for your activity', hovertemplate:'%{{y:.0f}} bpm<extra>Expected</extra>' }},
