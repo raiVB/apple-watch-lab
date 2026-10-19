@@ -764,7 +764,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         else:
             stress_likelihood = 50.0
 
-coverage_ratio = len(valid_idx) / 8.0
+        coverage_ratio = len(valid_idx) / 8.0
 
         daily_stress_rows.append({
             "date": str(d), "stress_likelihood": round(stress_likelihood, 1),
