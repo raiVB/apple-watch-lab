@@ -2378,6 +2378,24 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <style>
   {scene["css"]}
+  /* EMA Check-in Modal Styles */
+  #ema-modal {{ display:none; position:fixed; inset:0; z-index:9999; background:rgba(10,12,16,0.95); backdrop-filter:blur(10px); align-items:center; justify-content:center; padding:20px; }}
+  .ema-box {{ background:var(--s1); border:1px solid var(--line); border-radius:24px; padding:32px; max-width:480px; width:100%; box-shadow:0 20px 40px rgba(0,0,0,0.5); }}
+  .ema-box h2 {{ margin:0 0 8px; font-size:24px; color:var(--tx); }}
+  .ema-box p {{ color:var(--dim); font-size:14px; margin:0 0 24px; }}
+  .ema-group {{ margin-bottom:24px; }}
+  .ema-label {{ display:block; font-weight:700; font-size:14px; margin-bottom:12px; color:var(--tx); }}
+  .ema-scale {{ display:flex; justify-content:space-between; gap:8px; }}
+  .ema-scale label {{ flex:1; text-align:center; background:var(--s2); border:1px solid var(--line); padding:10px 0; border-radius:12px; cursor:pointer; font-size:14px; font-weight:600; color:var(--dim); transition:all 0.2s; }}
+  .ema-scale input[type="radio"] {{ display:none; }}
+  .ema-scale input[type="radio"]:checked + label {{ background:color-mix(in srgb, var(--hr) 15%, transparent); border-color:var(--hr); color:var(--hr); }}
+  .ema-select {{ width:100%; background:var(--s2); border:1px solid var(--line); color:var(--tx); padding:12px; border-radius:12px; font-size:14px; outline:none; }}
+  .ema-actions {{ display:flex; gap:12px; margin-top:32px; }}
+  .ema-btn {{ flex:1; padding:14px; border-radius:12px; font-weight:700; font-size:14px; cursor:pointer; border:none; transition:opacity 0.2s; }}
+  .ema-btn.primary {{ background:var(--tx); color:var(--bg); }}
+  .ema-btn.secondary {{ background:transparent; border:1px solid var(--line); color:var(--dim); }}
+  .ema-btn:hover {{ opacity:0.8; }}
+  
   :root {{
     --bg:#0a0c10; --s1:#11141a; --s2:#181c24; --line:rgba(255,255,255,.07);
     --tx:#eef1f6; --dim:#8c95a6; --faint:#5d6677;
@@ -2515,7 +2533,64 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 </style>
 </head>
 <body>
-<div class="shell">
+
+<!-- PRE-DASHBOARD PSYCHOPHYSIOLOGY CHECK-IN -->
+<div id="ema-modal">
+  <div class="ema-box">
+    <h2>State Check-in</h2>
+    <p>Help validate your personal psychophysiology model.</p>
+    
+    <div class="ema-group">
+      <span class="ema-label">1. How stressed do you feel right now? (0-4)</span>
+      <div class="ema-scale" id="scale-stress">
+        <input type="radio" name="ema_stress" id="s0" value="0"><label for="s0">0</label>
+        <input type="radio" name="ema_stress" id="s1" value="1"><label for="s1">1</label>
+        <input type="radio" name="ema_stress" id="s2" value="2"><label for="s2">2</label>
+        <input type="radio" name="ema_stress" id="s3" value="3"><label for="s3">3</label>
+        <input type="radio" name="ema_stress" id="s4" value="4"><label for="s4">4</label>
+      </div>
+    </div>
+
+    <div class="ema-group">
+      <span class="ema-label">2. How activated or keyed-up do you feel? (0-4)</span>
+      <div class="ema-scale" id="scale-arousal">
+        <input type="radio" name="ema_arousal" id="a0" value="0"><label for="a0">0</label>
+        <input type="radio" name="ema_arousal" id="a1" value="1"><label for="a1">1</label>
+        <input type="radio" name="ema_arousal" id="a2" value="2"><label for="a2">2</label>
+        <input type="radio" name="ema_arousal" id="a3" value="3"><label for="a3">3</label>
+        <input type="radio" name="ema_arousal" id="a4" value="4"><label for="a4">4</label>
+      </div>
+    </div>
+
+    <div class="ema-group">
+      <span class="ema-label">3. Current mood / valence</span>
+      <div class="ema-scale" id="scale-valence">
+        <input type="radio" name="ema_valence" id="v_unpleasant" value="unpleasant"><label for="v_unpleasant">Unpleasant</label>
+        <input type="radio" name="ema_valence" id="v_neutral" value="neutral"><label for="v_neutral">Neutral</label>
+        <input type="radio" name="ema_valence" id="v_pleasant" value="pleasant"><label for="v_pleasant">Pleasant</label>
+      </div>
+    </div>
+
+    <div class="ema-group">
+      <span class="ema-label">4. Current context</span>
+      <select class="ema-select" id="ema_context">
+        <option value="" disabled selected>Select your current primary context...</option>
+        <option value="Studying / cognitive work">Studying / cognitive work</option>
+        <option value="Physical activity / exercise">Physical activity / exercise</option>
+        <option value="Social or emotional situation">Social or emotional situation</option>
+        <option value="Resting / everyday activity">Resting / everyday activity</option>
+        <option value="Other / not sure">Other / not sure</option>
+      </select>
+    </div>
+
+    <div class="ema-actions">
+      <button class="ema-btn secondary" onclick="submitEMA(true)">Skip for now</button>
+      <button class="ema-btn primary" id="ema_submit_btn" onclick="submitEMA(false)">Submit</button>
+    </div>
+  </div>
+</div>
+
+<div class="shell" id="main-shell" style="filter: blur(8px); pointer-events:none;">
 
   <nav class="nav" aria-label="Sections">
     <div class="brand">
@@ -3040,11 +3115,82 @@ await loadDataPage(1);
     window.scrollTo(0, 0);
   }}
 
-  document.querySelectorAll('.ring[data-v]').forEach(r => {{
+document.querySelectorAll('.ring[data-v]').forEach(r => {{
     const v = parseFloat(r.dataset.v);
     requestAnimationFrame(() => requestAnimationFrame(() => setRing(r, v)));
   }});
   openTab((location.hash || '#home').slice(1));
+
+  // --- ECOLOGICAL MOMENTARY ASSESSMENT (EMA) LOGIC ---
+  const tokenParams = new URLSearchParams(window.location.search).get('token') || '';
+  const urlSuffix = tokenParams ? `?token=${{tokenParams}}` : '';
+
+  function initEMA() {{
+    const hasCheckedIn = sessionStorage.getItem('checkin_done');
+    if (!hasCheckedIn) {{
+      document.getElementById('ema-modal').style.display = 'flex';
+    }} else {{
+      unlockDashboard();
+    }}
+  }}
+
+  function unlockDashboard() {{
+    document.getElementById('ema-modal').style.display = 'none';
+    const shell = document.getElementById('main-shell');
+    shell.style.filter = 'none';
+    shell.style.pointerEvents = 'auto';
+  }}
+
+  async function submitEMA(isSkipped) {{
+    const btn = document.getElementById('ema_submit_btn');
+    const origText = btn.innerText;
+    btn.innerText = 'Saving...';
+    btn.disabled = true;
+
+    let payload = {{ skipped: true, client_timezone_offset: new Date().getTimezoneOffset() }};
+    
+    if (!isSkipped) {{
+      const s = document.querySelector('input[name="ema_stress"]:checked');
+      const a = document.querySelector('input[name="ema_arousal"]:checked');
+      const v = document.querySelector('input[name="ema_valence"]:checked');
+      const c = document.getElementById('ema_context').value;
+      
+      if (!s || !a || !v || !c) {{
+        alert("Please complete all fields, or choose 'Skip for now'.");
+        btn.innerText = origText;
+        btn.disabled = false;
+        return;
+      }}
+      payload = {{
+        stress: parseInt(s.value),
+        arousal: parseInt(a.value),
+        valence: v.value,
+        context: c,
+        skipped: false,
+        client_timezone_offset: new Date().getTimezoneOffset()
+      }};
+    }}
+
+    try {{
+      const res = await fetch('/api/checkin' + urlSuffix, {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(payload)
+      }});
+      if (!res.ok) throw new Error('Network response was not ok');
+      sessionStorage.setItem('checkin_done', 'true');
+      unlockDashboard();
+    }} catch (e) {{
+      console.error(e);
+      alert('Failed to save check-in. Please try again.');
+      btn.innerText = origText;
+      btn.disabled = false;
+    }}
+  }}
+
+  // Initialize on load
+  initEMA();
+
 </script>
 </body>
 </html>"""
