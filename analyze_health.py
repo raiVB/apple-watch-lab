@@ -2114,6 +2114,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     import json, os
     import numpy as np
     import pandas as pd
+    scene = build_body_scene(df_raw, pred_bundle, stress_bundle, sleep_bundle)
 
     # --- 0. SLEEP INGEST -------------------------------------------------------
     STAGES = {
@@ -2373,7 +2374,10 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <style>
+  {scene["css"]}
   :root {{
     --bg:#0a0c10; --s1:#11141a; --s2:#181c24; --line:rgba(255,255,255,.07);
     --tx:#eef1f6; --dim:#8c95a6; --faint:#5d6677;
@@ -2535,20 +2539,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
            <div style="font-size:13.5px; color:var(--tx); font-weight:700;">{last_synced_str}</div>
         </div>
       </header>
-      <div class="hero">
-        <div class="m" style="--c:{pred_bundle['badge_color']}">
-          <div class="ring" data-v="{pred_bundle['readiness_score']}"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span>{pred_bundle['readiness_score']}</span><small>%</small></div></div>
-          <div><h2>Energy readiness</h2><p>How ready you are to focus today</p></div><span class="badge">{pred_bundle['readiness_label']}</span>
-        </div>
-        <div class="m" style="--c:{stress_bundle['stress_color']}">
-          <div class="ring" data-v="{stress_bundle['today_likelihood']}"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span>{stress_bundle['today_likelihood']}</span><small>%</small></div></div>
-          <div><h2>Stress load</h2><p>Heart rate not explained by movement</p></div><span class="badge">{stress_bundle['stress_label']}</span>
-        </div>
-        <div class="m" style="--c:{sleep_bundle['quality_color']}">
-          <div class="ring" data-v="{sleep_bundle['latest_quality']}"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="val" cx="60" cy="60" r="52"/></svg><div class="ctr"><span>{sleep_bundle['latest_quality']}</span><small>%</small></div></div>
-          <div><h2>Sleep recovery</h2><p>How well last night repaired you</p></div><span class="badge">{sleep_bundle['quality_label']}</span>
-        </div>
-      </div>
+ {scene["html"]}
       <div class="row">
         <div class="panel">
           <div class="pt"><div><h3>Battery vs. engine</h3><p>Higher HRV means a more charged battery. Lower heart rate means a calmer engine.</p></div><span id="chip_quad" class="chip" hidden></span></div>
@@ -2662,6 +2653,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 
 <script>
   const D = {json.dumps(payload)};
+  {scene["js"]}
   const CIRC = 326.73;
   const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
 
@@ -2722,6 +2714,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
  
 
 function renderHome() {{
+if (typeof initBodyScene === 'function') initBodyScene();
     const base = getBase();
 
     const hrv = Array.isArray(D.quad_hrv) ? D.quad_hrv : [];
