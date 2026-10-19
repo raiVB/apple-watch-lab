@@ -3827,61 +3827,38 @@ await loadDataPage(1);
       '<b>4. Peer-Reviewed Scientific References:</b><ul>' + (meth.references || []).map(r => '<li><b>' + r.topic + ':</b> ' + r.citation + ' — <i>' + r.application + '</i></li>').join('') + '</ul>';
   }}
 
-  // ---------- NAVIGATION ----------
-  const RENDER = {{ home:renderHome, stress:renderStress, energy:renderEnergy, sleep:renderSleep, data:renderData, cardio:renderCardio }};
-  const RENDERED = {{}};
-  function openTab(name) {{
-    if (!RENDER[name]) name = 'home';
-    document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.id === 'tab-' + name));
-    document.querySelectorAll('.nav-btn').forEach(el => el.classList.toggle('active', el.dataset.tab === name));
-    if (!RENDERED[name]) {{ RENDERED[name] = true; RENDER[name](); }}
-    else {{ document.querySelectorAll('#tab-' + name + ' .chart').forEach(el => Plotly.Plots.resize(el)); }}
-    try {{ history.replaceState(null, '', '#' + name); }} catch (e) {{}}
-    window.scrollTo(0, 0);
-  }}
-
-document.querySelectorAll('.ring[data-v]').forEach(r => {{
-    const v = parseFloat(r.dataset.v);
-    requestAnimationFrame(() => requestAnimationFrame(() => setRing(r, v)));
-  }});
-  openTab((location.hash || '#home').slice(1));
-
   // --- ECOLOGICAL MOMENTARY ASSESSMENT (EMA) LOGIC ---
   const tokenParams = new URLSearchParams(window.location.search).get('token') || '';
   const urlSuffix = tokenParams ? `?token=${{tokenParams}}` : '';
 
-  function initEMA() {{
-    const hasCheckedIn = sessionStorage.getItem('checkin_done');
-    if (!hasCheckedIn) {{
-      document.getElementById('ema-modal').style.display = 'flex';
-    }} else {{
-      unlockDashboard();
-    }}
-  }}
-
   function unlockDashboard() {{
-    document.getElementById('ema-modal').style.display = 'none';
+    const modal = document.getElementById('ema-modal');
+    if (modal) modal.style.display = 'none';
     const shell = document.getElementById('main-shell');
-    shell.style.filter = 'none';
-    shell.style.pointerEvents = 'auto';
+    if (shell) {{
+      shell.style.filter = 'none';
+      shell.style.webkitFilter = 'none';
+      shell.style.pointerEvents = 'auto';
+    }}
   }}
 
   async function submitEMA(isSkipped) {{
     let payload = {{ skipped: true, client_timezone_offset: new Date().getTimezoneOffset() }};
-    
+
     if (!isSkipped) {{
       const s = document.querySelector('input[name="ema_stress"]:checked');
       const a = document.querySelector('input[name="ema_arousal"]:checked');
       const v = document.querySelector('input[name="ema_valence"]:checked');
-      const c = document.getElementById('ema_context').value;
-      
+      const cEl = document.getElementById('ema_context');
+      const c = cEl ? cEl.value : '';
+
       if (!s || !a || !v || !c) {{
         alert("Please complete all fields, or choose 'Skip for now'.");
         return;
       }}
       payload = {{
-        stress: parseInt(s.value),
-        arousal: parseInt(a.value),
+        stress: parseInt(s.value, 10),
+        arousal: parseInt(a.value, 10),
         valence: v.value,
         context: c,
         skipped: false,
@@ -3889,11 +3866,11 @@ document.querySelectorAll('.ring[data-v]').forEach(r => {{
       }};
     }}
 
-    // Instantly hide the modal and unlock the screen so you are never stuck
-    sessionStorage.setItem('checkin_done', 'true');
+    // Instantly hide the modal and remove the blur
+    try {{ sessionStorage.setItem('checkin_done', 'true'); }} catch (e) {{}}
     unlockDashboard();
 
-    // Silently save to MongoDB in the background
+    // Silently save to backend in the background
     try {{
       await fetch('/api/checkin' + urlSuffix, {{
         method: 'POST',
@@ -3905,8 +3882,52 @@ document.querySelectorAll('.ring[data-v]').forEach(r => {{
     }}
   }}
 
-  // Initialize on load
+  function initEMA() {{
+    let hasCheckedIn = false;
+    try {{ hasCheckedIn = sessionStorage.getItem('checkin_done') === 'true'; }} catch (e) {{}}
+    const modal = document.getElementById('ema-modal');
+    if (!hasCheckedIn && modal) {{
+      modal.style.display = 'flex';
+    }} else {{
+      unlockDashboard();
+    }}
+  }}
+
+  // Expose functions globally for inline onclick handlers
+  window.unlockDashboard = unlockDashboard;
+  window.submitEMA = submitEMA;
+  window.initEMA = initEMA;
+
+  // Run EMA initialization BEFORE rendering charts so chart errors cannot lock the UI
   initEMA();
+
+  // ---------- NAVIGATION ----------
+  const RENDER = {{ home:renderHome, stress:renderStress, energy:renderEnergy, sleep:renderSleep, data:renderData, cardio:renderCardio }};
+  const RENDERED = {{}};
+  function openTab(name) {{
+    if (!RENDER[name]) name = 'home';
+    document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.id === 'tab-' + name));
+    document.querySelectorAll('.nav-btn').forEach(el => el.classList.toggle('active', el.dataset.tab === name));
+    try {{
+      if (!RENDERED[name]) {{
+        RENDERED[name] = true;
+        RENDER[name]();
+      }} else if (typeof Plotly !== 'undefined') {{
+        document.querySelectorAll('#tab-' + name + ' .chart').forEach(el => Plotly.Plots.resize(el));
+      }}
+    }} catch (err) {{
+      console.error('Error rendering tab ' + name + ':', err);
+    }}
+    try {{ history.replaceState(null, '', '#' + name); }} catch (e) {{}}
+    window.scrollTo(0, 0);
+  }}
+  window.openTab = openTab;
+
+  document.querySelectorAll('.ring[data-v]').forEach(r => {{
+    const v = parseFloat(r.dataset.v);
+    requestAnimationFrame(() => requestAnimationFrame(() => setRing(r, v)));
+  }});
+  openTab((location.hash || '#home').slice(1));
 
 </script>
 </body>
