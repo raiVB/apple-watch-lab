@@ -3867,11 +3867,6 @@ document.querySelectorAll('.ring[data-v]').forEach(r => {{
   }}
 
   async function submitEMA(isSkipped) {{
-    const btn = document.getElementById('ema_submit_btn');
-    const origText = btn.innerText;
-    btn.innerText = 'Saving...';
-    btn.disabled = true;
-
     let payload = {{ skipped: true, client_timezone_offset: new Date().getTimezoneOffset() }};
     
     if (!isSkipped) {{
@@ -3882,8 +3877,6 @@ document.querySelectorAll('.ring[data-v]').forEach(r => {{
       
       if (!s || !a || !v || !c) {{
         alert("Please complete all fields, or choose 'Skip for now'.");
-        btn.innerText = origText;
-        btn.disabled = false;
         return;
       }}
       payload = {{
@@ -3896,20 +3889,19 @@ document.querySelectorAll('.ring[data-v]').forEach(r => {{
       }};
     }}
 
+    // Instantly hide the modal and unlock the screen so you are never stuck
+    sessionStorage.setItem('checkin_done', 'true');
+    unlockDashboard();
+
+    // Silently save to MongoDB in the background
     try {{
-      const res = await fetch('/api/checkin' + urlSuffix, {{
+      await fetch('/api/checkin' + urlSuffix, {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
         body: JSON.stringify(payload)
       }});
-      if (!res.ok) throw new Error('Network response was not ok');
-      sessionStorage.setItem('checkin_done', 'true');
-      unlockDashboard();
     }} catch (e) {{
-      console.error(e);
-      alert('Failed to save check-in. Please try again.');
-      btn.innerText = origText;
-      btn.disabled = false;
+      console.error('Background sync failed:', e);
     }}
   }}
 
