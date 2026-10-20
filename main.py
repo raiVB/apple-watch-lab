@@ -734,9 +734,8 @@ def backtest_dataset(request: Request):
 @app.post("/api/ecg/upload")
 async def upload_ecg_json(request: Request, background: BackgroundTasks):
     """
-    Accepts an Apple Health JSON file containing `data.ecg[]` (and optionally other metrics),
-    immediately extracts and caches all ECG recordings into `db.ecg_recordings`, and schedules
-    standard health-record ingestion if additional metrics are present.
+    Accepts an Apple Health JSON file, writes it securely to disk, and defers 
+    both standard metrics and ECG extraction to the locked background thread.
     """
     check_token(request)
     fd, path = tempfile.mkstemp(suffix=".json")
@@ -746,13 +745,12 @@ async def upload_ecg_json(request: Request, background: BackgroundTasks):
             f.write(chunk)
             size += len(chunk)
 
-    ecg_res = cardio_lab.ingest_ecg_from_json_file(path, db)
+    # Immediately release the event loop and let the locked background thread handle extraction
     background.add_task(process_file, path, size)
     return {
-        "status": "processed",
+        "status": "accepted",
         "bytes": size,
-        "ecg_found": ecg_res.get("ecg_found", 0),
-        "ecg_saved": ecg_res.get("ecg_saved", 0),
+        "message": "ECG processing safely deferred to background task."
     }
 
 
