@@ -5,7 +5,7 @@ import secrets
 import tempfile
 import threading
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import certifi
 import numpy as np
@@ -65,6 +65,26 @@ client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeou
 db = client.biolab
 
 LOCK = threading.Lock()  # only one upload is processed at a time, so RAM never stacks up
+RENDER_LOCK = threading.Lock()  # build_dashboard writes one shared HTML file; serialise render+read
+
+# Everything shown to you is India Standard Time. Render's server clock is UTC, so never use
+# datetime.now()/utcnow() for anything you read; use these helpers instead.
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def now_ist_str():
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+def to_ist_str(iso_utc):
+    """'2026-10-18T18:28:00.123Z' -> '2026-10-18 23:58:00' (IST). Returns None if unparseable."""
+    try:
+        dt = datetime.fromisoformat(str(iso_utc).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
 STATUS = {"last_upload": None, "ok": None, "detail": None, "seconds": None}
 INDEXES = {"ready": False, "error": None}
 
@@ -101,6 +121,18 @@ def clean_nans(obj):
     return obj
 
 
+def records_to_df(recs):
+    """DataFrame of 5-minute bins in strict chronological order. Sorts on the numeric UTC epoch,
+    never on the timestamp string (string order breaks as soon as two formats are mixed)."""
+    if not recs:
+        return pd.DataFrame()
+    df = pd.DataFrame(recs)
+    df["epoch_5m"] = pd.to_numeric(df["epoch_5m"], errors="coerce")
+    df = df.dropna(subset=["epoch_5m"])
+    df = df.drop_duplicates(subset=["metric", "epoch_5m"], keep="last")
+    return df.sort_values(["epoch_5m", "metric"], kind="stable").reset_index(drop=True)
+
+
 def process_file(path: str, size: int):
     """Runs after the HTTP response is sent. Streams the saved file, never loads it whole."""
     with LOCK:
@@ -119,7 +151,7 @@ def process_file(path: str, size: int):
             traceback.print_exc()
             STATUS.update(ok=False, detail=repr(e))
         finally:
-            STATUS.update(last_upload=datetime.utcnow().isoformat(timespec="seconds") + "Z", seconds=round(time.time() - t0, 1))
+            STATUS.update(last_upload=now_ist_str(), seconds=round(time.time() - t0, 1))
             try:
                 os.remove(path)
             except OSError:
@@ -153,7 +185,8 @@ def save_checkin(record: CheckInRecord, request: Request):
     """
     check_token(request)
     doc = record.model_dump()
-    doc["server_timestamp"] = datetime.utcnow().isoformat() + "Z"
+    doc["server_timestamp"] = datetime.utcnow().isoformat() + "Z"   # canonical UTC instant
+    doc["server_timestamp_ist"] = to_ist_str(doc["server_timestamp"])  # what you read
     doc["schema_version"] = "1.0"
     
     # Do not treat 'skipped' as a physiological baseline of 0
@@ -175,7 +208,8 @@ def save_class_attendance(record: ClassAttendanceRecord, request: Request):
         raise HTTPException(status_code=422, detail="Invalid attendance status")
 
     doc = record.model_dump()
-    doc["server_timestamp"] = datetime.utcnow().isoformat() + "Z"
+    doc["server_timestamp"] = datetime.utcnow().isoformat() + "Z"   # canonical UTC instant
+    doc["server_timestamp_ist"] = to_ist_str(doc["server_timestamp"])  # what you read
     doc["schema_version"] = "1.0"
 
     db.class_attendance.insert_one(doc)
@@ -210,7 +244,7 @@ def get_records(
 
     rows = list(
         db.records.find(query, {"_id": 0})
-        .sort([("timestamp", -1), ("metric", 1)])
+        .sort([("epoch_5m", -1), ("metric", 1)])
         .skip(skip)
         .limit(limit)
     )
@@ -221,9 +255,10 @@ def get_records(
         metric_name = row.get("metric", "Unknown")
         ts = row.get("timestamp", "")
         if metric_name in previous:
+            # rows are walked oldest -> newest: this row minus the previous (older) one is positive
             row["gap_minutes"] = round(
-                (datetime.strptime(previous[metric_name], "%Y-%m-%d %H:%M:%S")
-                 - datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                 - datetime.strptime(previous[metric_name], "%Y-%m-%d %H:%M:%S")
                 ).total_seconds() / 60, 1
             )
         else:
@@ -277,7 +312,7 @@ def serve_cockpit(request: Request):
     recs = list(db.records.find({"date": {"$gte": cutoff}}, {"_id": 0}))
     if len(recs) < 5:
         return _waiting_page(f"Only {len(recs)} records so far.")
-    df_raw = pd.DataFrame(recs).sort_values("timestamp", kind="stable").reset_index(drop=True)
+    df_raw = records_to_df(recs)
     del recs
 
     sleep_rows = list(db.sleep.find({"date": {"$gte": cutoff}}, {"_id": 0}))
@@ -297,11 +332,10 @@ def serve_cockpit(request: Request):
     sleep_bundle = analyze_health.compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle, pred_bundle)
     sleep_bundle["diary_rows"] = clean_nans(sleep_bundle["diary_rows"])
 
-    analyze_health.build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=df_raw_sleep)
-
-    
-    with open("biometric_science_lab.html", "r", encoding="utf-8") as f:
-        html = f.read()
+    with RENDER_LOCK:
+        analyze_health.build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=df_raw_sleep)
+        with open("biometric_science_lab.html", "r", encoding="utf-8") as f:
+            html = f.read()
 
     checkin_widget = r"""
     <section id="bio-checkin" style="
@@ -504,6 +538,7 @@ def backtest_readiness(request: Request):
         "checkins": [
             {
                 "timestamp": c.get("server_timestamp"),
+                "timestamp_ist": to_ist_str(c.get("server_timestamp")),
                 "stress": c.get("stress"),
             }
             for c in checkins
@@ -547,11 +582,10 @@ def backtest_dataset(request: Request):
             if timestamp.utcoffset() is None:
                 continue
 
-            # JavaScript getTimezoneOffset() is UTC minus local time.
-            offset = int(checkin.get("client_timezone_offset") or 0)
+            # db.records timestamps are always IST, so the match window must be IST too
+            # (not the phone's offset, which changes with travel/VPN/incognito).
          
-            # Convert UTC to the check-in device's local wall-clock time.
-            local_end = timestamp.replace(tzinfo=None) - timedelta(minutes=offset)
+            local_end = timestamp.astimezone(IST).replace(tzinfo=None)
             local_start = local_end - timedelta(minutes=60)
 
             rows = list(
@@ -724,7 +758,8 @@ def save_ecg_protocol_log(record: ECGProtocolLogRecord, request: Request):
         raise HTTPException(status_code=422, detail="Invalid recording_type")
 
     doc = record.model_dump()
-    doc["server_timestamp"] = datetime.utcnow().isoformat() + "Z"
+    doc["server_timestamp"] = datetime.utcnow().isoformat() + "Z"   # canonical UTC instant
+    doc["server_timestamp_ist"] = to_ist_str(doc["server_timestamp"])  # what you read
     doc["schema_version"] = "1.0"
     db.ecg_protocol_logs.insert_one(doc)
     return {"status": "recorded", "recording_type": doc["recording_type"]}
@@ -768,7 +803,7 @@ def get_cardio_lab_overview(request: Request):
     if latest_rec and latest_rec.get("date"):
         cutoff = (datetime.strptime(latest_rec["date"], "%Y-%m-%d") - timedelta(days=DASH_DAYS)).strftime("%Y-%m-%d")
         recs = list(db.records.find({"date": {"$gte": cutoff}}, {"_id": 0}))
-        df_raw = pd.DataFrame(recs).sort_values("timestamp", kind="stable").reset_index(drop=True) if recs else pd.DataFrame()
+        df_raw = records_to_df(recs)
         sleep_rows = list(db.sleep.find({"date": {"$gte": cutoff}}, {"_id": 0}))
         df_sleep = pd.DataFrame(sleep_rows).drop_duplicates() if sleep_rows else pd.DataFrame()
     else:
