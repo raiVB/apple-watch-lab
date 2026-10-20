@@ -1243,53 +1243,71 @@ def compute_longitudinal_baseline(
 # MODULE E: PERSONALIZED ANOMALY DETECTION (ROBUST Z + MAHALANOBIS + ISOLATION FOREST)
 # ==============================================================================
 
-def _numpy_isolation_forest_scores(X: np.ndarray, n_trees: int = 50, seed: int = 42) -> np.ndarray:
+def _numpy_isolation_forest_train_test_scores(
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    n_trees: int = 50,
+    seed: int = 42,
+) -> np.ndarray:
+    """Fit isolation trees on historical rows only, then score unseen rows.
+
+    This is a chronological scoring helper: X_test is never used to fit tree
+    splits or determine the training sample-size normalization. Returns an
+    empty array when there is insufficient historical data.
     """
-    Pure-NumPy Isolation Forest implementation (Liu, Ting & Zhou, ICDM 2008).
-    Constructs `n_trees` randomized axis-aligned isolation trees and computes anomaly scores
-    s(x, n) = 2^(-E(h(x)) / c(n)) in [0, 1], where values > 0.62 indicate statistical isolation.
-    """
-    n_samples, n_features = X.shape
-    if n_samples < 6 or n_features < 1:
-        return np.full(n_samples, 0.45, dtype=float)
+    X_train = np.asarray(X_train, dtype=float)
+    X_test = np.asarray(X_test, dtype=float)
+    if X_train.ndim != 2 or X_test.ndim != 2 or X_train.shape[1] == 0:
+        return np.full(len(X_test), np.nan, dtype=float)
+    if len(X_train) < 6 or len(X_test) == 0:
+        return np.full(len(X_test), np.nan, dtype=float)
+    if not np.isfinite(X_train).all() or not np.isfinite(X_test).all():
+        return np.full(len(X_test), np.nan, dtype=float)
 
     rng = np.random.default_rng(seed)
-    max_depth = max(3, int(math.ceil(math.log2(n_samples))))
+    n_train, n_features = X_train.shape
+    max_depth = max(3, int(math.ceil(math.log2(n_train))))
 
-    def _c_factor(n: int) -> float:
+    def c_factor(n: int) -> float:
         if n <= 1:
-            return 1.0
+            return 0.0
         if n == 2:
             return 1.0
         return 2.0 * (math.log(n - 1.0) + 0.5772156649) - (2.0 * (n - 1.0) / n)
 
-    path_lengths = np.zeros((n_samples, n_trees), dtype=float)
+    def build_tree(X: np.ndarray, indices: np.ndarray, depth: int):
+        m = len(indices)
+        if m <= 1 or depth >= max_depth:
+            return (None, None, None, None, m, depth)
+        feat = int(rng.integers(0, n_features))
+        vals = X[indices, feat]
+        vmin, vmax = float(np.min(vals)), float(np.max(vals))
+        if vmax - vmin < 1e-9:
+            return (None, None, None, None, m, depth)
+        split = float(rng.uniform(vmin, vmax))
+        left_mask = vals < split
+        if np.all(left_mask) or not np.any(left_mask):
+            return (None, None, None, None, m, depth)
+        return (
+            feat, split,
+            build_tree(X, indices[left_mask], depth + 1),
+            build_tree(X, indices[~left_mask], depth + 1),
+            m, depth,
+        )
 
-    for t_i in range(n_trees):
-        def _split_node(indices: np.ndarray, depth: int):
-            m = len(indices)
-            if m <= 1 or depth >= max_depth:
-                path_lengths[indices, t_i] = depth + _c_factor(m)
-                return
-            feat = int(rng.integers(0, n_features))
-            col_vals = X[indices, feat]
-            vmin, vmax = float(np.min(col_vals)), float(np.max(col_vals))
-            if vmax - vmin < 1e-9:
-                path_lengths[indices, t_i] = depth + _c_factor(m)
-                return
-            split_val = float(rng.uniform(vmin, vmax))
-            left_mask = col_vals < split_val
-            if np.all(left_mask) or not np.any(left_mask):
-                path_lengths[indices, t_i] = depth + _c_factor(m)
-                return
-            _split_node(indices[left_mask], depth + 1)
-            _split_node(indices[~left_mask], depth + 1)
+    def path_length(tree, row):
+        feat, split, left, right, size, depth = tree
+        if feat is None:
+            return float(depth) + c_factor(size)
+        return path_length(left if row[feat] < split else right, row)
 
-        _split_node(np.arange(n_samples), 0)
-
-    mean_h = np.mean(path_lengths, axis=1)
-    c_n = max(_c_factor(n_samples), 1e-6)
-    return np.power(2.0, -mean_h / c_n)
+    trees = [build_tree(X_train, np.arange(n_train), 0) for _ in range(n_trees)]
+    norm = max(c_factor(n_train), 1e-6)
+    scores = []
+    for row in X_test:
+        mean_path = float(np.mean([path_length(tree, row) for tree in trees]))
+        scores.append(2.0 ** (-mean_path / norm))
+    return np.asarray(scores, dtype=float)
 
 
 def detect_cardio_anomalies(
@@ -1297,17 +1315,17 @@ def detect_cardio_anomalies(
     df_sleep: pd.DataFrame,
     ecg_summaries: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    Compares 3 interpretable anomaly-detection methods across daily resting/overnight physiology:
-      1. Robust Univariate Z-Score (|z_robust| >= 2.2)
-      2. Regularized Subspace Mahalanobis Distance (RMS-M >= 1.65)
-      3. Pure-NumPy Isolation Forest (score >= 0.62)
-    Produces the 9-field non-diagnostic Anomaly Report for every flagged deviation.
+    """Chronological exploratory anomaly detection using past data only.
+
+    Each day's robust baseline uses earlier dates only. Isolation Forest trees
+    are fitted on earlier rows and score the current row out-of-sample. The
+    first days may have no score because there is not enough history. Thresholds
+    remain heuristic and are not clinical or calibrated probabilities.
     """
     if df_raw is None or df_raw.empty:
         return {"anomalies": [], "evaluation": {}}
 
-    all_dates = sorted(df_raw["date"].unique().tolist())
+    all_dates = sorted(df_raw["date"].dropna().astype(str).unique().tolist())
     rhr_s = df_raw[df_raw["metric"] == "RestingHeartRate"].groupby("date")["value"].median()
     hrv_s = df_raw[df_raw["metric"] == "HeartRateVariabilitySDNN"].groupby("date")["value"].median()
     resp_s = df_raw[df_raw["metric"] == "RespiratoryRate"].groupby("date")["value"].median()
@@ -1315,11 +1333,17 @@ def detect_cardio_anomalies(
     ex_s = df_raw[df_raw["metric"] == "AppleExerciseTime"].groupby("date")["value"].sum()
     steps_s = df_raw[df_raw["metric"] == "StepCount"].groupby("date")["value"].sum()
 
-    rhr_vals = rhr_s.dropna().tolist()
-    hrv_vals = hrv_s.dropna().tolist()
-    resp_vals = resp_s.dropna().tolist()
-    wtemp_vals = wtemp_s.dropna().tolist()
+    metric_series = [rhr_s, hrv_s, resp_s, wtemp_s]
+    min_scales = [2.0, 5.0, 0.8, 0.15]
+    metric_names = ["rhr", "hrv", "resp", "wt"]
+    day_records: List[Dict[str, Any]] = []
+    historical_vectors: List[List[float]] = []
+    anomalies = []
+    prior_flag = False
+    prior_date = None
 
+    # Kept for compatibility with the existing multivariate output. This
+    # correlation matrix is a heuristic prior, not learned/calibrated from data.
     R_prior_4x4 = np.array([
         [1.00, -0.52, 0.28, 0.30],
         [-0.52, 1.00, -0.22, -0.25],
@@ -1327,73 +1351,79 @@ def detect_cardio_anomalies(
         [0.30, -0.25, 0.38, 1.00],
     ], dtype=float)
 
-    daily_z_matrix = []
-    day_records = []
+    for idx, d_str in enumerate(all_dates):
+        prior_dates = all_dates[:idx]
+        vals_today = [
+            float(series[d_str]) if d_str in series.index and not pd.isna(series[d_str]) else None
+            for series in metric_series
+        ]
+        z_values, med_values, mad_values = [], [], []
+        for series, value, min_scale in zip(metric_series, vals_today, min_scales):
+            past_vals = [float(series[d]) for d in prior_dates if d in series.index and not pd.isna(series[d])]
+            z, med, mad = robust_z_score(value, past_vals, min_scale=min_scale)
+            z_values.append(z)
+            med_values.append(med)
+            mad_values.append(mad)
 
-    for d_str in all_dates:
-        v_rhr = float(rhr_s[d_str]) if d_str in rhr_s.index and not pd.isna(rhr_s[d_str]) else None
-        v_hrv = float(hrv_s[d_str]) if d_str in hrv_s.index and not pd.isna(hrv_s[d_str]) else None
-        v_resp = float(resp_s[d_str]) if d_str in resp_s.index and not pd.isna(resp_s[d_str]) else None
-        v_wt = float(wtemp_s[d_str]) if d_str in wtemp_s.index and not pd.isna(wtemp_s[d_str]) else None
-
-        z_rhr, med_rhr, mad_rhr = robust_z_score(v_rhr, rhr_vals, min_scale=2.0)
-        z_hrv, med_hrv, mad_hrv = robust_z_score(v_hrv, hrv_vals, min_scale=5.0)
-        z_resp, med_resp, mad_resp = robust_z_score(v_resp, resp_vals, min_scale=0.8)
-        z_wt, med_wt, mad_wt = robust_z_score(v_wt, wtemp_vals, min_scale=0.15)
-
-        z_vec = [z_rhr, z_hrv, z_resp, z_wt]
-        valid_idx = [i for i, z in enumerate(z_vec) if z is not None]
+        valid_idx = [i for i, z in enumerate(z_values) if z is not None]
         k_obs = len(valid_idx)
-        if k_obs > 0:
-            z_sub = np.array([float(z_vec[i]) for i in valid_idx], dtype=float)
+        if k_obs:
+            z_sub = np.array([float(z_values[i]) for i in valid_idx], dtype=float)
             R_sub = 0.85 * R_prior_4x4[np.ix_(valid_idx, valid_idx)] + 0.15 * np.eye(k_obs)
-            d2 = float(z_sub.T @ np.linalg.solve(R_sub, z_sub))
-            rms_m = math.sqrt(max(0.0, d2) / k_obs)
+            try:
+                d2 = float(z_sub.T @ np.linalg.solve(R_sub, z_sub))
+                rms_m = math.sqrt(max(0.0, d2) / k_obs)
+            except np.linalg.LinAlgError:
+                rms_m = float(np.sqrt(np.mean(z_sub ** 2)))
         else:
             rms_m = 0.0
 
-        # Median-imputed vector strictly for Isolation Forest tree splitting (missingness tracked separately)
-        daily_z_matrix.append([z if z is not None else 0.0 for z in z_vec])
-        day_records.append({
+        # Train only on previous dates' already-causal z-vectors.
+        current_vector = [float(z) if z is not None else 0.0 for z in z_values]
+        if len(historical_vectors) >= 6:
+            score_arr = _numpy_isolation_forest_train_test_scores(
+                np.asarray(historical_vectors, dtype=float),
+                np.asarray([current_vector], dtype=float),
+                n_trees=50,
+                seed=42,
+            )
+            if_score = float(score_arr[0]) if len(score_arr) else float("nan")
+        else:
+            if_score = float("nan")
+
+        rec = {
             "date": d_str,
-            "v_rhr": v_rhr, "med_rhr": med_rhr, "z_rhr": z_rhr,
-            "v_hrv": v_hrv, "med_hrv": med_hrv, "z_hrv": z_hrv,
-            "v_resp": v_resp, "med_resp": med_resp, "z_resp": z_resp,
-            "v_wt": v_wt, "med_wt": med_wt, "z_wt": z_wt,
+            "v_rhr": vals_today[0], "med_rhr": med_values[0], "z_rhr": z_values[0],
+            "v_hrv": vals_today[1], "med_hrv": med_values[1], "z_hrv": z_values[1],
+            "v_resp": vals_today[2], "med_resp": med_values[2], "z_resp": z_values[2],
+            "v_wt": vals_today[3], "med_wt": med_values[3], "z_wt": z_values[3],
             "k_obs": k_obs, "rms_m": round(rms_m, 2),
+            "iforest_score": if_score,
             "ex_mins": float(ex_s.get(d_str, 0.0)),
             "steps": float(steps_s.get(d_str, 0.0)),
-        })
+            "baseline_days": len(prior_dates),
+        }
+        day_records.append(rec)
 
-    X_iforest = np.array(daily_z_matrix, dtype=float)
-    if_scores = _numpy_isolation_forest_scores(X_iforest, n_trees=50, seed=42)
-
-    anomalies = []
-    for idx, rec in enumerate(day_records):
-        rec["iforest_score"] = round(float(if_scores[idx]), 3)
         z_list = [rec["z_rhr"], rec["z_hrv"], rec["z_resp"], rec["z_wt"]]
         max_abs_z = max([abs(z) for z in z_list if z is not None], default=0.0)
-
         m1_flag = max_abs_z >= 2.2
         m2_flag = rec["rms_m"] >= 1.65 and rec["k_obs"] >= 2
-        m3_flag = rec["iforest_score"] >= 0.63 and rec["k_obs"] >= 2
+        m3_flag = math.isfinite(if_score) and if_score >= 0.63 and rec["k_obs"] >= 2
+        flagged = m1_flag or m2_flag or m3_flag
 
-        if m1_flag or m2_flag or m3_flag:
+        if flagged:
             changed = []
             if rec["z_rhr"] is not None and abs(rec["z_rhr"]) >= 1.5:
-                changed.append(f"RHR {rec['v_rhr']:.1f} bpm ({rec['z_rhr']:+.2f} z_rob vs {rec['med_rhr']:.1f} bpm baseline)")
+                changed.append(f"RHR {rec['v_rhr']:.1f} bpm ({rec['z_rhr']:+.2f} z_rob vs prior median {rec['med_rhr']:.1f} bpm)")
             if rec["z_hrv"] is not None and abs(rec["z_hrv"]) >= 1.5:
-                changed.append(f"PPG HRV {rec['v_hrv']:.1f} ms ({rec['z_hrv']:+.2f} z_rob vs {rec['med_hrv']:.1f} ms baseline)")
+                changed.append(f"PPG HRV {rec['v_hrv']:.1f} ms ({rec['z_hrv']:+.2f} z_rob vs prior median {rec['med_hrv']:.1f} ms)")
             if rec["z_resp"] is not None and abs(rec["z_resp"]) >= 1.5:
-                changed.append(f"Resp Rate {rec['v_resp']:.1f} br/min ({rec['z_resp']:+.2f} z_rob vs {rec['med_resp']:.1f} baseline)")
+                changed.append(f"Resp Rate {rec['v_resp']:.1f} br/min ({rec['z_resp']:+.2f} z_rob vs prior median {rec['med_resp']:.1f})")
             if rec["z_wt"] is not None and abs(rec["z_wt"]) >= 1.5:
-                changed.append(f"Wrist Temp {rec['v_wt']:.2f} °C ({rec['z_wt']:+.2f} z_rob vs {rec['med_wt']:.2f} baseline)")
+                changed.append(f"Wrist Temp {rec['v_wt']:.2f} °C ({rec['z_wt']:+.2f} z_rob vs prior median {rec['med_wt']:.2f} °C)")
             if not changed:
                 changed.append(f"Multivariate combination shift (RMS-M = {rec['rms_m']:.2f})")
-
-            prev_flagged = idx > 0 and (day_records[idx - 1]["rms_m"] >= 1.5 or if_scores[idx - 1] >= 0.60)
-            next_flagged = idx + 1 < len(day_records) and (day_records[idx + 1]["rms_m"] >= 1.5 or if_scores[idx + 1] >= 0.60)
-            persisted = prev_flagged or next_flagged
 
             methods_triggered = []
             if m1_flag:
@@ -1401,33 +1431,47 @@ def detect_cardio_anomalies(
             if m2_flag:
                 methods_triggered.append("Subspace Mahalanobis")
             if m3_flag:
-                methods_triggered.append("Isolation Forest")
+                methods_triggered.append("Out-of-sample Isolation Forest")
+
+            # Causal persistence: only the already-processed previous observation
+            # can count. Do not inspect the next date to label today's event.
+            try:
+                from datetime import date as _date
+                consecutive = prior_date is not None and (_date.fromisoformat(d_str) - _date.fromisoformat(prior_date)).days == 1
+            except (ValueError, TypeError):
+                consecutive = prior_date is not None and prior_date == d_str
+            persisted = bool(prior_flag and consecutive)
 
             anomalies.append({
                 "time_and_duration": f"{rec['date']} (24h resting & overnight physiological composite)",
                 "measurements_changed": "; ".join(changed),
-                "direction_and_magnitude": f"Max |z_robust| = {max_abs_z:.2f} SD | Mahalanobis RMS-M = {rec['rms_m']:.2f} | Isolation Score = {rec['iforest_score']:.2f}",
-                "baseline_comparison": f"Compared against {len(all_dates)}-day personal robust median/MAD baseline",
+                "direction_and_magnitude": f"Max |z_robust| = {max_abs_z:.2f} SD | Mahalanobis RMS-M = {rec['rms_m']:.2f} | Isolation Score = {if_score:.2f}" if math.isfinite(if_score) else f"Max |z_robust| = {max_abs_z:.2f} SD | Mahalanobis RMS-M = {rec['rms_m']:.2f} | Isolation Score = unavailable (need >=6 prior days)",
+                "baseline_comparison": f"Compared against prior observations only ({rec['baseline_days']} prior calendar dates; metric-specific available history may be smaller)",
                 "data_quality_missingness": f"{rec['k_obs']}/4 core resting/overnight sensors observed ({int(rec['k_obs']*25)}% coverage)",
-                "model_confidence": f"{len(methods_triggered)}/3 detectors agreed ({', '.join(methods_triggered)})",
+                "model_confidence": f"{len(methods_triggered)}/3 detectors agreed ({', '.join(methods_triggered)}) — agreement, not calibrated confidence",
                 "confounders_and_explanations": (
-                    f"Prior/same-day activity: {rec['ex_mins']:.0f} exercise mins, {rec['steps']:.0f} steps. "
-                    "Non-diagnostic possibilities include late meals, exam/academic stress, sleep debt, dehydration, or ambient warmth."
+                    f"Same-day activity: {rec['ex_mins']:.0f} exercise mins, {rec['steps']:.0f} steps. "
+                    "Non-diagnostic possibilities include late meals, academic stress, sleep debt, dehydration, or ambient warmth."
                 ),
-                "persistence": "Multi-day persistent shift (>=2 consecutive days)" if persisted else "Isolated single-day transient deviation",
-                "physiological_context": "Resting & Overnight Sleep Baseline Window (exercise periods gated out)",
+                "persistence": "Persistent across consecutive observed dates (prior-day confirmation only)" if persisted else "No prior consecutive-day confirmation available",
+                "physiological_context": "Daily aggregate; not a verified exercise-gated resting/sleep-only window",
             })
+
+        prior_flag = flagged
+        prior_date = d_str
+        # Append current row only after it has been scored, so it cannot train its own forest.
+        historical_vectors.append(current_vector)
 
     weeks = max(len(all_dates) / 7.0, 1.0)
     return {
-        "anomalies": anomalies[::-1],  # Newest first
+        "anomalies": anomalies[::-1],
         "evaluation": {
             "total_days_evaluated": len(all_dates),
             "flagged_days": len(anomalies),
             "alerts_per_week": round(len(anomalies) / weeks, 2),
             "note": (
-                "Unsupervised statistical deviation metrics only. Single-subject N-of-1 model: "
-                "not validated on external clinical cohorts and cannot diagnose or rule out cardiac disease."
+                "Chronological exploratory anomaly flags using past observations only. Thresholds and correlation prior remain heuristic; "
+                "this single-subject system is not validated on external clinical cohorts and cannot diagnose or rule out cardiac disease."
             ),
         },
     }
