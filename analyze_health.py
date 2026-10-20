@@ -528,6 +528,7 @@ def build_intraday_series(rows, n=350, gap_bins=3):
     """Chronologically ordered intraday arrays for Plotly. Sorted on the numeric epoch (never the
     timestamp string); a null point is inserted wherever the watch recorded nothing for more than
     gap_bins x 5 min so the line breaks at the gap instead of drawing a diagonal across it."""
+    # Enforce strict chronological sorting based on the mathematical epoch
     rows = sorted(rows, key=lambda r: r["epoch_5m"])[-n:]
     out = {"ts": [], "hr_raw": [], "hr_exp": [], "stress": [], "state": []}
     prev = None
@@ -2327,7 +2328,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     if pd.isna(latest_ts):
         last_synced_str = "Waiting for data..."
     else:
-        # Formats to: "Oct 18, 2026 • 08:24 AM"
+        # Formats cleanly without browser-side timezone shifting: "Oct 18, 2026 • 08:24 AM IST"
         last_synced_str = latest_ts.strftime("%b %d, %Y &bull; %I:%M %p") + " IST"
 
     # --- 1. SLEEP TIMELINE, STAT TILES, STAGE BAR ------------------------------
