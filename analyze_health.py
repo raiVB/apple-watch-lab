@@ -634,7 +634,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
             is_slp, slp_stage = is_sleeping_epoch(ep)
             is_wk, wk_name = is_workout_epoch(ep)
 
-# Apply personalized weights
+            # Apply personalized weights
             c_cos = math.cos(2.0 * math.pi * (hr_hour - 3.5) / 24.0)
             circ_mod = w_circ * c_cos if not is_slp else -8.5
             orthostatic_mod = w_ortho if (not is_slp and 8.0 <= hr_hour <= 22.5) else 0.0
@@ -644,12 +644,11 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
             non_met_residual = hr_val - expected_hr
             z_hr_res = non_met_residual / 7.5
 
-            ep_int = int(ep)
-            near_hrv = [hrv_map[k] for k in range(ep_int - 3, ep_int + 4) if k in hrv_map]
+            near_hrv = [hrv_map[k] for k in range(ep - 3, ep + 4) if k in hrv_map]
             hrv_val = float(np.mean(near_hrv)) if near_hrv else np.nan
             z_hrv_stress = ((base_ln_hrv - math.log(max(hrv_val, 1.0))) / sd_ln_hrv) if not pd.isna(hrv_val) else np.nan
 
-            near_ns = [ns_map[k] for k in range(ep_int - 1, ep_int + 2) if k in ns_map]
+            near_ns = [ns_map[k] for k in range(ep - 1, ep + 2) if k in ns_map]
             amb_db = float(np.mean(near_ns)) if near_ns else np.nan
             z_noise = ((amb_db - 65.0) / 10.0) if not pd.isna(amb_db) else np.nan
 
