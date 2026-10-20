@@ -411,10 +411,13 @@ def process_raw_ecg_recording(ecg_obj: Dict[str, Any]) -> Dict[str, Any]:
     segments_idx = np.split(np.arange(len(v_arr)), split_pts)
 
     v_filt = np.zeros_like(v_arr)
+    # Ensure segments have at least 1.0 second of data so the FFT can resolve 1.0 Hz bins
+    min_filter_len = max(32, int(math.ceil(fs_hat))) 
+
     for seg in segments_idx:
         if len(seg) == 0:
             continue
-        if len(seg) >= 32:
+        if len(seg) >= min_filter_len:
             v_filt[seg] = zero_phase_butterworth_filter(
                 v_arr[seg], fs=fs_hat, hp_cut=0.5, lp_cut=40.0, order=4, notch_freqs=(50.0, 60.0)
             )
@@ -592,20 +595,35 @@ def detect_beats_and_morphology(
     if n < 32 or fs <= 20:
         return {"detected_beats": 0, "peak_indices": [], "peak_times_s": [], "peak_voltages_mv": [], "rr_intervals_ms": []}
 
-    # Step 1: 5-15 Hz QRS Bandpass
-    v_qrs = zero_phase_butterworth_filter(v_filt, fs=fs, hp_cut=5.0, lp_cut=15.0, order=2, notch_freqs=())
+# Reconstruct gap segments to avoid LTI violations across missing data
+    dt_all = np.diff(t_rel)
+    split_pts = [int(i + 1) for i in np.where(dt_all > 0.100)[0]]
+    segments_idx = np.split(np.arange(n), split_pts)
 
-    # Step 2: 5-point derivative
-    deriv = np.zeros_like(v_qrs)
-    if n >= 5:
-        deriv[2:-2] = (-v_qrs[:-4] - 2.0 * v_qrs[1:-3] + 2.0 * v_qrs[3:-1] + v_qrs[4:]) * (fs / 8.0)
-
-    # Step 3: Nonlinear squaring
-    sq = deriv ** 2
-
-    # Step 4: 150 ms Moving Window Integration
+    v_qrs = np.zeros_like(v_filt)
+    deriv = np.zeros_like(v_filt)
+    sq = np.zeros_like(v_filt)
+    mwi = np.zeros_like(v_filt)
     win_mwi = max(3, int(round(0.150 * fs)))
-    mwi = np.convolve(sq, np.ones(win_mwi, dtype=float) / win_mwi, mode="same")
+
+    for seg in segments_idx:
+        n_seg = len(seg)
+        if n_seg < 32:
+            continue
+            
+        # Step 1: 5-15 Hz QRS Bandpass strictly within the continuous segment
+        v_qrs[seg] = zero_phase_butterworth_filter(v_filt[seg], fs=fs, hp_cut=5.0, lp_cut=15.0, order=2, notch_freqs=())
+        
+        # Step 2: 5-point derivative strictly within the segment
+        if n_seg >= 5:
+            d_seg = np.zeros(n_seg)
+            v_seg = v_qrs[seg]
+            d_seg[2:-2] = (-v_seg[:-4] - 2.0 * v_seg[1:-3] + 2.0 * v_seg[3:-1] + v_seg[4:]) * (fs / 8.0)
+            deriv[seg] = d_seg
+            
+        # Step 3 & 4: Nonlinear squaring & MWI strictly within the segment
+        sq[seg] = deriv[seg] ** 2
+        mwi[seg] = np.convolve(sq[seg], np.ones(win_mwi, dtype=float) / win_mwi, mode="same")
 
     # Determine dominant QRS polarity (positive R vs deep S if watch worn on opposite wrist)
     p98 = float(np.percentile(v_filt, 98))
@@ -1483,11 +1501,37 @@ def analyze_exercise_recovery(df_raw: pd.DataFrame) -> Dict[str, Any]:
             best_tau, best_a, best_rhr, best_sse = 6.0, a_init, hr_asymp, 1e18
             for cand_tau in np.linspace(1.5, 25.0, 95):
                 exp_vec = np.exp(-t_arr / cand_tau)
-                # Linear least squares for [HR_rest, A] given tau
+                # Unbounded linear least squares for [HR_rest, A]
                 G = np.column_stack([np.ones_like(exp_vec), exp_vec])
                 theta, _, _, _ = np.linalg.lstsq(G, y_arr, rcond=None)
-                c_rhr = float(np.clip(theta[0], base_rhr - 5.0, y_arr[-1] + 5.0))
-                c_a = float(max(5.0, theta[1]))
+                
+                c_rhr = float(theta[0])
+                c_a = float(theta[1])
+                
+                # If bounds are violated, calculate exact algebraic boundary projections 
+                if c_rhr < base_rhr - 5.0 or c_rhr > y_arr[-1] + 5.0 or c_a < 5.0:
+                    # Boundary 1: Lock A to 5.0, optimize HR_rest
+                    rhr_1 = np.clip(np.mean(y_arr - 5.0 * exp_vec), base_rhr - 5.0, y_arr[-1] + 5.0)
+                    sse_1 = np.sum((y_arr - (rhr_1 + 5.0 * exp_vec))**2)
+                    
+                    # Boundary 2: Lock HR_rest to lower bound, optimize A
+                    r_lb = base_rhr - 5.0
+                    a_2 = max(5.0, np.sum((y_arr - r_lb) * exp_vec) / np.sum(exp_vec**2))
+                    sse_2 = np.sum((y_arr - (r_lb + a_2 * exp_vec))**2)
+                    
+                    # Boundary 3: Lock HR_rest to upper bound, optimize A
+                    r_ub = y_arr[-1] + 5.0
+                    a_3 = max(5.0, np.sum((y_arr - r_ub) * exp_vec) / np.sum(exp_vec**2))
+                    sse_3 = np.sum((y_arr - (r_ub + a_3 * exp_vec))**2)
+                    
+                    # Adopt the optimal boundary constraint
+                    if sse_1 <= sse_2 and sse_1 <= sse_3:
+                        c_a, c_rhr = 5.0, float(rhr_1)
+                    elif sse_2 <= sse_1 and sse_2 <= sse_3:
+                        c_a, c_rhr = float(a_2), r_lb
+                    else:
+                        c_a, c_rhr = float(a_3), r_ub
+
                 pred = c_rhr + c_a * exp_vec
                 sse = float(np.sum((y_arr - pred) ** 2))
                 if sse < best_sse:
