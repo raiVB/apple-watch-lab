@@ -8,7 +8,7 @@ import os
 import json
 import math
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional, Tuple
 
 import numpy as np
@@ -92,6 +92,12 @@ METHODOLOGY_REGISTRY = {
 # MODULE A: ECG SIGNAL LABORATORY (INGESTION, TIMESTAMP RECONSTRUCTION & DSP)
 # ==============================================================================
 
+# Everything shown to you is IST. Timestamps that carry no offset are assumed to be in NAIVE_TZ
+# (default IST, same rule as ingest.py). Set NAIVE_TZ_OFFSET_MIN=0 on Render if your export sends naive UTC.
+IST = timezone(timedelta(hours=5, minutes=30))
+NAIVE_TZ = timezone(timedelta(minutes=int(os.getenv("NAIVE_TZ_OFFSET_MIN", "330"))))
+
+
 def parse_high_res_timestamp(ts_val: Any) -> Optional[float]:
     """
     Parses an Apple Health timestamp or numeric offset into Unix epoch seconds (float)
@@ -132,7 +138,7 @@ def parse_high_res_timestamp(ts_val: Any) -> Optional[float]:
             iso_s = iso_s[:-1] + "+00:00"
         dt = datetime.fromisoformat(iso_s)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=NAIVE_TZ)
         return dt.timestamp()
     except ValueError:
         pass
@@ -140,7 +146,7 @@ def parse_high_res_timestamp(ts_val: Any) -> Optional[float]:
     # Fallback formats
     for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
         try:
-            dt = datetime.strptime(s[:26].strip(), fmt).replace(tzinfo=timezone.utc)
+            dt = datetime.strptime(s[:26].strip(), fmt).replace(tzinfo=NAIVE_TZ)
             return dt.timestamp()
         except ValueError:
             continue
@@ -332,11 +338,16 @@ def process_raw_ecg_recording(ecg_obj: Dict[str, Any]) -> Dict[str, Any]:
         rec_start_epoch = t0 if t0 > 1e8 else datetime.now(timezone.utc).timestamp()
     if not rec_start_str or len(rec_start_str) < 10:
         rec_start_str = datetime.fromtimestamp(rec_start_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    rec_date = rec_start_str[:10]
-    try:
-        rec_hour = float(int(rec_start_str[11:13]) + int(rec_start_str[14:16]) / 60.0)
-    except Exception:
-        rec_hour = 12.0
+    # Keep the original string only to build a stable ecg_id (so re-uploads overwrite, not duplicate).
+    rec_start_raw = rec_start_str
+    # date / hour / display time come from the true instant, converted to IST, so they line up with
+    # db.records (which is IST). Cutting them out of the raw string kept the export's own timezone.
+    rec_start_ist = datetime.fromtimestamp(rec_start_epoch, tz=IST)
+    rec_date = rec_start_ist.strftime("%Y-%m-%d")
+    rec_hour = float(rec_start_ist.hour + rec_start_ist.minute / 60.0)
+    rec_start_str = rec_start_ist.strftime("%Y-%m-%d %H:%M:%S")
+    if rec_end_epoch is not None and rec_end_epoch > 1e8:
+        rec_end_str = datetime.fromtimestamp(rec_end_epoch, tz=IST).strftime("%Y-%m-%d %H:%M:%S")
 
     # Independent sampling frequency verification from actual timestamps
     dt_pos = np.diff(t_rel)
@@ -489,7 +500,7 @@ def process_raw_ecg_recording(ecg_obj: Dict[str, Any]) -> Dict[str, Any]:
             plot_raw_mv.append(None)
             plot_filt_mv.append(None)
 
-    ecg_id = hashlib.sha1(f"{rec_start_str}_{len(t_rel)}_{round(float(v_arr[0]), 4)}".encode("utf-8")).hexdigest()[:16]
+    ecg_id = hashlib.sha1(f"{rec_start_raw}_{len(t_rel)}_{round(float(v_arr[0]), 4)}".encode("utf-8")).hexdigest()[:16]
 
     return {
         "ecg_id": ecg_id,
