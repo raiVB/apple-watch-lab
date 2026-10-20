@@ -9,6 +9,8 @@ Shared by main.py (Render) and backfill.py (your computer).
 """
 import calendar
 import json
+import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import ijson
@@ -57,6 +59,11 @@ STAGE_MAP = {
 NIGHT_STAGES = [("deep", "Deep Sleep (Body Repair)"), ("rem", "REM Sleep (Brain & Memory)"),
                 ("core", "Core Sleep (Light)"), ("awake", "Awake in Bed")]
 EPOCH0 = datetime(1970, 1, 1)
+IST = timezone(timedelta(hours=5, minutes=30))
+# Timezone assumed for timestamps that carry NO offset. Default IST. If your export sends naive UTC,
+# set NAIVE_TZ_OFFSET_MIN=0 in Render and re-upload.
+NAIVE_TZ = timezone(timedelta(minutes=int(os.getenv("NAIVE_TZ_OFFSET_MIN", "330"))))
+_OFFSET_FIX = re.compile(r"\s*([+-])(\d{2}):?(\d{2})$")
 
 
 def parse_ts(s):
@@ -67,9 +74,34 @@ def parse_ts(s):
     try:
         # Safely handle 'Z' for UTC to ensure broad Python version compatibility
         s_str = str(s).strip().replace("Z", "+00:00")
-        return datetime.fromisoformat(s_str)
+        try:
+            return datetime.fromisoformat(s_str)
+        except ValueError:
+            pass
+        # Health Auto Export default: "2026-10-18 23:58:00 +0530". Python < 3.11 cannot parse the
+        # space before the offset (or a bare +0530), so normalise it to "+05:30" and retry.
+        m = _OFFSET_FIX.search(s_str)
+        if m and len(s_str) > 19:
+            s_str = s_str[:m.start()] + f"{m.group(1)}{m.group(2)}:{m.group(3)}"
+            return datetime.fromisoformat(s_str.replace(" ", "T", 1))
+        return None
     except (ValueError, TypeError):
         return None
+
+
+def to_ist(dt):
+    """Wall-clock datetime in IST (naive timestamps are assumed to already be IST)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=NAIVE_TZ)
+    return dt.astimezone(IST).replace(tzinfo=None)
+
+
+def ist_str(s):
+    """Normalise any timestamp string to 'YYYY-MM-DD HH:MM:SS' IST; fall back to the first 19 chars."""
+    dt = to_ist(parse_ts(s)) if s else None
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else str(s or "")[:19]
 
 def to_epoch(dt):
     """Convert a datetime to Unix seconds without losing its timezone."""
@@ -80,8 +112,7 @@ def to_epoch(dt):
         # Explicit policy for timezone-naive timestamps:
         # Default to India Standard Time (+05:30) to preserve wall-clock alignment
         # rather than defaulting to UTC and shifting the user's day by 5.5 hours.
-        ist_offset = timezone(timedelta(hours=5, minutes=30))
-        dt = dt.replace(tzinfo=ist_offset)
+        dt = dt.replace(tzinfo=NAIVE_TZ)
 
     return dt.timestamp()
 
@@ -171,12 +202,14 @@ class Ingestor:
             dt = parse_ts(ds)
         except (ValueError, TypeError):
             return
+        if dt is None or val != val:   # unparseable timestamp or NaN value: skip it, never crash the upload
+            return
         if metric == "WalkingSpeed" and "m/s" in units: val *= 3.6
         elif metric == "WalkingStepLength" and units == "m": val *= 100.0
         elif metric == "DistanceWalkingRunning" and units == "m": val /= 1000.0
         elif metric in PCT_METRICS and val <= 1.0: val *= 100.0
 
-        bk = (metric, to_epoch(dt) // 300)
+        bk = (metric, int(to_epoch(dt) // 300))
         b = self.bins.get(bk)
         if b is None:
             self.bins[bk] = [val, 1, units]
@@ -186,16 +219,24 @@ class Ingestor:
 
     def record_docs(self):
         for (metric, ep), (total, n, unit) in self.bins.items():
-            bs = EPOCH0 + timedelta(seconds=ep * 300)
+            # Convert the true UTC epoch back to India Standard Time (+05:30) for dashboard displays
+            bs_utc = EPOCH0 + timedelta(seconds=ep * 300)
+            bs_ist = bs_utc + timedelta(hours=5, minutes=30)
             yield {
-                "metric": metric, "timestamp": bs.strftime("%Y-%m-%d %H:%M:%S"), "date": bs.strftime("%Y-%m-%d"),
-                "hour": round(bs.hour + bs.minute / 60.0, 2), "epoch_5m": ep,
+                "metric": metric, "timestamp": bs_ist.strftime("%Y-%m-%d %H:%M:%S"), "date": bs_ist.strftime("%Y-%m-%d"),
+                "hour": round(bs_ist.hour + bs_ist.minute / 60.0, 2), "epoch_5m": ep,
                 "value": round(total if metric in SUM_METRICS else total / n, 4), "unit": unit,
             }
-
+          
     def _sleep(self, item):
-        s19 = str(item.get("start") or item.get("startDate") or "")[:19]
-        e19 = str(item.get("end") or item.get("endDate") or "")[:19]
+        # Normalise to IST wall-clock so sleep timing lines up with the IST-based 5-minute records.
+        s19 = ist_str(item.get("start") or item.get("startDate")) if (item.get("start") or item.get("startDate")) else ""
+        e19 = ist_str(item.get("end") or item.get("endDate")) if (item.get("end") or item.get("endDate")) else ""
+        if s19 and e19:
+            item = dict(item)
+            for ks, ke in (("start", "end"), ("startDate", "endDate")):
+                if item.get(ks): item[ks] = s19
+                if item.get(ke): item[ke] = e19
         d = (s19 or str(item.get("date") or item.get("sleepEnd") or ""))[:10]
         if self.keep_from and d and d < self.keep_from:
             return
@@ -209,12 +250,13 @@ class Ingestor:
         if any(x in item for x in ("deep", "rem", "core", "asleep")):
             d_str = str(item.get("date") or item.get("sleepEnd") or "")[:10]
             try:
-                s_dt = parse_ts(item.get("sleepStart") or f"{d_str} 00:30:00")
-                e_dt = parse_ts(item.get("sleepEnd") or f"{d_str} 07:30:00")
+                s_raw = parse_ts(item.get("sleepStart") or f"{d_str} 00:30:00")
+                e_raw = parse_ts(item.get("sleepEnd") or f"{d_str} 07:30:00")
+                s_dt, e_dt = to_ist(s_raw), to_ist(e_raw)
                 s_hr = s_dt.hour + s_dt.minute / 60.0
                 if s_hr < 14.0: s_hr += 24.0
                 e_hr = e_dt.hour + e_dt.minute / 60.0
-                s_ep, e_ep = to_epoch(s_dt) // 300, to_epoch(e_dt) // 300
+                s_ep, e_ep = int(to_epoch(s_raw) // 300), int(to_epoch(e_raw) // 300)
                 for stg_key, stg_label in NIGHT_STAGES:
                     hrs = float(item.get(stg_key) or 0.0)
                     if hrs > 16.0: hrs /= 60.0
@@ -222,26 +264,27 @@ class Ingestor:
                         self.legacy[(stg_label, s_ep, e_ep)] = {
                             "date": d_str, "stage": stg_label, "hours": hrs, "onset_hr": s_hr,
                             "wake_hr": e_hr, "start_epoch": s_ep, "end_epoch": e_ep}
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 pass
         else:
             raw_stage = str(item.get("value") or item.get("stage") or "core").lower()
             label = next((v for k2, v in STAGE_MAP.items() if k2 in raw_stage), "Core Sleep (Light)")
             try:
-                s_dt = parse_ts(item.get("startDate") or item.get("date") or "")
-                e_dt = parse_ts(item.get("endDate") or item.get("startDate") or item.get("date") or "")
+                s_raw = parse_ts(item.get("startDate") or item.get("date") or "")
+                e_raw = parse_ts(item.get("endDate") or item.get("startDate") or item.get("date") or "")
+                s_dt, e_dt = to_ist(s_raw), to_ist(e_raw)
                 dur = (e_dt - s_dt).total_seconds() / 3600.0
                 if dur <= 0: dur = float(item.get("qty") or 0.0)
                 if 0 < dur < 16:
                     s_hr = s_dt.hour + s_dt.minute / 60.0
                     if s_hr < 14.0: s_hr += 24.0
                     e_hr = e_dt.hour + e_dt.minute / 60.0
-                    s_ep, e_ep = to_epoch(s_dt) // 300, to_epoch(e_dt) // 300
+                    s_ep, e_ep = int(to_epoch(s_raw) // 300), int(to_epoch(e_raw) // 300)
                     self.legacy[(label, s_ep, e_ep)] = {
                         "date": e_dt.strftime("%Y-%m-%d"), "stage": label, "hours": dur, "onset_hr": s_hr,
                         "wake_hr": e_hr, "start_epoch": s_ep, "end_epoch": e_ep}
                     self.legacy_win.append((s_ep, e_ep))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 pass
 
 
@@ -279,16 +322,20 @@ def write(db, ing, chunk=2000):
             _bulk(db.records, ops); n_rec += len(ops); ops = []
     _bulk(db.records, ops); n_rec += len(ops)
 
-    # If a payload re-sends a stretch of sleep, replace that stretch (Apple can re-segment a night).
-    segs = [d for d in ing.raw.values() if d["s19"] and d["e19"]]
-    if segs:
-        db.sleep_raw.delete_many({"s19": {"$gte": min(d["s19"] for d in segs)}, "e19": {"$lte": max(d["e19"] for d in segs)}})
-    if ing.legacy_win:
-        db.sleep.delete_many({"start_epoch": {"$gte": min(w[0] for w in ing.legacy_win)},
-                              "end_epoch": {"$lte": max(w[1] for w in ing.legacy_win)}})
+    # Safe Replacement Strategy: Delete previously stored sleep records strictly for the 
+    # specific dates present in this upload payload.
+    affected_raw_dates = list(set(d["d"] for d in ing.raw.values() if d.get("d")))
+    if affected_raw_dates:
+        db.sleep_raw.delete_many({"d": {"$in": affected_raw_dates}})
+        
+    affected_legacy_dates = list(set(d["date"] for d in ing.legacy.values() if d.get("date")))
+    if affected_legacy_dates:
+        db.sleep.delete_many({"date": {"$in": affected_legacy_dates}})
+        
     raw_ops = [UpdateOne({"k": d["k"]}, {"$set": d}, upsert=True) for d in ing.raw.values()]
     leg_ops = [UpdateOne({"stage": d["stage"], "start_epoch": d["start_epoch"], "end_epoch": d["end_epoch"]}, {"$set": d}, upsert=True)
                for d in ing.legacy.values()]
     for i in range(0, len(raw_ops), chunk): _bulk(db.sleep_raw, raw_ops[i:i + chunk])
     for i in range(0, len(leg_ops), chunk): _bulk(db.sleep, leg_ops[i:i + chunk])
+    
     return {"items_read": ing.items, "bins_written": n_rec, "sleep_segments": len(ing.raw), "unnamed_skipped": ing.unnamed}
