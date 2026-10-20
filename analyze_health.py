@@ -12,7 +12,10 @@ import json
 import math
 import webbrowser
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# Render runs on UTC. Everything shown to you is IST, so "now" and Apple-date parsing are IST-explicit.
+IST_TZ = timezone(timedelta(hours=5, minutes=30))
 import pandas as pd
 import numpy as np
 
@@ -324,7 +327,8 @@ def run_self_tests():
 # ==============================================================================
 
 def parse_apple_date(date_str):
-    return datetime.strptime(date_str[:19], "%Y-%m-%d %H:%M:%S")
+    # Wall-clock in the export is already IST; tagging it makes .timestamp() independent of the machine tz.
+    return datetime.strptime(date_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST_TZ)
 
 
 def analyze_export(xml_path):
@@ -520,10 +524,29 @@ def prompt_optional_daily_log(latest_date):
 # ACTIVITY 1: PERSONAL STRESS DETECTIVE ENGINE
 # ==============================================================================
 
+def build_intraday_series(rows, n=350, gap_bins=3):
+    """Chronologically ordered intraday arrays for Plotly. Sorted on the numeric epoch (never the
+    timestamp string); a null point is inserted wherever the watch recorded nothing for more than
+    gap_bins x 5 min so the line breaks at the gap instead of drawing a diagonal across it."""
+    rows = sorted(rows, key=lambda r: r["epoch_5m"])[-n:]
+    out = {"ts": [], "hr_raw": [], "hr_exp": [], "stress": [], "state": []}
+    prev = None
+    for r in rows:
+        if prev is not None and (r["epoch_5m"] - prev["epoch_5m"]) > gap_bins:
+            out["ts"].append(prev["timestamp"])
+            out["hr_raw"].append(None); out["hr_exp"].append(None)
+            out["stress"].append(None); out["state"].append("No data")
+        out["ts"].append(r["timestamp"])
+        out["hr_raw"].append(r["hr_raw"]); out["hr_exp"].append(r["expected_hr"])
+        out["stress"].append(r["stress_pct"]); out["state"].append(r["state_tag"])
+        prev = r
+    return out
+
+
 def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
     print("[2/6] Running Activity 1: Personal Stress Detective (Metabolic De-confounding & Mahalanobis Engine)...")
 
-    all_dates = sorted(df_raw["date"].unique()) if not df_raw.empty else [datetime.now().strftime("%Y-%m-%d")]
+    all_dates = sorted(df_raw["date"].unique()) if not df_raw.empty else [datetime.now(IST_TZ).strftime("%Y-%m-%d")]
     recent_dates = all_dates[-min(14, len(all_dates)):]
     df_rec = df_raw[df_raw["date"].isin(recent_dates)].copy()
 
@@ -865,7 +888,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
     else:
         s_label, s_color = "Low Stress (Parasympathetic Dominance)", "#10b981"
 
-    intraday_rows.sort(key=lambda r: (r["timestamp"], r["epoch_5m"]))
+    intra = build_intraday_series(intraday_rows)
 
     return {
         "today_likelihood": s_like, 
@@ -876,11 +899,11 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         "daily_dates": df_stress_daily["date"].tolist(),
         "daily_likelihood": [round(float(x), 1) for x in df_stress_daily["stress_likelihood"].tolist()],
         "daily_anomaly_mag": [round(float(x), 2) for x in df_stress_daily["anomaly_magnitude"].tolist()],
-        "intraday_ts": [r["timestamp"] for r in intraday_rows[-350:]],
-        "intraday_hr_raw": [r["hr_raw"] for r in intraday_rows[-350:]],
-        "intraday_hr_exp": [r["expected_hr"] for r in intraday_rows[-350:]],
-        "intraday_stress": [r["stress_pct"] for r in intraday_rows[-350:]],
-        "intraday_state": [r["state_tag"] for r in intraday_rows[-350:]],
+        "intraday_ts": intra["ts"],
+        "intraday_hr_raw": intra["hr_raw"],
+        "intraday_hr_exp": intra["hr_exp"],
+        "intraday_stress": intra["stress"],
+        "intraday_state": intra["state"],
         "contrib_names": contrib_names, "contrib_z": contrib_z,
         "contrib_colors": contrib_colors, "contrib_roles": contrib_roles,
         "episodes": dedup_episodes, "df_stress_daily": df_stress_daily
@@ -894,7 +917,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
 def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
     print("[3/6] Running Activity 2: Personal Energy Predictor (Borbély S+C & Bayesian MAP Engine)...")
 
-    all_dates = sorted(df_raw["date"].unique()) if not df_raw.empty else [datetime.now().strftime("%Y-%m-%d")]
+    all_dates = sorted(df_raw["date"].unique()) if not df_raw.empty else [datetime.now(IST_TZ).strftime("%Y-%m-%d")]
     daily_rows = []
 
     for d in all_dates:
@@ -1087,7 +1110,7 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
     """
     print("[4/6] Running Activity 3: 360° Sleep Experiment Lab (Circular Chronobiology, Hammock Nadir & N-of-1 Trials)...")
 
-    all_dates = sorted(df_raw["date"].unique()) if not df_raw.empty else [datetime.now().strftime("%Y-%m-%d")]
+    all_dates = sorted(df_raw["date"].unique()) if not df_raw.empty else [datetime.now(IST_TZ).strftime("%Y-%m-%d")]
     df_stress_daily = stress_bundle["df_stress_daily"].set_index("date")
     df_energy_daily = pred_bundle["df_feat"].set_index("date")
 
@@ -2305,7 +2328,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         last_synced_str = "Waiting for data..."
     else:
         # Formats to: "Oct 18, 2026 • 08:24 AM"
-        last_synced_str = latest_ts.strftime("%b %d, %Y &bull; %I:%M %p")
+        last_synced_str = latest_ts.strftime("%b %d, %Y &bull; %I:%M %p") + " IST"
 
     # --- 1. SLEEP TIMELINE, STAT TILES, STAGE BAR ------------------------------
     sleep_log_html, stage_bar_html, sleep_stats_html = "", "", ""
@@ -3225,12 +3248,12 @@ if (typeof initBodyScene === 'function') initBodyScene();
         }}
       }}).catch(e => console.error('Validation fetch error:', e));
     Plotly.newPlot('c_st_intra', [
-      {{ x:D.in_ts, y:D.in_stress, yaxis:'y2', text:D.in_state, mode:'lines', fill:'tozeroy', fillcolor:'rgba(255,122,107,.10)', line:{{ color:C.stress, width:1.5 }}, name:'Stress', hovertemplate:'%{{y:.0f}}%<br>%{{text}}<extra>Stress</extra>' }},
-      {{ x:D.in_ts, y:D.in_hr_exp, mode:'lines', line:{{ color:C.hr, width:2, dash:'dot' }}, name:'Expected for your activity', hovertemplate:'%{{y:.0f}} bpm<extra>Expected</extra>' }},
-      {{ x:D.in_ts, y:D.in_hr_raw, mode:'lines', line:{{ color:C.tx, width:2 }}, name:'Actual heart rate', hovertemplate:'%{{y:.0f}} bpm<extra>Actual</extra>' }}
+      {{ x:D.in_ts, y:D.in_stress, yaxis:'y2', text:D.in_state, mode:'lines', connectgaps:false, fill:'tozeroy', fillcolor:'rgba(255,122,107,.10)', line:{{ color:C.stress, width:1.5 }}, name:'Stress', hovertemplate:'%{{y:.0f}}%<br>%{{text}}<extra>Stress</extra>' }},
+      {{ x:D.in_ts, y:D.in_hr_exp, mode:'lines', connectgaps:false, line:{{ color:C.hr, width:2, dash:'dot' }}, name:'Expected for your activity', hovertemplate:'%{{y:.0f}} bpm<extra>Expected</extra>' }},
+      {{ x:D.in_ts, y:D.in_hr_raw, mode:'lines', connectgaps:false, line:{{ color:C.tx, width:2 }}, name:'Actual heart rate', hovertemplate:'%{{y:.0f}} bpm<extra>Actual</extra>' }}
     ], {{
       ...base, hovermode:'x unified', margin:{{ ...base.margin, r:56 }},
-      xaxis:{{ ...base.xaxis, title:{{ text:'Time of day' }} }},
+      xaxis:{{ ...base.xaxis, type:'date', title:{{ text:'Time of day (IST)' }} }},
       yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm)' }}, type:'linear' }},
       yaxis2:{{ overlaying:'y', side:'right', range:[0, 105], title:{{ text:'Stress (%)', font:{{ color:C.stress, size:11 }} }}, showgrid:false, zeroline:false, ticksuffix:'%', tickfont:{{ color:C.stress, size:11 }} }}
     }}, cfg);
@@ -3992,7 +4015,7 @@ await loadDataPage(1);
 if __name__ == "__main__":
     run_self_tests()
     df_raw, df_sleep, workout_windows = analyze_export(XML_FILE)
-    latest_dt = sorted(df_raw["date"].unique())[-1] if not df_raw.empty else datetime.now().strftime("%Y-%m-%d")
+    latest_dt = sorted(df_raw["date"].unique())[-1] if not df_raw.empty else datetime.now(IST_TZ).strftime("%Y-%m-%d")
     log_df = prompt_optional_daily_log(latest_dt)
     stress_bundle = compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df)
     pred_bundle = compute_energy_predictor_engine(df_raw, df_sleep, log_df)
