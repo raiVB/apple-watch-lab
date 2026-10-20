@@ -1665,38 +1665,101 @@ def analyze_exercise_recovery(df_raw: pd.DataFrame) -> Dict[str, Any]:
 # MODULE G: MULTIMODAL RESEARCH HYPOTHESES & ECG SAMPLING PROTOCOL ANALYZER
 # ==============================================================================
 
+def _beta_continued_fraction(a: float, b: float, x: float) -> float:
+    """Numerical continued fraction for the regularized incomplete beta function."""
+    max_iter, eps, fpmin = 200, 3e-12, 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    if abs(d) < fpmin:
+        d = fpmin
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin: d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin: c = fpmin
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin: d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin: c = fpmin
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _regularized_incomplete_beta(x: float, a: float, b: float) -> float:
+    if x <= 0.0: return 0.0
+    if x >= 1.0: return 1.0
+    log_bt = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x)
+    bt = math.exp(log_bt)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _beta_continued_fraction(a, b, x) / a
+    return 1.0 - bt * _beta_continued_fraction(b, a, 1.0 - x) / b
+
+
+def _student_t_two_sided_p(t_abs: float, df: int) -> float:
+    """Two-sided Student-t p-value using I_(df/(df+t^2))(df/2, 1/2)."""
+    if df <= 0:
+        return float("nan")
+    x = df / (df + t_abs * t_abs)
+    return max(0.0, min(1.0, _regularized_incomplete_beta(x, df / 2.0, 0.5)))
+
+
+def _student_t_critical_975(df: int) -> float:
+    """95% two-sided Student-t critical value, solved by bisection without SciPy."""
+    if df <= 0: return float("nan")
+    lo, hi = 0.0, 100.0
+    for _ in range(80):
+        mid = (lo + hi) / 2.0
+        p = _student_t_two_sided_p(mid, df)
+        if p > 0.05:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
 def _ols_association(x_list: List[float], y_list: List[float]) -> Dict[str, Any]:
-    """
-    Computes linear regression slope, Pearson r, Spearman rank rho, and two-sided t-distribution p-value
-    on paired non-missing observations.
+    """OLS/Pearson association with exact Student-t inference under IID residual assumptions.
+
+    The reported p-value and confidence interval are nominal: daily physiological data
+    can be serially correlated, so these are not autocorrelation-robust inferential claims.
     """
     pairs = [(float(x), float(y)) for x, y in zip(x_list, y_list) if x is not None and y is not None and not pd.isna(x) and not pd.isna(y)]
     n = len(pairs)
     if n < 5:
         return {"valid": False, "n": n}
-
     x = np.array([p[0] for p in pairs], dtype=float)
     y = np.array([p[1] for p in pairs], dtype=float)
     sx, sy = float(np.std(x, ddof=1)), float(np.std(y, ddof=1))
     if sx < 1e-9 or sy < 1e-9:
         return {"valid": False, "n": n}
-
-    r = float(np.corrcoef(x, y)[0, 1])
+    r = float(np.clip(np.corrcoef(x, y)[0, 1], -1.0, 1.0))
     slope = r * (sy / sx)
-    se_slope = (sy / sx) * math.sqrt(max(0.0, 1.0 - r ** 2) / max(n - 2, 1))
-    t_stat = abs(r) * math.sqrt((n - 2) / max(1.0 - r ** 2, 1e-9))
     df = n - 2
-    z_eq = t_stat * (1.0 - 1.0 / (4.0 * df)) / math.sqrt(1.0 + (t_stat ** 2) / (2.0 * df))
-    p_raw = max(0.0001, min(1.0, 2.0 * (1.0 - 0.5 * (1.0 + math.erf(z_eq / math.sqrt(2.0))))))
-
+    se_slope = (sy / sx) * math.sqrt(max(0.0, 1.0 - r ** 2) / df)
+    t_stat = abs(r) * math.sqrt(df / max(1.0 - r ** 2, 1e-15))
+    p_raw = _student_t_two_sided_p(t_stat, df)
+    ci_half_width = _student_t_critical_975(df) * se_slope
     return {
-        "valid": True,
-        "n": n,
-        "slope": round(slope, 3),
-        "se_slope": round(se_slope, 3),
-        "ci95_slope": round(1.96 * se_slope, 3),
-        "r": round(r, 3),
-        "p_raw": round(p_raw, 4),
+        "valid": True, "n": n,
+        "slope": round(slope, 6),
+        "se_slope": round(se_slope, 6),
+        "ci95_slope": round(ci_half_width, 6),
+        "ci95_low": round(slope - ci_half_width, 6),
+        "ci95_high": round(slope + ci_half_width, 6),
+        "r": round(r, 6),
+        "p_raw": round(p_raw, 8),
+        "inference_note": "Nominal Student-t inference assumes independent observations; serial autocorrelation is not modeled.",
     }
 
 
@@ -1721,38 +1784,45 @@ def run_multimodal_research_and_protocol(
         if df_sleep is not None and not df_sleep.empty:
             slp_dur = df_sleep[df_sleep["stage"] != "Awake in Bed"].groupby("date")["hours"].sum().to_dict()
 
+        # Use exact calendar-day lags, not the previous *available* row: gaps in
+        # the dataset must not silently turn a 3-day lag into a 1-day lag.
+        from datetime import date as _date, timedelta as _timedelta
+        prior_calendar_date = {
+            d: (_date.fromisoformat(str(d)) - _timedelta(days=1)).isoformat()
+            for d in all_dates
+        }
         specs = [
             (
-                "H1: Sleep Duration -> Next-Day Vagal HRV (SDNN)",
-                "Does total sleep duration associate with next-day vagal heart-rate variability?",
-                [slp_dur.get(d) for d in all_dates],
+                "H1: Prior-Night Sleep Duration -> Next-Day Vagal HRV (SDNN)",
+                "Does sleep recorded on the prior calendar date associate with next-day HRV?",
+                [slp_dur.get(prior_calendar_date[d]) for d in all_dates],
                 [hrv_s.get(d) for d in all_dates],
-                "ms per hour of sleep",
-                "Time-of-day of HRV sampling and prior-day exercise load",
+                "ms per hour of prior-night sleep",
+                "Sleep-stage date attribution, HRV sampling time, prior-day exercise, and serial autocorrelation",
             ),
             (
-                "H2: Sleep Duration -> Next-Day Resting Heart Rate",
-                "Does shorter sleep duration associate with elevated next-day resting heart rate?",
-                [slp_dur.get(d) for d in all_dates],
+                "H2: Prior-Night Sleep Duration -> Next-Day Resting Heart Rate",
+                "Does prior-calendar-date sleep duration associate with next-day resting heart rate?",
+                [slp_dur.get(prior_calendar_date[d]) for d in all_dates],
                 [rhr_s.get(d) for d in all_dates],
-                "bpm per hour of sleep",
-                "Evening meal timing, hydration, and ambient temperature",
+                "bpm per hour of prior-night sleep",
+                "Sleep-stage date attribution, evening meals, hydration, ambient temperature, and serial autocorrelation",
             ),
             (
-                "H3: Sleeping Wrist Temperature -> Resting Heart Rate",
-                "Do nocturnal peripheral temperature shifts covary with resting heart rate?",
+                "H3: Sleeping Wrist Temperature vs Same-Day Resting Heart Rate",
+                "Do nocturnal peripheral temperature shifts covary with resting heart rate assigned to the same date?",
                 [wtemp_s.get(d) for d in all_dates],
                 [rhr_s.get(d) for d in all_dates],
                 "bpm per °C shift",
-                "Room bedding microclimate and circadian phase shifts",
+                "Room/bedding microclimate, circadian phase, and serial autocorrelation",
             ),
             (
-                "H4: Previous-Day Steps -> Next-Day Resting Heart Rate",
-                "Does prior-day ambulation volume associate with next-day resting heart rate?",
-                [steps_s.get(all_dates[i - 1]) if i > 0 else None for i in range(len(all_dates))],
+                "H4: Prior-Calendar-Day Steps -> Next-Day Resting Heart Rate",
+                "Does step count on the prior calendar date associate with next-day resting heart rate?",
+                [steps_s.get(prior_calendar_date[d]) for d in all_dates],
                 [rhr_s.get(d) for d in all_dates],
                 "bpm per step",
-                "Workout intensity and sleep duration",
+                "Workout intensity, sleep duration, missing dates, and serial autocorrelation",
             ),
         ]
 
@@ -1776,9 +1846,9 @@ def run_multimodal_research_and_protocol(
             if res.get("valid"):
                 q_fdr = p_adj_map.get(idx, res["p_raw"])
                 verdict = (
-                    f"Statistically supported association (r = {res['r']:+.2f}, p_FDR = {q_fdr:.3f})"
+                    f"Exploratory association signal (r = {res['r']:+.2f}, nominal p_FDR = {q_fdr:.3f}; serial autocorrelation not modeled)"
                     if q_fdr < 0.10
-                    else f"Exploratory / No significant association yet (r = {res['r']:+.2f}, p_FDR = {q_fdr:.3f})"
+                    else f"No clear association signal in this analysis (r = {res['r']:+.2f}, nominal p_FDR = {q_fdr:.3f}; serial autocorrelation not modeled)"
                 )
                 hypotheses.append({
                     "title": title,
@@ -1848,6 +1918,11 @@ def run_multimodal_research_and_protocol(
 
     return {
         "hypotheses": hypotheses,
+        "inference_limitations": (
+            "OLS confidence intervals and Student-t p-values are mathematically computed under independent-observation assumptions. "
+            "Daily wearable physiology can be serially autocorrelated, confounded, and nonstationary; nominal BH-FDR does not correct those problems. "
+            "Treat outputs as exploratory associations, not causal or clinical findings."
+        ),
         "protocol": protocol,
     }
 
