@@ -219,7 +219,7 @@ class Ingestor:
 
     def record_docs(self):
         for (metric, ep), (total, n, unit) in self.bins.items():
-            # Convert the true UTC epoch back to India Standard Time (+05:30) for dashboard displays
+            # Convert absolute UTC epoch to India Standard Time (+05:30) for dashboard strings
             bs_utc = EPOCH0 + timedelta(seconds=ep * 300)
             bs_ist = bs_utc + timedelta(hours=5, minutes=30)
             yield {
