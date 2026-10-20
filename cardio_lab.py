@@ -1310,6 +1310,24 @@ def _numpy_isolation_forest_train_test_scores(
     return np.asarray(scores, dtype=float)
 
 
+def _empirical_upper_threshold(
+    prior_scores: List[float], quantile: float = 0.95, min_calibration: int = 20
+) -> Optional[float]:
+    """Return a past-only empirical upper-tail threshold, or None until calibrated.
+
+    This is an exploratory personal-baseline threshold, not a guaranteed false-alarm
+    probability: daily observations can be autocorrelated and distributions can drift.
+    """
+    clean = np.asarray([float(x) for x in prior_scores if x is not None and math.isfinite(float(x))], dtype=float)
+    if len(clean) < min_calibration:
+        return None
+    # 'higher' avoids interpolating a threshold between observed historical scores.
+    try:
+        return float(np.quantile(clean, quantile, method="higher"))
+    except TypeError:  # NumPy < 1.22 compatibility
+        return float(np.quantile(clean, quantile, interpolation="higher"))
+
+
 def detect_cardio_anomalies(
     df_raw: pd.DataFrame,
     df_sleep: pd.DataFrame,
@@ -1335,7 +1353,10 @@ def detect_cardio_anomalies(
 
     metric_series = [rhr_s, hrv_s, resp_s, wtemp_s]
     min_scales = [2.0, 5.0, 0.8, 0.15]
-    metric_names = ["rhr", "hrv", "resp", "wt"]
+    # Detector thresholds are learned only from previously scored days. A detector
+    # stays inactive until 20 usable historical scores exist; no guessed fallback.
+    calibration_days_required = 20
+    alert_quantile = 0.95
     day_records: List[Dict[str, Any]] = []
     historical_vectors: List[List[float]] = []
     anomalies = []
@@ -1403,13 +1424,34 @@ def detect_cardio_anomalies(
             "steps": float(steps_s.get(d_str, 0.0)),
             "baseline_days": len(prior_dates),
         }
-        day_records.append(rec)
-
         z_list = [rec["z_rhr"], rec["z_hrv"], rec["z_resp"], rec["z_wt"]]
         max_abs_z = max([abs(z) for z in z_list if z is not None], default=0.0)
-        m1_flag = max_abs_z >= 2.2
-        m2_flag = rec["rms_m"] >= 1.65 and rec["k_obs"] >= 2
-        m3_flag = math.isfinite(if_score) and if_score >= 0.63 and rec["k_obs"] >= 2
+        rec["max_abs_z"] = max_abs_z
+
+        # Empirical thresholds are computed from earlier daily scores only. These
+        # scores are not independent, so the quantile is a calibration heuristic,
+        # not a promised 5% false-alarm rate or a clinical decision boundary.
+        z_threshold = _empirical_upper_threshold(
+            [r.get("max_abs_z") for r in day_records if r.get("k_obs", 0) >= 1],
+            quantile=alert_quantile, min_calibration=calibration_days_required
+        )
+        mahal_threshold = _empirical_upper_threshold(
+            [r.get("rms_m") for r in day_records if r.get("k_obs", 0) >= 2],
+            quantile=alert_quantile, min_calibration=calibration_days_required
+        )
+        forest_threshold = _empirical_upper_threshold(
+            [r.get("iforest_score") for r in day_records if r.get("k_obs", 0) >= 2 and math.isfinite(r.get("iforest_score", float("nan")))],
+            quantile=alert_quantile, min_calibration=calibration_days_required
+        )
+        rec["thresholds"] = {"robust_z": z_threshold, "mahalanobis_rms": mahal_threshold, "isolation_forest": forest_threshold}
+        rec["calibration_counts"] = {
+            "robust_z": sum(1 for r in day_records if r.get("k_obs", 0) >= 1),
+            "mahalanobis_rms": sum(1 for r in day_records if r.get("k_obs", 0) >= 2),
+            "isolation_forest": sum(1 for r in day_records if r.get("k_obs", 0) >= 2 and math.isfinite(r.get("iforest_score", float("nan")))),
+        }
+        m1_flag = z_threshold is not None and max_abs_z > z_threshold and rec["k_obs"] >= 1
+        m2_flag = mahal_threshold is not None and rec["rms_m"] > mahal_threshold and rec["k_obs"] >= 2
+        m3_flag = forest_threshold is not None and math.isfinite(if_score) and if_score > forest_threshold and rec["k_obs"] >= 2
         flagged = m1_flag or m2_flag or m3_flag
 
         if flagged:
@@ -1449,6 +1491,12 @@ def detect_cardio_anomalies(
                 "baseline_comparison": f"Compared against prior observations only ({rec['baseline_days']} prior calendar dates; metric-specific available history may be smaller)",
                 "data_quality_missingness": f"{rec['k_obs']}/4 core resting/overnight sensors observed ({int(rec['k_obs']*25)}% coverage)",
                 "model_confidence": f"{len(methods_triggered)}/3 detectors agreed ({', '.join(methods_triggered)}) — agreement, not calibrated confidence",
+                "threshold_calibration": (
+                    f"Past-only empirical {int(alert_quantile*100)}th-percentile thresholds; prior usable scores: "
+                    f"robust-Z={rec['calibration_counts']['robust_z']}, Mahalanobis={rec['calibration_counts']['mahalanobis_rms']}, "
+                    f"Isolation Forest={rec['calibration_counts']['isolation_forest']}. Each detector requires {calibration_days_required} prior scores; "
+                    "quantiles do not guarantee a clinical or statistical false-alarm rate."
+                ),
                 "confounders_and_explanations": (
                     f"Same-day activity: {rec['ex_mins']:.0f} exercise mins, {rec['steps']:.0f} steps. "
                     "Non-diagnostic possibilities include late meals, academic stress, sleep debt, dehydration, or ambient warmth."
@@ -1459,7 +1507,8 @@ def detect_cardio_anomalies(
 
         prior_flag = flagged
         prior_date = d_str
-        # Append current row only after it has been scored, so it cannot train its own forest.
+        # Append current row only after scoring/calibration so it cannot set its own threshold.
+        day_records.append(rec)
         historical_vectors.append(current_vector)
 
     weeks = max(len(all_dates) / 7.0, 1.0)
@@ -1470,8 +1519,9 @@ def detect_cardio_anomalies(
             "flagged_days": len(anomalies),
             "alerts_per_week": round(len(anomalies) / weeks, 2),
             "note": (
-                "Chronological exploratory anomaly flags using past observations only. Thresholds and correlation prior remain heuristic; "
-                "this single-subject system is not validated on external clinical cohorts and cannot diagnose or rule out cardiac disease."
+                "Chronological exploratory anomaly flags using past observations only. Detector cutoffs use past-only empirical upper-tail calibration after "
+                "at least 20 usable prior scores per detector; this is not a guaranteed false-alarm rate because observations may be autocorrelated or drift. "
+                "The correlation prior remains heuristic. This single-subject system is not validated on external clinical cohorts and cannot diagnose or rule out cardiac disease."
             ),
         },
     }
@@ -1848,9 +1898,14 @@ def run_cardio_lab_self_tests() -> Dict[str, Any]:
     assert abs(res["hrv"]["mean_nn_ms"] - 1000.0) < 2.0, "Mean NN interval should be 1000 ms"
     assert res["hrv"]["rmssd_ms"] < 3.0, "Regular 60 bpm rhythm should have near-zero RMSSD"
 
+    # Empirical alert threshold must remain unavailable before minimum history and
+    # use a non-interpolated observed score once enough past scores exist.
+    assert _empirical_upper_threshold(list(range(19))) is None, "Threshold should not calibrate with <20 prior scores"
+    assert _empirical_upper_threshold(list(range(20))) == 19.0, "Higher empirical quantile should be an observed historical value"
+
     return {
         "all_passed": True,
-        "tests_run": 5,
+        "tests_run": 7,
         "verified_fs_hz": res["sampling"]["estimated_fs_hz"],
         "verified_beats": res["beats"]["detected_beats"],
         "verified_mean_nn_ms": res["hrv"]["mean_nn_ms"],
