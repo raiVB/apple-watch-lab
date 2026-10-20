@@ -865,6 +865,8 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
     else:
         s_label, s_color = "Low Stress (Parasympathetic Dominance)", "#10b981"
 
+    intraday_rows.sort(key=lambda r: (r["timestamp"], r["epoch_5m"]))
+
     return {
         "today_likelihood": s_like, 
         "today_coverage": float(today_s["coverage_ratio"]),
