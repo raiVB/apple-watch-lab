@@ -424,26 +424,36 @@ def process_raw_ecg_recording(ecg_obj: Dict[str, Any]) -> Dict[str, Any]:
         else:
             v_filt[seg] = v_arr[seg] - float(np.mean(v_arr[seg]))
 
-    # Evaluate Signal Quality Index (SQI) in 2-second windows + global spectral/kurtosis metrics
+    # Heuristic Signal Quality Index (SQI). Windows that straddle a detected
+    # >100 ms timestamp gap are excluded rather than treated as continuous data.
     win_2s = max(32, int(round(2.0 * fs_hat)))
     n_wins = max(1, len(v_filt) // win_2s)
+    gap_boundary_indices = set(int(i) for i in large_gap_indices)
     usable_wins = 0
     for w_i in range(n_wins):
         s_i = w_i * win_2s
         e_i = min(len(v_filt), s_i + win_2s)
+        # A boundary at i means samples i and i+1 are separated by a detected gap.
+        crosses_gap = any(s_i <= g_i < e_i - 1 for g_i in gap_boundary_indices)
+        if crosses_gap:
+            continue
         seg_w = v_filt[s_i:e_i]
+        if len(seg_w) < win_2s:
+            continue  # don't give a short trailing fragment the same weight as 2 s
         std_w = float(np.std(seg_w))
         p2p_w = float(np.max(seg_w) - np.min(seg_w))
-        # Usable window criteria: not flatline (std >= 0.015 mV), not huge motion artifact (p2p <= 3.5 mV)
         if 0.015 <= std_w <= 0.85 and p2p_w <= 3.8 and not np.any(implausible_mask[s_i:e_i]):
             usable_wins += 1
 
-    usable_duration_pct = round(
-        float(np.clip((usable_wins / max(n_wins, 1)) * 100.0 * (1.0 - gap_duration_s / max(total_duration_s, 1.0)), 0.0, 100.0)),
-        1,
-    )
+    # This is the percentage of the recording's wall-clock duration covered by
+    # accepted complete 2-second windows. Gaps are penalized by the denominator;
+    # do not apply a second separate gap-duration penalty.
+    usable_duration_pct = round(float(np.clip(
+        (usable_wins * win_2s / max(fs_hat, 1e-9)) / max(total_duration_s, 1e-9) * 100.0,
+        0.0, 100.0)), 1)
 
-    # Spectral power ratio in QRS band (5-15 Hz) vs broadband (5-40 Hz) and Kurtosis
+    # Exploratory whole-recording spectral/kurtosis descriptors. These are not
+    # validated clinical SQIs; values may still be affected by non-gap artifacts.
     freqs_sqi = np.fft.rfftfreq(len(v_filt), d=1.0 / fs_hat)
     psd_sqi = np.abs(np.fft.rfft(v_filt)) ** 2
     qrs_band_pwr = float(np.sum(psd_sqi[(freqs_sqi >= 5.0) & (freqs_sqi <= 15.0)]))
@@ -453,25 +463,37 @@ def process_raw_ecg_recording(ecg_obj: Dict[str, Any]) -> Dict[str, Any]:
     std_global = max(float(np.std(v_filt)), 1e-6)
     kurtosis_val = float(np.mean(((v_filt - np.mean(v_filt)) / std_global) ** 4))
 
-    baseline_wander_rms_mv = round(float(np.std(v_arr - v_filt)), 4)
-    hf_noise_rms_mv = round(
-        float(np.std(v_arr - zero_phase_butterworth_filter(v_arr, fs=fs_hat, hp_cut=None, lp_cut=40.0, order=4))),
-        4,
-    )
+    # Estimate baseline wander using a separate <0.5 Hz low-pass component, and
+    # high-frequency residual above the 40 Hz low-pass. Work segment-by-segment
+    # so neither diagnostic filter bridges missing-data gaps.
+    baseline_parts = []
+    hf_residual_parts = []
+    for seg in segments_idx:
+        if len(seg) < min_filter_len:
+            continue
+        raw_seg = v_arr[seg]
+        baseline_parts.append(zero_phase_butterworth_filter(
+            raw_seg, fs=fs_hat, hp_cut=None, lp_cut=0.5, order=4, notch_freqs=()))
+        low40_seg = zero_phase_butterworth_filter(
+            raw_seg, fs=fs_hat, hp_cut=None, lp_cut=40.0, order=4, notch_freqs=())
+        hf_residual_parts.append(raw_seg - low40_seg)
+    baseline_wander_rms_mv = round(float(np.sqrt(np.mean(np.concatenate(baseline_parts) ** 2))), 4) if baseline_parts else None
+    hf_noise_rms_mv = round(float(np.sqrt(np.mean(np.concatenate(hf_residual_parts) ** 2))), 4) if hf_residual_parts else None
 
-    # Composite SQI (0 to 100) based on Clifford et al. (2012)
+    # Heuristic composite (0-100), inspired by common SQI feature families but
+    # not a validated implementation of Clifford et al. and not a probability.
     sqi_kurt_score = float(np.clip((kurtosis_val - 3.0) / 5.0, 0.0, 1.0)) * 100.0
     sqi_spec_score = float(np.clip((inband_qrs_ratio - 0.25) / 0.45, 0.0, 1.0)) * 100.0
     sqi_score = round(0.45 * usable_duration_pct + 0.30 * sqi_spec_score + 0.25 * sqi_kurt_score, 1)
 
     if sqi_score >= 78.0 and usable_duration_pct >= 80.0:
-        sqi_label = "High Signal Quality (Research Grade)"
+        sqi_label = "High heuristic SQI (not externally validated)"
         sqi_color = "#3ddbb0"
     elif sqi_score >= 52.0 and usable_duration_pct >= 55.0:
-        sqi_label = "Moderate Signal Quality (Inspect Artifact Windows)"
+        sqi_label = "Moderate heuristic SQI (inspect artifacts)"
         sqi_color = "#f5b84a"
     else:
-        sqi_label = "Low Signal Quality (Motion / Electrode Contact Noise)"
+        sqi_label = "Low heuristic SQI (inspect signal / contact)"
         sqi_color = "#ff7a6b"
 
     # Run Module B (Beat Detection & Morphology)
@@ -538,8 +560,9 @@ def process_raw_ecg_recording(ecg_obj: Dict[str, Any]) -> Dict[str, Any]:
             "hf_noise_rms_mv": hf_noise_rms_mv,
             "source_units": sorted(list(units_seen)),
             "calibration_note": (
-                "Lead-I equivalent (left wrist negative to right index finger positive). "
-                "Absolute voltage amplitude depends on skin-electrode contact impedance and cardiac axis orientation."
+                "Lead-I-like single-lead recording; absolute voltage amplitude depends on contact and cardiac axis. "
+                "The 0-100 SQI is a heuristic feature score, not a probability or externally validated clinical quality grade. "
+                "Baseline-wander RMS is estimated from a separate <0.5 Hz component on gap-free segments."
             ),
         },
         "sampling": {
