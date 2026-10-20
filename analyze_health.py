@@ -3073,7 +3073,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
 </div>
 
 <script>
-  const D = {json.dumps(payload)};
+  const D = {json.dumps(payload).replace("</", "<\\/")};
   {scene["js"]}
   const CIRC = 326.73;
   const C = {{ sleep:'#8f9bff', stress:'#ff7a6b', energy:'#3ddbb0', hr:'#7cc4ff', tx:'#eef1f6', dim:'#8c95a6', warn:'#f5b84a', grid:'rgba(255,255,255,.06)' }};
@@ -3611,11 +3611,11 @@ await loadDataPage(1);
   // ---------- CARDIOVASCULAR RESEARCH LAB ----------
   let CARDIO_OVERVIEW = null;
 
-  async function uploadEcgJsonFile(input) {{
+async function uploadEcgJsonFile(input) {{
     const file = input.files && input.files[0];
     if (!file) return;
     const lbl = document.getElementById('ecg_up_txt');
-    lbl.innerText = 'Processing ECG DSP...';
+    lbl.innerText = 'Sending to backend...';
     try {{
       const text = await file.text();
       const res = await fetch('/api/ecg/upload' + window.location.search, {{
@@ -3623,11 +3623,13 @@ await loadDataPage(1);
         headers: {{ 'Content-Type': 'application/json' }},
         body: text
       }});
-      const out = await res.json();
       if (res.ok) {{
-        lbl.innerText = 'Saved ' + (out.ecg_saved || 0) + ' ECG(s)! Reloading...';
-        RENDERED['cardio'] = false;
-        await renderCardio();
+        lbl.innerText = 'Processing in background! Give it a moment...';
+        setTimeout(() => {{
+          RENDERED['cardio'] = false;
+          renderCardio();
+          lbl.innerText = 'Upload Apple Health ECG (.json)';
+        }}, 3500);
       }} else {{
         lbl.innerText = 'Upload failed';
       }}
