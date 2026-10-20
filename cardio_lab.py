@@ -1671,8 +1671,12 @@ def run_multimodal_research_and_protocol(
         valid_p = sorted([( idx, r[4]["p_raw"] ) for idx, r in enumerate(raw_results) if r[4].get("valid")], key=lambda x: x[1])
         m_tests = max(len(valid_p), 1)
         p_adj_map = {}
-        for rank_i, (orig_idx, p_val) in enumerate(valid_p, start=1):
-            p_adj_map[orig_idx] = round(min(1.0, p_val * m_tests / rank_i), 4)
+        min_q = 1.0
+        # BH-FDR step-up requires traversing from largest p-value to smallest to enforce monotonicity
+        for rank_i, (orig_idx, p_val) in reversed(list(enumerate(valid_p, start=1))):
+            q_est = p_val * m_tests / rank_i
+            min_q = min(min_q, q_est)
+            p_adj_map[orig_idx] = round(min_q, 4)
 
         for idx, (title, q_text, unit_s, conf_s, res) in enumerate(raw_results):
             if res.get("valid"):
