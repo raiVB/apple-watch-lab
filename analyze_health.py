@@ -248,7 +248,8 @@ def hedges_g_and_welch_test(vals_a, vals_b):
     # Cornisch-Fisher normal approximation for Student-t survival
     z_equiv = abs(t_stat) * (1.0 - 1.0 / (4.0 * df_welch)) / math.sqrt(1.0 + (t_stat ** 2) / (2.0 * df_welch))
     p_val = max(0.0001, min(1.0, 2.0 * (1.0 - norm_cdf(z_equiv))))
-    ci_95 = 1.96 * se_welch * (1.0 + 1.0 / (2.0 * df_welch))
+    # Use exact Cornish-Fisher expansion for z=1.96: (1 + (z^2+1)/4df) -> (1 + 1.21/df)
+    ci_95 = 1.96 * se_welch * (1.0 + 1.21 / df_welch)
 
     return {
         "valid": True, "na": na, "nb": nb,
