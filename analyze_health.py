@@ -553,12 +553,22 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         date=("date", "first"), hour=("hour", "mean")
     ).sort_index()
 
+    # Keep five-minute epoch buckets as integers for range() and map lookups.
+    hr_epochs.index = hr_epochs.index.astype("int64")
+
     steps_5m = df_rec[df_rec["metric"] == "StepCount"].groupby("epoch_5m")["value"].sum()
     kcal_5m = df_rec[df_rec["metric"] == "ActiveEnergyBurned"].groupby("epoch_5m")["value"].sum()
     ex_5m = df_rec[df_rec["metric"] == "AppleExerciseTime"].groupby("epoch_5m")["value"].sum()
     flights_5m = df_rec[df_rec["metric"] == "FlightsClimbed"].groupby("epoch_5m")["value"].sum()
     hrv_5m = df_rec[df_rec["metric"] == "HeartRateVariabilitySDNN"].groupby("epoch_5m")["value"].mean()
     noise_5m = df_rec[df_rec["metric"] == "EnvironmentalAudioExposure"].groupby("epoch_5m")["value"].mean()
+
+    steps_5m.index = steps_5m.index.astype("int64")
+    kcal_5m.index = kcal_5m.index.astype("int64")
+    ex_5m.index = ex_5m.index.astype("int64")
+    flights_5m.index = flights_5m.index.astype("int64")
+    hrv_5m.index = hrv_5m.index.astype("int64")
+    noise_5m.index = noise_5m.index.astype("int64")
 
     rhr_series = df_raw[df_raw["metric"] == "RestingHeartRate"]["value"]
     base_rhr = float(rhr_series.median()) if not rhr_series.empty else (
@@ -584,7 +594,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         latest_dt = str(hr_epochs["date"].max())
         X_train_list, y_train_list = [], []
         
-        for ep in ep_indices:
+        for ep in map(int, ep_indices):
             r_date = str(hr_epochs.loc[ep, "date"])
             if r_date >= latest_dt:
                 continue # Strict chronological separation: only train on past days
