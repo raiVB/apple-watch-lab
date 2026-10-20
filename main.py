@@ -844,57 +844,41 @@ def get_cardio_lab_overview(request: Request):
 
 @app.get("/api/backtest/evaluate")
 def backtest_evaluate(request: Request):
+    """Audit whether a real, frozen predictor can be evaluated against check-ins.
+
+    This endpoint intentionally does NOT manufacture predictions. The previous
+    version mapped ordinal self-reports to arbitrary percentages and generated a
+    heart-rate-only score with hand-picked constants, then reported MAE/RMSE as
+    though it were a trained model. That is not a valid model evaluation.
+    """
     check_token(request)
-    
-    # 1. Pull the validation dataset we already prepared
+
+    # Dataset preparation is useful; it is not itself a prediction model.
     dataset_response = backtest_dataset(request)
-    usable_data = [row for row in dataset_response.get("results", []) if row.get("usable_for_preliminary_analysis")]
-    
-    if len(usable_data) < 3:
-        return {
-            "status": "insufficient_data", 
-            "detail": f"Only {len(usable_data)} usable check-ins found. You need at least 3 to calculate RMSE."
-        }
-        
-    y_true = []
-    y_pred = []
-    
-    for row in usable_data:
-        # Ground truth from your EMA check-in (Scale 0-4 mapped to 0-100% stress)
-        actual_stress_label = row["stress_label"]
-        actual_scaled = {0: 10.0, 1: 30.0, 2: 50.0, 3: 75.0, 4: 95.0}.get(actual_stress_label, 50.0)
-        
-        # Predictor features (In production, this calls your Bayesian Ridge weights)
-        hr_mean = row["features"]["HeartRate"]["mean"]
-        
-        # Compute predicted stress magnitude based on physiological deviation
-        predicted_stress = float(np.clip(10.0 + (hr_mean - 65.0) * 2.5, 5.0, 95.0))
-        
-        y_true.append(actual_scaled)
-        y_pred.append(predicted_stress)
-        
-    # 2. Calculate Phase 4 Metrics (MAE & RMSE)
-    y_true_arr = np.array(y_true)
-    y_pred_arr = np.array(y_pred)
-    
-    mae = float(np.mean(np.abs(y_true_arr - y_pred_arr)))
-    rmse = float(np.sqrt(np.mean((y_true_arr - y_pred_arr)**2)))
-    
-    # Calculate baseline error (what the error would be if the model just guessed your average stress every time)
-    baseline_mae = float(np.mean(np.abs(y_true_arr - np.mean(y_true_arr)))) 
-    model_edge = baseline_mae - mae
-    
+    results = dataset_response.get("results", [])
+    usable_data = [
+        row for row in results
+        if row.get("usable_for_preliminary_analysis") is True
+        and row.get("stress_label") in (0, 1, 2, 3, 4)
+    ]
+
     return {
-        "status": "validation_complete",
-        "n_samples_tested": len(y_true),
-        "metrics": {
-            "MAE": round(mae, 2),
-            "RMSE": round(rmse, 2),
-            "Baseline_Guess_MAE": round(baseline_mae, 2),
-            "Model_Improvement_vs_Guessing": round(model_edge, 2)
-        },
-        "interpretation": (
-            f"Your model's predictions are off by an average of {round(mae, 2)}% per check-in. "
-            f"{'Your custom model is outperforming random guessing!' if model_edge > 0 else 'The model needs more logged check-ins to beat baseline guessing.'}"
-        )
+        "status": "not_evaluable_model_not_connected",
+        "dataset_status": dataset_response.get("status", "unknown"),
+        "checkins_processed": len(results),
+        "usable_labeled_observations": len(usable_data),
+        "metrics": None,
+        "reason": (
+            "No trained, frozen stress predictor is connected to this endpoint. "
+            "The previous hand-written HR-to-score formula and arbitrary mapping "
+            "from the 0-4 self-report scale to percentages have been removed; "
+            "reporting MAE/RMSE from those values would be misleading."
+        ),
+        "data_notes": [
+            "Stress check-ins are ordinal self-reports (0-4), not validated percentages.",
+            "Heart-rate sample-count eligibility is a preliminary data-quality rule, not a clinical threshold.",
+            "A valid evaluation needs a defined target, a predictor trained only on earlier observations, and chronological held-out predictions.",
+            "Any model using HRV must explicitly handle missing HRV rather than silently treating it as zero.",
+        ],
+        "future_sensor_data_used": dataset_response.get("future_sensor_data_used"),
     }
