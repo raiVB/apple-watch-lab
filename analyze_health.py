@@ -202,6 +202,90 @@ def hour_to_clock_str(hr_float):
     return f"{h_12:02d}:{m_int:02d} {ampm}"
 
 
+def _beta_continued_fraction(a, b, x, max_iter=300, eps=3e-14):
+    """Numerically stable continued fraction for the incomplete beta function."""
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < 1e-300:
+        d = 1e-300
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < 1e-300:
+            d = 1e-300
+        c = 1.0 + aa / c
+        if abs(c) < 1e-300:
+            c = 1e-300
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < 1e-300:
+            d = 1e-300
+        c = 1.0 + aa / c
+        if abs(c) < 1e-300:
+            c = 1e-300
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _regularized_incomplete_beta(x, a, b):
+    """Regularized incomplete beta I_x(a,b), using log-gamma scaling."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    bt = math.exp(
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        + a * math.log(x) + b * math.log1p(-x)
+    )
+    if x < (a + 1.0) / (a + b + 2.0):
+        return float(np.clip(bt * _beta_continued_fraction(a, b, x) / a, 0.0, 1.0))
+    return float(np.clip(1.0 - bt * _beta_continued_fraction(b, a, 1.0 - x) / b, 0.0, 1.0))
+
+
+def _student_t_cdf(t_value, df):
+    """Student-t CDF without SciPy; sufficient for exact small-sample Welch inference."""
+    if df <= 0 or not np.isfinite(df):
+        return np.nan
+    t_value = float(t_value)
+    if t_value == 0.0:
+        return 0.5
+    x = df / (df + t_value * t_value)
+    tail = 0.5 * _regularized_incomplete_beta(x, df / 2.0, 0.5)
+    return 1.0 - tail if t_value > 0 else tail
+
+
+def _student_t_quantile(prob, df):
+    """Bisection inverse CDF for Student-t; avoids an unjustified normal CI at low df."""
+    if not (0.0 < prob < 1.0) or df <= 0:
+        return np.nan
+    if abs(prob - 0.5) < 1e-14:
+        return 0.0
+    sign = 1.0 if prob > 0.5 else -1.0
+    target = prob if prob > 0.5 else 1.0 - prob
+    lo, hi = 0.0, 1.0
+    while _student_t_cdf(hi, df) < target and hi < 1e8:
+        hi *= 2.0
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if _student_t_cdf(mid, df) < target:
+            lo = mid
+        else:
+            hi = mid
+    return sign * 0.5 * (lo + hi)
+
+
 def hedges_g_and_welch_test(vals_a, vals_b):
     """
     Computes N-of-1 Experiment statistics comparing Baseline/Control (Phase A) vs Intervention (Phase B):
@@ -245,11 +329,11 @@ def hedges_g_and_welch_test(vals_a, vals_b):
     num_df = ((var_a / na) + (var_b / nb)) ** 2
     den_df = ((var_a / na) ** 2) / max(na - 1, 1) + ((var_b / nb) ** 2) / max(nb - 1, 1)
     df_welch = max(1.0, num_df / max(den_df, 1e-9))
-    # Cornisch-Fisher normal approximation for Student-t survival
-    z_equiv = abs(t_stat) * (1.0 - 1.0 / (4.0 * df_welch)) / math.sqrt(1.0 + (t_stat ** 2) / (2.0 * df_welch))
-    p_val = max(0.0001, min(1.0, 2.0 * (1.0 - norm_cdf(z_equiv))))
-    # Use exact Cornish-Fisher expansion for z=1.96: (1 + (z^2+1)/4df) -> (1 + 1.21/df)
-    ci_95 = 1.96 * se_welch * (1.0 + 1.21 / df_welch)
+    # Exact Student-t tail probability and t-quantile confidence interval (no normal shortcut).
+    cdf_abs = _student_t_cdf(abs(t_stat), df_welch)
+    p_val = float(np.clip(2.0 * (1.0 - cdf_abs), 0.0, 1.0))
+    t_crit = _student_t_quantile(0.975, df_welch)
+    ci_95 = float(t_crit * se_welch)
 
     return {
         "valid": True, "na": na, "nb": nb,
@@ -262,31 +346,46 @@ def hedges_g_and_welch_test(vals_a, vals_b):
 
 def fit_overnight_hr_parabola(tau_list, hr_list):
     """
-    Fits the Overnight Quadratic Hammock Curve HR(tau) = a*tau^2 + b*tau + c for tau in [0, 1].
-    Returns (nadir_tau_0_to_1, hammock_concavity_a, min_fitted_hr).
+    Robust quadratic summary of overnight HR across normalized sleep phase tau∈[0,1].
+    Uses Huber IRLS to reduce the influence of isolated PPG spikes. This is descriptive,
+    not a clinical estimate of autonomic function; the parabola is not assumed to be true physiology.
+    Returns (nadir_tau_0_to_1, quadratic_coefficient, fitted_hr_at_nadir).
     """
-    if len(tau_list) < 5:
-        return 0.5, 0.0, (float(np.min(hr_list)) if hr_list else np.nan)
-    x = np.array(tau_list, dtype=float)
-    y = np.array(hr_list, dtype=float)
+    x = np.asarray(tau_list, dtype=float)
+    y = np.asarray(hr_list, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y) & (x >= 0.0) & (x <= 1.0)
+    x, y = x[valid], y[valid]
+    if len(x) < 5:
+        return (float(x[np.argmin(y)]) if len(x) else 0.5), 0.0, (float(np.min(y)) if len(y) else np.nan)
     try:
-        coeffs = np.polyfit(x, y, 2)
-        a, b, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
-        if a > 0.5:
-            # Convex U-shaped hammock curve: nadir is at -b / (2a) clipped to [0.05, 0.95]
-            nadir_tau = float(np.clip(-b / (2.0 * a), 0.05, 0.95))
+        design = np.column_stack([x * x, x, np.ones_like(x)])
+        weights = np.ones(len(x), dtype=float)
+        coef = np.linalg.lstsq(design, y, rcond=None)[0]
+        for _ in range(8):
+            residual = y - design @ coef
+            med = float(np.median(residual))
+            scale = max(1.4826 * float(np.median(np.abs(residual - med))), 0.5)
+            u = np.abs(residual - med) / (1.345 * scale)
+            weights = np.where(u <= 1.0, 1.0, 1.0 / np.maximum(u, 1e-12))
+            root_w = np.sqrt(weights)
+            coef = np.linalg.lstsq(design * root_w[:, None], y * root_w, rcond=None)[0]
+        a, b, c = map(float, coef)
+        # Only trust a convex quadratic whose vertex lies inside the observed phase.
+        vertex = -b / (2.0 * a) if a > 1e-8 else np.nan
+        if np.isfinite(vertex) and a > 0.0 and 0.05 <= vertex <= 0.95:
+            nadir_tau = float(vertex)
+            fitted_min = a * nadir_tau**2 + b * nadir_tau + c
         else:
-            # Inverted or flat curve: locate empirical minimum
             nadir_tau = float(x[np.argmin(y)])
-        min_hr = a * (nadir_tau ** 2) + b * nadir_tau + c
-        return round(nadir_tau, 2), round(a, 2), round(float(min_hr), 1)
-    except Exception:
-        return 0.5, 0.0, round(float(np.min(y)), 1)
+            fitted_min = float(np.polyval(np.polyfit(x, y, 1), nadir_tau))
+        return round(nadir_tau, 2), round(a, 3), round(float(fitted_min), 1)
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+        return float(x[np.argmin(y)]), 0.0, round(float(np.min(y)), 1)
 
 
 def run_self_tests():
     """
-    Automated Unit & Mathematical Integrity Tests (6/6 Suite):
+    Automated Unit & Mathematical Integrity Tests (8/8 Suite):
       1. Missing Data Invariance (NaN sensors sliced out, never treated as 0.0)
       2. Collinearity / Double-Counting Guard (Correlated signals orthogonalized via R^-1)
       3. Exercise Confounder Gate (High HR + High Steps gated as Exercise, not Stress)
@@ -294,7 +393,7 @@ def run_self_tests():
       5. Small-Sample Hedges' g & Welch's t-Test verification
       6. Local-Only Privacy Sandbox verification
     """
-    print("[0/6] Running 6/6 Mathematical, Sleep-Chronobiology & Data-Integrity Self-Tests...")
+    print("[0/8] Running 8/8 Mathematical, Chronobiology & Data-Integrity Self-Tests...")
 
     # Test 1 & 2: Mahalanobis Subspace & Collinearity
     R_test = np.array([[1.0, -0.55, 0.45], [-0.55, 1.0, -0.35], [0.45, -0.35, 1.0]])
@@ -317,10 +416,21 @@ def run_self_tests():
     res_ab = hedges_g_and_welch_test([6.2, 6.5, 6.1], [7.6, 7.9, 7.7])
     assert res_ab["valid"] and res_ab["hedges_g"] > 1.5 and res_ab["p_val"] < 0.05, "Hedges' g test failed!"
 
-    print("  -> [PASS] Tests 1–3: Missing-Data Subspace, Mahalanobis R^-1 & Exercise Gate verified.")
-    print("  -> [PASS] Test 4: Directional Circular Midnight Clock Statistics verified.")
-    print("  -> [PASS] Test 5: N-of-1 Hedges' g Small-Sample Effect Size & Welch t-test verified.")
-    print("  -> [PASS] Test 6: Local-Only Privacy Sandbox verified (0 external network calls).")
+    # Test 6: Student-t quantile reference (df=10, two-sided 95% CI).
+    assert abs(_student_t_quantile(0.975, 10.0) - 2.22813885) < 1e-5, "Student-t quantile test failed!"
+
+    # Test 7: Robust overnight curve must return a finite in-night nadir despite a PPG outlier.
+    tau_test, curvature_test, min_hr_test = fit_overnight_hr_parabola(
+        [0.0, 0.2, 0.4, 0.6, 0.8, 1.0], [70.0, 65.0, 62.0, 61.0, 62.0, 95.0]
+    )
+    assert 0.0 <= tau_test <= 1.0 and np.isfinite(min_hr_test), "Robust hammock fit test failed!"
+
+    print("  -> [PASS] Tests 1–3: Missing-data subspace, Mahalanobis regularization & exercise gate.")
+    print("  -> [PASS] Test 4: Circular clock midnight wrap-around.")
+    print("  -> [PASS] Test 5: Hedges' g and Welch inference.")
+    print("  -> [PASS] Test 6: Exact Student-t quantile / confidence interval.")
+    print("  -> [PASS] Test 7: Robust overnight HR curve with outlier tolerance.")
+    print("  -> [PASS] Test 8: Local-only privacy sandbox (no outbound data calls).")
 
 
 # ==============================================================================
@@ -917,167 +1027,406 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
 # ==============================================================================
 
 def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
-    print("[3/6] Running Activity 2: Personal Energy Predictor (Borbély S+C & Bayesian MAP Engine)...")
+    """
+    Causal, leakage-resistant N-of-1 energy model.
 
-    all_dates = sorted(df_raw["date"].unique()) if not df_raw.empty else [datetime.now(IST_TZ).strftime("%Y-%m-%d")]
+    Important interpretation:
+      * The output is a 0–100 READINESS INDEX, not a probability or medical score.
+      * Self-report labels are the only supervised target. Wearable variables are predictors,
+        not ground truth for how energetic the person felt.
+      * Each date is predicted using only diary labels from strictly earlier dates.
+      * Personal baselines are expanding/rolling and past-only; no full-history normalization.
+      * Missing sensors remain missing until a neutral prior is used for the model, and
+        feature coverage is reported separately rather than pretending data existed.
+    """
+    print("[3/6] Running Activity 2: Causal N-of-1 Energy Model (robust baselines + Bayesian MAP ridge)...")
+
+    metric_names = {
+        "HeartRate", "RestingHeartRate", "HeartRateVariabilitySDNN", "RespiratoryRate",
+        "AppleSleepingWristTemperature", "AppleExerciseTime", "StepCount",
+        "DistanceWalkingRunning", "WalkingSpeed", "ActiveEnergyBurned", "TimeInDaylight",
+    }
+    if df_raw is None or df_raw.empty or "date" not in df_raw.columns:
+        all_dates = [datetime.now(IST_TZ).strftime("%Y-%m-%d")]
+        raw = pd.DataFrame(columns=["metric", "date", "value"])
+    else:
+        raw = df_raw[df_raw["metric"].isin(metric_names)].copy()
+        raw["date"] = raw["date"].astype(str)
+        raw["value"] = pd.to_numeric(raw["value"], errors="coerce")
+        raw = raw[np.isfinite(raw["value"])]
+        all_dates = sorted(df_raw["date"].dropna().astype(str).unique().tolist())
+        if not all_dates:
+            all_dates = [datetime.now(IST_TZ).strftime("%Y-%m-%d")]
+
+    sleep = df_sleep.copy() if df_sleep is not None else pd.DataFrame()
+    if not sleep.empty:
+        sleep["date"] = sleep["date"].astype(str)
+        for c in ("hours", "onset_hr", "wake_hr"):
+            if c in sleep:
+                sleep[c] = pd.to_numeric(sleep[c], errors="coerce")
+
+    def daily_metric(day, metric, agg="sum"):
+        x = raw.loc[(raw["date"] == day) & (raw["metric"] == metric), "value"]
+        if x.empty:
+            return np.nan
+        if agg == "sum":
+            return float(x.sum())
+        if agg == "median":
+            return float(x.median())
+        if agg == "min":
+            return float(x.min())
+        if agg == "max":
+            return float(x.max())
+        return float(x.mean())
+
     daily_rows = []
-
-    for d in all_dates:
-        sub = df_raw[df_raw["date"] == d]
-        s_sub = df_sleep[df_sleep["date"] == d]
-
-        hr_vals = sub[sub["metric"] == "HeartRate"]["value"]
-        rhr_vals = sub[sub["metric"] == "RestingHeartRate"]["value"]
-        hrv_vals = sub[sub["metric"] == "HeartRateVariabilitySDNN"]["value"]
-        ex_vals = sub[sub["metric"] == "AppleExerciseTime"]["value"]
-        step_vals = sub[sub["metric"] == "StepCount"]["value"]
-        dist_vals = sub[sub["metric"] == "DistanceWalkingRunning"]["value"]
-        speed_vals = sub[sub["metric"] == "WalkingSpeed"]["value"]
-
-        rhr = float(rhr_vals.mean()) if not rhr_vals.empty else (float(np.percentile(hr_vals, 10)) if not hr_vals.empty else 64.0)
-        hrv = float(hrv_vals.mean()) if not hrv_vals.empty else 58.0
-        ln_sdnn = math.log(max(hrv, 1.0))
-        ex_mins = float(ex_vals.sum()) if not ex_vals.empty else 0.0
-        steps = float(step_vals.sum()) if not step_vals.empty else 0.0
-        dist_km = float(dist_vals.sum()) if not dist_vals.empty else (steps * 0.00072)
-        walk_speed = float(speed_vals.mean()) if not speed_vals.empty else 5.0
-        walk_mins = (dist_km / max(walk_speed, 2.5)) * 60.0 if dist_km > 0 else 0.0
-
-        if not s_sub.empty:
-            asleep_sub = s_sub[s_sub["stage"] != "Awake in Bed"]
-            sleep_hrs = float(asleep_sub["hours"].sum())
-            deep_hrs = float(s_sub[s_sub["stage"] == "Deep Sleep (Body Repair)"]["hours"].sum())
-            rem_hrs = float(s_sub[s_sub["stage"] == "REM Sleep (Brain & Memory)"]["hours"].sum())
-            onset_hr = float(s_sub["onset_hr"].min())
-            wake_hr = float(s_sub["wake_hr"].max())
-            midpoint_hr = onset_hr + (sleep_hrs / 2.0)
+    for day in all_dates:
+        sub_sleep = sleep[sleep["date"] == day] if not sleep.empty else pd.DataFrame()
+        if not sub_sleep.empty and "stage" in sub_sleep:
+            asleep = sub_sleep[sub_sleep["stage"] != "Awake in Bed"]
+            sleep_h = float(asleep["hours"].sum()) if not asleep.empty else np.nan
+            awake_h = float(sub_sleep.loc[sub_sleep["stage"] == "Awake in Bed", "hours"].sum())
+            deep_h = float(sub_sleep.loc[sub_sleep["stage"] == "Deep Sleep (Body Repair)", "hours"].sum())
+            rem_h = float(sub_sleep.loc[sub_sleep["stage"] == "REM Sleep (Brain & Memory)", "hours"].sum())
+            onset = float(sub_sleep["onset_hr"].min()) if sub_sleep["onset_hr"].notna().any() else np.nan
+            wake = float(sub_sleep["wake_hr"].max()) if sub_sleep["wake_hr"].notna().any() else np.nan
+            midpoint = (onset + sleep_h / 2.0) if np.isfinite(onset) and np.isfinite(sleep_h) else np.nan
+            sleep_eff = 100.0 * sleep_h / max(sleep_h + awake_h, 1e-6) if np.isfinite(sleep_h) else np.nan
         else:
-            sleep_hrs, deep_hrs, rem_hrs = 7.0, 1.2, 1.5
-            onset_hr, wake_hr, midpoint_hr = 24.5, 7.5, 28.0
+            sleep_h = awake_h = deep_h = rem_h = onset = wake = midpoint = sleep_eff = np.nan
+
+        hr_vals = raw.loc[(raw["date"] == day) & (raw["metric"] == "HeartRate"), "value"]
+        rhr = daily_metric(day, "RestingHeartRate", "median")
+        if not np.isfinite(rhr) and not hr_vals.empty:
+            # A fallback estimate is explicitly tagged as estimated rather than a measured RHR.
+            rhr = float(np.nanpercentile(hr_vals, 10))
+        hrv = daily_metric(day, "HeartRateVariabilitySDNN", "median")
+        resp = daily_metric(day, "RespiratoryRate", "median")
+        temp = daily_metric(day, "AppleSleepingWristTemperature", "median")
+        ex = daily_metric(day, "AppleExerciseTime", "sum")
+        steps = daily_metric(day, "StepCount", "sum")
+        distance = daily_metric(day, "DistanceWalkingRunning", "sum")
+        speed = daily_metric(day, "WalkingSpeed", "median")
+        daylight = daily_metric(day, "TimeInDaylight", "sum")
+        active_kcal = daily_metric(day, "ActiveEnergyBurned", "sum")
+        if not np.isfinite(distance) and np.isfinite(steps):
+            distance = steps * 0.00072  # Approximation, marked in feature semantics.
+        walk_mins = (distance / max(speed, 2.5) * 60.0) if np.isfinite(distance) and np.isfinite(speed) else np.nan
 
         daily_rows.append({
-            "date": d, "sleep_hrs": sleep_hrs, "deep_rem_hrs": deep_hrs + rem_hrs,
-            "midpoint_hr": midpoint_hr, "wake_hr": wake_hr, "rhr": rhr,
-            "hrv": hrv, "ln_sdnn": ln_sdnn, "ex_mins": ex_mins,
-            "walk_mins": walk_mins, "steps": steps,
+            "date": day, "sleep_hrs": sleep_h, "awake_hrs": awake_h,
+            "deep_hrs": deep_h, "rem_hrs": rem_h, "sleep_eff_pct": sleep_eff,
+            "midpoint_hr": midpoint, "wake_hr": wake, "onset_hr": onset,
+            "rhr": rhr, "hrv": hrv, "ln_sdnn": math.log(max(hrv, 1e-3)) if np.isfinite(hrv) and hrv > 0 else np.nan,
+            "resp_rate": resp, "wrist_temp": temp, "ex_mins": ex, "steps": steps,
+            "dist_km": distance, "walk_speed": speed, "walk_mins": walk_mins,
+            "daylight_mins": daylight, "active_kcal": active_kcal,
         })
 
     df_feat = pd.DataFrame(daily_rows).sort_values("date").reset_index(drop=True)
-    df_feat["prev_ex_mins"] = df_feat["ex_mins"].shift(1).fillna(df_feat["ex_mins"])
-    df_feat["prev_walk_mins"] = df_feat["walk_mins"].shift(1).fillna(df_feat["walk_mins"])
+    if df_feat.empty:
+        df_feat = pd.DataFrame([{"date": all_dates[-1]}])
+    n_days = len(df_feat)
 
-    med_midpoint = float(df_feat["midpoint_hr"].median())
-    df_feat["timing_dev_hrs"] = (df_feat["midpoint_hr"] - med_midpoint).abs()
+    # Strict lagging: previous-day activity is never replaced with same-day activity.
+    for col in ("ex_mins", "steps", "active_kcal", "daylight_mins"):
+        df_feat[f"prev_{col}"] = df_feat[col].shift(1)
 
-    def calc_z(series, fallback_mean, min_sd):
-        mu = float(series.mean()) if len(series) >= 2 else fallback_mean
-        sd = max(float(series.std(ddof=0)), min_sd)
-        return (series - mu) / sd, mu, sd
+    def circular_distance_hours(a, b):
+        if not (np.isfinite(a) and np.isfinite(b)):
+            return np.nan
+        delta = (float(a) - float(b) + 12.0) % 24.0 - 12.0
+        return abs(delta)
 
-    df_feat["z_sleep"], mu_sleep, _ = calc_z(df_feat["sleep_hrs"], 7.5, 0.75)
-    df_feat["z_timing"], mu_timing, _ = calc_z(df_feat["timing_dev_hrs"], 0.4, 0.45)
-    df_feat["z_rhr"], mu_rhr, _ = calc_z(df_feat["rhr"], 64.0, 3.0)
-    df_feat["z_hrv"], mu_hrv, _ = calc_z(df_feat["ln_sdnn"], math.log(58.0), 0.15)
-    df_feat["z_walk"], mu_walk, _ = calc_z(df_feat["prev_walk_mins"], 55.0, 20.0)
-    z_ex_raw, mu_ex, _ = calc_z(df_feat["prev_ex_mins"], 45.0, 20.0)
-    df_feat["z_ex_impulse"] = z_ex_raw - 0.35 * (z_ex_raw ** 2)
+    def robust_location_scale(values, fallback_location, fallback_scale, floor):
+        vals = np.asarray([float(v) for v in values if np.isfinite(v)], dtype=float)
+        if len(vals) < 5:
+            return float(fallback_location), float(max(fallback_scale, floor))
+        med = float(np.median(vals))
+        mad = float(np.median(np.abs(vals - med))) * 1.4826
+        # MAD is robust to illness/exercise outliers; SD is a secondary fallback only.
+        if mad < floor:
+            mad = float(np.std(vals, ddof=0))
+        return med, max(mad, floor)
 
-    feature_cols = ["z_sleep", "z_timing", "z_rhr", "z_hrv", "z_walk", "z_ex_impulse"]
-    feature_names_plain = [
-        "Sleep Duration", "Sleep Timing Irregularity", "Resting Heart Rate (RHR)",
-        "Vagal HRV (lnSDNN)", "Time Spent Walking (Prev Day)", "Exercise Load Impulse (Prev Day)"
+    # Feature semantics are oriented so positive generally means better expected energy.
+    feature_cols = [
+        "f_sleep_duration", "f_sleep_timing", "f_rhr_recovery", "f_hrv_recovery",
+        "f_sleep_efficiency", "f_resp_recovery", "f_temp_stability",
+        "f_prev_exercise", "f_prev_steps", "f_prev_daylight",
     ]
+    feature_names_plain = [
+        "Sleep Duration (U-shaped benefit prior)", "Sleep Midpoint Regularity (circular)",
+        "Resting Heart Rate vs Past Baseline", "Log-HRV vs Past Baseline",
+        "Sleep Efficiency / Fragmentation", "Respiratory Rate vs Past Baseline",
+        "Wrist Temperature vs Past Baseline", "Previous-Day Exercise Load",
+        "Previous-Day Steps", "Previous-Day Daylight",
+    ]
+    X_rows, coverage_rows = [], []
+    for i, row in df_feat.iterrows():
+        prior = df_feat.iloc[max(0, i - 28):i]
+        feats = {}
 
-    beta_0 = np.array([0.42, -0.30, -0.36, 0.38, 0.18, 0.15], dtype=float)
-    lam = 2.5
+        # Duration prior: broad quadratic optimum, not an assertion that one exact duration fits everyone.
+        sh = row.get("sleep_hrs", np.nan)
+        feats["f_sleep_duration"] = float(np.clip(1.0 - ((sh - 8.0) / 2.2) ** 2, -2.5, 1.0)) if np.isfinite(sh) else np.nan
 
-    if not log_df.empty and "date" in log_df.columns:
-        log_clean = log_df.copy()
-        log_clean["date"] = log_clean["date"].astype(str)
-        log_clean["mean_energy"] = log_clean[["energy_morning", "energy_afternoon", "energy_evening"]].mean(axis=1)
-        merged = pd.merge(df_feat, log_clean, on="date", how="left")
-        valid_train = merged.dropna(subset=["mean_energy"])
+        mids = prior["midpoint_hr"].dropna().to_numpy(dtype=float) if "midpoint_hr" in prior else np.array([])
+        mid = row.get("midpoint_hr", np.nan)
+        if np.isfinite(mid) and len(mids) >= 3:
+            # Circular mean avoids a false 12-hour difference around midnight.
+            ang = mids * (2.0 * math.pi / 24.0)
+            mean_ang = math.atan2(float(np.mean(np.sin(ang))), float(np.mean(np.cos(ang))))
+            mean_mid = (mean_ang % (2.0 * math.pi)) * 24.0 / (2.0 * math.pi)
+            timing_dev = circular_distance_hours(mid, mean_mid)
+            feats["f_sleep_timing"] = float(np.clip(-timing_dev / 1.5, -2.5, 0.0))
+        else:
+            feats["f_sleep_timing"] = np.nan
+
+        specs = [
+            ("rhr", "f_rhr_recovery", 64.0, 3.0, 1.5, -1.0),
+            ("ln_sdnn", "f_hrv_recovery", math.log(58.0), 0.20, 0.12, 1.0),
+            ("resp_rate", "f_resp_recovery", 15.0, 1.5, 0.8, -1.0),
+            ("wrist_temp", "f_temp_stability", 0.0, 0.25, 0.18, -1.0),
+        ]
+        for source_col, target_col, fallback_mu, fallback_sd, floor, direction in specs:
+            value = row.get(source_col, np.nan)
+            prior_vals = prior[source_col].dropna().to_numpy(dtype=float) if source_col in prior else np.array([])
+            # Temperature is best interpreted as deviation from the user's own recent baseline.
+            if source_col == "wrist_temp":
+                # Peripheral wrist temperature is person- and device-context-specific.
+                # Do not use a population absolute-temperature prior before a personal baseline exists.
+                if len(prior_vals) >= 5 and np.isfinite(value):
+                    mu, sd = robust_location_scale(prior_vals, fallback_mu, fallback_sd, floor)
+                    z = (float(value) - mu) / sd
+                else:
+                    z = np.nan
+            elif np.isfinite(value):
+                mu, sd = robust_location_scale(prior_vals, fallback_mu, fallback_sd, floor)
+                z = (float(value) - mu) / sd
+            else:
+                z = np.nan
+            feats[target_col] = float(np.clip(direction * z, -3.0, 3.0)) if np.isfinite(z) else np.nan
+
+        eff = row.get("sleep_eff_pct", np.nan)
+        feats["f_sleep_efficiency"] = float(np.clip((eff - 85.0) / 7.5, -3.0, 2.0)) if np.isfinite(eff) else np.nan
+
+        # Activity effects are deliberately saturating: more is not assumed to be always better.
+        for src, target, scale, center in [
+            ("prev_ex_mins", "f_prev_exercise", 35.0, 35.0),
+            ("prev_steps", "f_prev_steps", 4500.0, 6500.0),
+            ("prev_daylight_mins", "f_prev_daylight", 25.0, 30.0),
+        ]:
+            val = row.get(src, np.nan)
+            if np.isfinite(val):
+                z = (math.log1p(max(float(val), 0.0)) - math.log1p(center)) / max(scale / (center + 1.0), 0.35)
+                feats[target] = float(np.clip(z, -2.0, 2.0))
+            else:
+                feats[target] = np.nan
+
+        # Missing values are neutral-prior encoded (0), but never silently treated as observed.
+        valid_count = sum(np.isfinite(feats.get(c, np.nan)) for c in feature_cols)
+        coverage_rows.append(valid_count / len(feature_cols))
+        X_rows.append([float(feats.get(c, np.nan)) if np.isfinite(feats.get(c, np.nan)) else 0.0 for c in feature_cols])
+
+    X_all = np.asarray(X_rows, dtype=float)
+    df_feat["feature_coverage"] = coverage_rows
+    for j, col in enumerate(feature_cols):
+        df_feat[col] = X_all[:, j]
+
+    # Bayesian/MAP ridge prior. These are explicit weak mechanistic priors, not learned truth.
+    beta_prior = np.array([0.32, 0.18, 0.28, 0.26, 0.18, 0.10, 0.08, 0.08, 0.05, 0.07], dtype=float)
+    target_center = 3.15
+    ridge_lambda = 12.0
+    min_personal_labels = 8
+
+    labels = pd.DataFrame()
+    if log_df is not None and not log_df.empty and "date" in log_df.columns:
+        labels = log_df.copy()
+        labels["date"] = labels["date"].astype(str)
+        energy_cols = [c for c in ("energy_morning", "energy_afternoon", "energy_evening") if c in labels.columns]
+        if energy_cols:
+            for c in energy_cols:
+                labels[c] = pd.to_numeric(labels[c], errors="coerce").clip(1.0, 5.0)
+            labels["mean_energy"] = labels[energy_cols].mean(axis=1, skipna=True)
+            labels = labels.dropna(subset=["mean_energy"]).groupby("date", as_index=False)["mean_energy"].mean()
+        else:
+            labels = pd.DataFrame(columns=["date", "mean_energy"])
     else:
-        valid_train = pd.DataFrame()
+        labels = pd.DataFrame(columns=["date", "mean_energy"])
 
-    if len(valid_train) >= 2:
-        X = valid_train[feature_cols].to_numpy(dtype=float)
-        y = valid_train["mean_energy"].to_numpy(dtype=float) - 3.2
-        I_mat = np.eye(len(beta_0))
-        beta_map = np.linalg.solve(X.T @ X + lam * I_mat, X.T @ y + lam * beta_0)
-        model_mode = f"Bayesian MAP Ridge Model (Trained on {len(valid_train)} logged days + Biophysical Priors)"
-    else:
-        beta_map = beta_0.copy()
-        model_mode = f"Biophysical Prior Mode (Log 2+ days in {LOG_CSV} to adapt personal ML weights)"
+    label_map = dict(zip(labels["date"], labels["mean_energy"])) if not labels.empty else {}
+    preds, model_modes, training_counts, confidence_scores = [], [], [], []
+    val_errors, baseline_errors, validation_dates = [], [], []
 
-    X_all = df_feat[feature_cols].to_numpy(dtype=float)
-    raw_pred_centered = X_all @ beta_map
-    
-    # SCIENTIFIC REFINEMENT: The Homeostatic Intercept
-    homeostatic_intercept = 1.35 
-    
-    df_feat["pred_energy_1_5"] = np.clip(3.8 + raw_pred_centered, 1.0, 5.0)
-    df_feat["readiness_pct"] = np.clip(100.0 / (1.0 + np.exp(-1.45 * (raw_pred_centered + homeostatic_intercept))), 10.0, 99.0)
+    for i, row in df_feat.iterrows():
+        day = str(row["date"])
+        # Strict walk-forward: no label from this date or future dates can enter its fit.
+        prior_labels = labels[labels["date"] < day].copy() if not labels.empty else pd.DataFrame()
+        train_idx = [j for j in range(i) if str(df_feat.iloc[j]["date"]) in set(prior_labels["date"].astype(str))]
+        n_train = len(train_idx)
+        x_now = X_all[i]
+        if n_train >= min_personal_labels:
+            X_train = X_all[train_idx]
+            y_train = np.array([float(label_map[str(df_feat.iloc[j]["date"])]) for j in train_idx], dtype=float)
+            # Gaussian prior beta ~ N(beta_prior, lambda^-1 I); solve MAP in primal space.
+            lhs = X_train.T @ X_train + ridge_lambda * np.eye(X_train.shape[1])
+            rhs = X_train.T @ (y_train - target_center) + ridge_lambda * beta_prior
+            try:
+                beta = np.linalg.solve(lhs, rhs)
+            except np.linalg.LinAlgError:
+                beta = np.linalg.pinv(lhs) @ rhs
+            pred = target_center + float(x_now @ beta)
+            mode = f"Walk-forward Bayesian MAP ridge (past labels n={n_train}; λ={ridge_lambda:g})"
+            # Posterior coefficient covariance proxy and residual uncertainty.
+            fitted = target_center + X_train @ beta
+            resid = y_train - fitted
+            sigma = max(float(np.sqrt(np.mean(resid ** 2))) if len(resid) else 0.8, 0.35)
+            cov_beta = sigma ** 2 * np.linalg.pinv(lhs)
+            pred_sd = math.sqrt(max(float(x_now @ cov_beta @ x_now), 0.0) + sigma ** 2)
+            confidence = float(np.clip(100.0 * (n_train / (n_train + 12.0)) * (1.0 / (1.0 + pred_sd)), 0.0, 85.0))
+        else:
+            beta = beta_prior.copy()
+            pred = target_center + float(x_now @ beta)
+            mode = f"Mechanistic-prior mode (personal fit requires ≥{min_personal_labels} earlier labeled days; have {n_train})"
+            confidence = float(np.clip(15.0 + 4.5 * n_train, 10.0, 45.0))
+
+        pred = float(np.clip(pred, 1.0, 5.0))
+        preds.append(pred)
+        model_modes.append(mode)
+        training_counts.append(n_train)
+        confidence_scores.append(round(confidence, 1))
+
+        # Prequential evaluation: each observed label is scored only by a prediction made
+        # before that label was allowed into training.
+        if day in label_map:
+            actual = float(label_map[day])
+            val_errors.append(actual - pred)
+            if n_train:
+                previous_actuals = [float(label_map[str(df_feat.iloc[j]["date"])]) for j in train_idx]
+                baseline_pred = float(np.mean(previous_actuals)) if previous_actuals else target_center
+            else:
+                baseline_pred = target_center
+            baseline_errors.append(actual - baseline_pred)
+            validation_dates.append(day)
+
+    df_feat["pred_energy_1_5"] = np.asarray(preds, dtype=float)
+    # Linear mapping of the 1–5 self-report scale to an index; emphatically not probability.
+    df_feat["readiness_pct"] = np.clip((df_feat["pred_energy_1_5"] - 1.0) * 25.0, 0.0, 100.0)
+    df_feat["model_training_days"] = training_counts
+    df_feat["model_confidence_index"] = confidence_scores
+    df_feat["energy_model_mode"] = model_modes
 
     today = df_feat.iloc[-1]
-    readiness_score = float(today["readiness_pct"])
     energy_1_5 = float(today["pred_energy_1_5"])
+    readiness_score = float(today["readiness_pct"])
+    model_mode = str(today["energy_model_mode"])
 
     if readiness_score >= 70.0:
-        readiness_label, badge_color = "High (Optimal Peak)", "#10b981"
-    elif readiness_score >= 48.0:
-        readiness_label, badge_color = "Moderate", "#f59e0b"
+        readiness_label, badge_color = "Higher self-reported-energy estimate", "#10b981"
+    elif readiness_score >= 45.0:
+        readiness_label, badge_color = "Mid-range energy estimate", "#f59e0b"
     else:
-        readiness_label, badge_color = "Low (Recovery Priority)", "#ef4444"
+        readiness_label, badge_color = "Lower energy estimate", "#ef4444"
+
+    def finite_or(row, key, default=np.nan):
+        value = row.get(key, default)
+        return float(value) if value is not None and np.isfinite(value) else default
+
+    sleep_h = finite_or(today, "sleep_hrs")
+    rhr = finite_or(today, "rhr")
+    hrv = finite_or(today, "hrv")
+    timing = np.nan
+    if len(df_feat) >= 2 and np.isfinite(finite_or(today, "midpoint_hr")):
+        prior_mids = df_feat.iloc[:-1]["midpoint_hr"].dropna().to_numpy(dtype=float)
+        if len(prior_mids) >= 3:
+            aa = prior_mids * 2.0 * math.pi / 24.0
+            mean_angle = math.atan2(float(np.mean(np.sin(aa))), float(np.mean(np.cos(aa))))
+            timing = circular_distance_hours(finite_or(today, "midpoint_hr"), (mean_angle % (2*math.pi))*24/(2*math.pi))
 
     reasons = []
-    if today["sleep_hrs"] < mu_sleep - 0.35:
-        reasons.append(f"you slept less than your recent average ({today['sleep_hrs']:.1f} hrs vs. {mu_sleep:.1f} hrs baseline)")
-    elif today["sleep_hrs"] > mu_sleep + 0.35:
-        reasons.append(f"you slept more than your recent average ({today['sleep_hrs']:.1f} hrs vs. {mu_sleep:.1f} hrs baseline)")
+    reasons.append(
+        f"sleep duration was {sleep_h:.1f} hours" if np.isfinite(sleep_h)
+        else "sleep-duration data were unavailable"
+    )
+    reasons.append(
+        f"resting heart rate was {rhr:.0f} bpm" if np.isfinite(rhr)
+        else "a measured resting-heart-rate value was unavailable"
+    )
+    reasons.append(
+        f"HRV was {hrv:.0f} ms" if np.isfinite(hrv)
+        else "HRV data were unavailable"
+    )
+    if np.isfinite(timing):
+        reasons.append(f"sleep midpoint differed by about {timing*60:.0f} minutes from the past circular mean")
     else:
-        reasons.append(f"your sleep duration ({today['sleep_hrs']:.1f} hrs) is aligned with your personal average")
+        reasons.append("there are not yet enough earlier nights to estimate personal sleep-timing regularity")
+    diagnostic_text = (
+        f"Estimate based on {int(round(float(today['feature_coverage']) * len(feature_cols)))} of "
+        f"{len(feature_cols)} feature families. " + "; ".join(reasons) + ". "
+        "This is an exploratory personal model, not a clinical measurement."
+    )
 
-    if today["rhr"] > mu_rhr + 1.2:
-        reasons.append(f"your resting heart rate is higher than your personal baseline ({today['rhr']:.0f} bpm vs. {mu_rhr:.0f} bpm)")
-    elif today["rhr"] < mu_rhr - 1.2:
-        reasons.append(f"your resting heart rate is lower than your baseline ({today['rhr']:.0f} bpm vs. {mu_rhr:.0f} bpm, showing strong vagal recovery)")
+    wake_t = finite_or(today, "wake_hr", 7.5)
+    if not np.isfinite(wake_t) or not 4.0 <= wake_t <= 11.5:
+        wake_t = 7.5
+    sleep_for_curve = sleep_h if np.isfinite(sleep_h) else 7.5
+    midpoint_now = finite_or(today, "midpoint_hr", np.nan)
+    prior_mids = df_feat.iloc[:-1]["midpoint_hr"].dropna().to_numpy(dtype=float) if len(df_feat) > 1 else np.array([])
+    if len(prior_mids):
+        angles = prior_mids * 2.0 * math.pi / 24.0
+        mean_angle = math.atan2(float(np.mean(np.sin(angles))), float(np.mean(np.cos(angles)))
+        )
+        med_midpoint = (mean_angle % (2.0 * math.pi)) * 24.0 / (2.0 * math.pi)
     else:
-        reasons.append(f"your resting heart rate ({today['rhr']:.0f} bpm) is steady at your baseline")
-
-    if today["timing_dev_hrs"] > 0.65:
-        reasons.append(f"your recent sleep timing has been inconsistent (±{today['timing_dev_hrs']*60:.0f} mins shift in sleep midpoint)")
-    else:
-        reasons.append("your recent sleep timing has been consistent")
-
-    diagnostic_text = f"{reasons[0].capitalize()}. {reasons[1].capitalize()}, and {reasons[2]}."
-
-    wake_t = float(today["wake_hr"]) if 4.0 <= today["wake_hr"] <= 11.5 else 7.5
-    s0 = 0.85 * math.exp(-float(today["sleep_hrs"]) / 4.2)
-    jetlag_shift = float(today["midpoint_hr"] - med_midpoint)
-
-    hours_grid = [round(6.0 + 0.5 * i, 1) for i in range(37)]
+        med_midpoint = midpoint_now if np.isfinite(midpoint_now) else 4.0
+    jetlag_shift = circular_distance_hours(midpoint_now, med_midpoint) if np.isfinite(midpoint_now) else 0.0
+    # Process S/C display is a conceptual illustrative curve, not a fit of adenosine or SCN output.
+    s0 = 0.85 * math.exp(-sleep_for_curve / 4.2)
+    hours_grid = [round(6.0 + 0.5 * j, 1) for j in range(37)]
     alertness_curve, adenosine_curve, circadian_curve = [], [], []
-
-    for h in hours_grid:
-        t_awake = max(0.0, h - wake_t)
-        s_t = 1.0 - (1.0 - s0) * math.exp(-t_awake / 18.2)
-        phase = 2.0 * math.pi * (h - wake_t - jetlag_shift - 2.5) / 24.0
-        c_t = 0.55 + 0.32 * math.sin(phase) + 0.10 * math.sin(2.0 * phase)
-        post_lunch_dip = 0.18 * math.exp(-((h - 14.5) ** 2) / 1.8)
-        c_net = c_t - post_lunch_dip
-        ans_mod = (readiness_score - 65.0) / 100.0
-        e_t = 1.0 + 4.0 * np.clip(0.55 * (1.0 - s_t) + 0.45 * c_net + ans_mod, 0.05, 0.98)
-
-        alertness_curve.append(round(float(e_t), 2))
-        adenosine_curve.append(round(float(s_t * 5.0), 2))
+    for hour in hours_grid:
+        t_awake = max(0.0, hour - wake_t)
+        process_s = 1.0 - (1.0 - s0) * math.exp(-t_awake / 18.2)
+        phase = 2.0 * math.pi * (hour - wake_t - jetlag_shift - 2.5) / 24.0
+        process_c = 0.55 + 0.32 * math.sin(phase) + 0.10 * math.sin(2.0 * phase)
+        lunch_dip = 0.18 * math.exp(-((hour - 14.5) ** 2) / 1.8)
+        c_net = process_c - lunch_dip
+        energy_mod = (energy_1_5 - 3.0) / 5.0
+        alert = 1.0 + 4.0 * np.clip(0.55 * (1.0 - process_s) + 0.45 * c_net + energy_mod, 0.05, 0.98)
+        alertness_curve.append(round(float(alert), 2))
+        adenosine_curve.append(round(float(process_s * 5.0), 2))
         circadian_curve.append(round(float(np.clip(c_net * 5.0, 0.5, 5.0)), 2))
 
     pk_start = round(wake_t + 2.5, 1)
     pk_end = round(wake_t + 5.5, 1)
-    focus_window = f"Late Morning ({int(pk_start):02d}:{int((pk_start%1)*60):02d} – {int(pk_end):02d}:{int((pk_end%1)*60):02d})"
-    focus_reason = "Your homeostatic adenosine pressure (Process S) is near its daily minimum while your suprachiasmatic circadian alerting signal (Process C) crests before the afternoon dip."
+    focus_window = f"Illustrative late-morning window ({int(pk_start)%24:02d}:{int((pk_start%1)*60):02d} – {int(pk_end)%24:02d}:{int((pk_end%1)*60):02d})"
+    focus_reason = (
+        "The curve is a simplified Borbély-style Process S/Process C illustration. "
+        "Its parameters are not individually identified from your Watch data and it cannot measure your true alertness."
+    )
 
+    # Honest walk-forward metrics, including a naive historical-mean baseline.
+    if val_errors:
+        mae = float(np.mean(np.abs(val_errors)))
+        rmse = float(np.sqrt(np.mean(np.square(val_errors))))
+        base_mae = float(np.mean(np.abs(baseline_errors)))
+        base_rmse = float(np.sqrt(np.mean(np.square(baseline_errors))))
+        skill = float(1.0 - rmse / base_rmse) if base_rmse > 1e-9 else np.nan
+    else:
+        mae = rmse = base_mae = base_rmse = skill = np.nan
+    validation = {
+        "n_prequential": len(val_errors),
+        "dates": validation_dates,
+        "mae": None if not np.isfinite(mae) else round(mae, 3),
+        "rmse": None if not np.isfinite(rmse) else round(rmse, 3),
+        "baseline_mae": None if not np.isfinite(base_mae) else round(base_mae, 3),
+        "baseline_rmse": None if not np.isfinite(base_rmse) else round(base_rmse, 3),
+        "rmse_skill_vs_historical_mean": None if not np.isfinite(skill) else round(skill, 3),
+        "interpretation": "Prequential estimates; unstable at small N and not external validation.",
+    }
+
+    # Preserve the existing dashboard's return contract so the UI remains compatible.
     return {
         "readiness_score": round(readiness_score, 1),
         "energy_1_5": round(energy_1_5, 2),
@@ -1092,8 +1441,15 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
         "adenosine_curve": adenosine_curve,
         "circadian_curve": circadian_curve,
         "feature_names": feature_names_plain,
-        "feature_weights": [round(float(w), 3) for w in beta_map],
+        # Legacy six-feature simulator contract is retained so the existing HTML controls stay valid.
+        "feature_weights": [0.42, -0.30, -0.36, 0.38, 0.18, 0.15],
+        "model_feature_weights": [round(float(w), 3) for w in beta],
+        "model_feature_names": feature_names_plain,
         "df_feat": df_feat,
+        "model_confidence": float(today["model_confidence_index"]),
+        "training_days": int(today["model_training_days"]),
+        "walk_forward_validation": validation,
+        "readiness_interpretation": "0–100 index linearly mapped from predicted 1–5 self-reported energy; not a probability.",
     }
 
 # === END OF PART 1 OF 2 (PASTE PART 2 DIRECTLY BELOW THIS LINE) ===
@@ -1650,7 +2006,7 @@ def build_body_scene(df_raw, pred_bundle, stress_bundle, sleep_bundle):
          "v": f"{stress_bundle['today_likelihood']}", "u": "% stress", "s": f"Energy {pred_bundle['readiness_score']}% · Sleep {sleep_bundle['latest_quality']}%",
          "tag": f"{stress_bundle['stress_label']}", "tagColor": stress_bundle["stress_color"],
          "rows": [["Stress load", f"{stress_bundle['today_likelihood']}% ({stress_bundle['stress_label']})"],
-                  ["Energy readiness", f"{pred_bundle['readiness_score']}% ({pred_bundle['readiness_label']})"],
+                  ["Energy readiness index", f"{pred_bundle['readiness_score']}% ({pred_bundle['readiness_label']})"],
                   ["Sleep recovery", f"{sleep_bundle['latest_quality']}% ({sleep_bundle['quality_label']})"],
                   ["Best focus time", best_focus]],
          "note": "Stress, energy and sleep scores are estimated from your heart rate, HRV and movement. The Watch does not measure the brain directly."},
@@ -1697,7 +2053,7 @@ def build_body_scene(df_raw, pred_bundle, stress_bundle, sleep_bundle):
 
     scores = (
         f"<div class='bs-score' style='--c:{pred_bundle['badge_color']}'><div class='n'>{pred_bundle['readiness_score']}<small>%</small></div>"
-        f"<div><div class='l'>Energy readiness</div><span class='badge'>{pred_bundle['readiness_label']}</span></div></div>"
+        f"<div><div class='l'>Energy readiness index</div><span class='badge'>{pred_bundle['readiness_label']}</span></div></div>"
         f"<div class='bs-score' style='--c:{stress_bundle['stress_color']}'><div class='n'>{stress_bundle['today_likelihood']}<small>%</small></div>"
         f"<div><div class='l'>Stress load</div><span class='badge'>{stress_bundle['stress_label']}</span></div></div>"
         f"<div class='bs-score' style='--c:{sleep_bundle['quality_color']}'><div class='n'>{sleep_bundle['latest_quality']}<small>%</small></div>"
