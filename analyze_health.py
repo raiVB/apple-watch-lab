@@ -1263,7 +1263,26 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
         day = str(row["date"])
         # Strict walk-forward: no label from this date or future dates can enter its fit.
         prior_labels = labels[labels["date"] < day].copy() if not labels.empty else pd.DataFrame()
-        train_idx = [j for j in range(i) if str(df_feat.iloc[j]["date"]) in set(prior_labels["date"].astype(str))]
+        
+# Robustly handle an empty diary-label DataFrame.
+# No previous labels means no supervised training rows;
+# the predictor should fall back to its prior-only mode.
+if (
+    isinstance(prior_labels, pd.DataFrame)
+    and "date" in prior_labels.columns
+):
+    prior_label_dates = set(
+        prior_labels["date"].dropna().astype(str)
+    )
+else:
+    prior_label_dates = set()
+
+train_idx = [
+    j
+    for j in range(i)
+    if str(df_feat.iloc[j]["date"]) in prior_label_dates
+]
+
         n_train = len(train_idx)
         x_now = X_all[i]
         if n_train >= min_personal_labels:
