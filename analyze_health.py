@@ -154,8 +154,15 @@ def subspace_mahalanobis_d2(z_vec, R_prior):
     z_sub = np.array([float(z_vec[i]) for i in valid_idx], dtype=float)
     R_sub = R_prior[np.ix_(valid_idx, valid_idx)]
     R_reg = 0.85 * R_sub + 0.15 * np.eye(k)
-    inv_R_z = np.linalg.solve(R_reg, z_sub)
-    d2 = float(z_sub.T @ inv_R_z)
+    
+    # Deep Fix 25: Prevent Singular Matrix HTTP 500 Crashes
+    try:
+        inv_R_z = np.linalg.solve(R_reg, z_sub)
+        d2 = float(z_sub.T @ inv_R_z)
+    except np.linalg.LinAlgError:
+        # Fallback to unweighted Euclidean distance squared if covariance matrix is ill-conditioned
+        d2 = float(np.sum(z_sub ** 2))
+        
     return max(0.0, d2), k
 
 
