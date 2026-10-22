@@ -1354,7 +1354,7 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
         })
 
     df_nights = pd.DataFrame(night_records)
-    df_nights.to_csv("sleep_360_diary.csv", index=False)
+    # df_nights.to_csv("sleep_360_diary.csv", index=False)  # Disabled for cloud deployment
 
     # --- PART B: CIRCULAR CLOCK CONSISTENCY & SOCIAL JETLAG ---
     mean_onset, sd_onset, reg_onset = circular_clock_stats(df_nights["onset_hr"].tolist())
@@ -1500,7 +1500,7 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
             "badge_col": badge_col,
         })
 
-    pd.DataFrame(experiment_results).to_csv(EXP_CSV, index=False)
+    # pd.DataFrame(experiment_results).to_csv(EXP_CSV, index=False)  # Disabled for cloud deployment
 
     # Generate Personalized Experiment Recommendations Based on Data Gaps
     recommendations = []
@@ -3240,6 +3240,10 @@ if (typeof initBodyScene === 'function') initBodyScene();
           b.innerText = 'Needs Data';
           b.style.setProperty('--c', C.warn);
           m.innerHTML = data.detail + ' Open this dashboard in a Private/Incognito window to log more check-ins.';
+        }} else if (data.status === 'not_evaluable_model_not_connected') {{
+          b.innerText = 'Model Disconnected';
+          b.style.setProperty('--c', C.dim);
+          m.innerHTML = data.reason;
         }} else if (data.status === 'validation_complete') {{
           b.innerText = 'N = ' + data.n_samples_tested + ' Check-ins';
           b.style.setProperty('--c', C.energy);
@@ -4008,12 +4012,7 @@ async function uploadEcgJsonFile(input) {{
 
     with open("biometric_science_lab.html", "w", encoding="utf-8") as f:
         f.write(html)
-    abs_path = os.path.abspath(HTML_DASHBOARD)
-    print(f"[6/6] Launching Unified 3-Activity Biometric Science Lab: {abs_path}")
-    try:
-        os.startfile(abs_path)
-    except AttributeError:
-        webbrowser.open("file://" + abs_path)
+    print("[6/6] Unified 3-Activity Biometric Science Lab HTML generated.")
 
 
 if __name__ == "__main__":
