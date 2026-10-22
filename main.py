@@ -375,11 +375,16 @@ def serve_cockpit(request: Request):
                 if d_str in att_dict:
                     row["calendar_event"] = "Classes: " + ", ".join(att_dict[d_str])
             
-    log_df = pd.DataFrame(log_rows) if log_rows else pd.DataFrame(columns=[
+    # Deep Fix 26: Provide exact exhaustive schema to prevent Sleep Lab KeyErrors
+    exhaustive_columns = [
         "date", "energy_morning", "energy_afternoon", "energy_evening",
         "study_hours", "productivity_rating", "best_focus_window",
         "stress_rating", "mood_rating", "workload_rating", "caffeine_cups", "calendar_event",
-    ])
+        "caffeine_cutoff_hr", "screen_off_mins", "last_meal_hrs_before_bed", 
+        "nap_mins", "bedtime_routine", "experiment_name", "experiment_phase"
+    ]
+    
+    log_df = pd.DataFrame(log_rows, columns=exhaustive_columns) if log_rows else pd.DataFrame(columns=exhaustive_columns)
 
     stress_bundle = analyze_health.compute_stress_detective_engine(df_raw, df_sleep, [], log_df)
     pred_bundle = analyze_health.compute_energy_predictor_engine(df_raw, df_sleep, log_df)
