@@ -1526,14 +1526,15 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
         )
 
     latest_n = df_nights.iloc[-1]
-    slp_q = latest_n["sleep_quality_score"] if latest_n["sleep_quality_score"] is not None else 74.0
-    if slp_q >= 75.0:
+    slp_q = latest_n["sleep_quality_score"]
+    if pd.isna(slp_q):
+        slp_label, slp_col = "No Sleep Data", "#8c95a6"
+    elif slp_q >= 75.0:
         slp_label, slp_col = "Restorative & Phase-Aligned", "#10b981"
     elif slp_q >= 55.0:
         slp_label, slp_col = "Moderate Restoration", "#f59e0b"
     else:
         slp_label, slp_col = "Fragmented / Recovery Debt", "#ef4444"
-
     return {
         "latest_quality": round(float(slp_q), 1),
         "quality_label": slp_label,
