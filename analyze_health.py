@@ -848,7 +848,13 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
             z_sub = np.array([float(z_vec[i]) for i in valid_idx])
             w_sub = prior_w[valid_idx]
             R_sub = 0.85 * R_prior_8x8[np.ix_(valid_idx, valid_idx)] + 0.15 * np.eye(len(valid_idx))
-            w_ortho = np.linalg.solve(R_sub, w_sub)
+            
+            # Deep Fix 29: Protect the secondary Mahalanobis solver from Singular Matrix crashes
+            try:
+                w_ortho = np.linalg.solve(R_sub, w_sub)
+            except np.linalg.LinAlgError:
+                w_ortho = w_sub # Fall back to raw priors if collinearity destroys the matrix rank
+                
             stress_logit = float(w_ortho.T @ z_sub)
             stress_likelihood = float(np.clip(100.0 / (1.0 + math.exp(-1.25 * stress_logit)), 8.0, 98.0))
         else:
@@ -1006,7 +1012,9 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
         log_clean["date"] = log_clean["date"].astype(str)
         log_clean["mean_energy"] = log_clean[["energy_morning", "energy_afternoon", "energy_evening"]].mean(axis=1)
         merged = pd.merge(df_feat, log_clean, on="date", how="left")
-        valid_train = merged.dropna(subset=["mean_energy"])
+        
+        # Deep Fix 27: Prevent Linear Algebra crashes by ensuring no NaNs enter the X feature matrix
+        valid_train = merged.dropna(subset=["mean_energy"] + feature_cols)
     else:
         valid_train = pd.DataFrame()
 
@@ -1020,7 +1028,8 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
         beta_map = beta_0.copy()
         model_mode = f"Biophysical Prior Mode (Log 2+ days in {LOG_CSV} to adapt personal ML weights)"
 
-    X_all = df_feat[feature_cols].to_numpy(dtype=float)
+    # Deep Fix 28: Prevent NaN matrix poisoning by imputing missing Z-scores to their mathematical origin (Z=0.0)
+    X_all = df_feat[feature_cols].fillna(0.0).to_numpy(dtype=float)
     raw_pred_centered = X_all @ beta_map
     
     # SCIENTIFIC REFINEMENT: The Homeostatic Intercept
