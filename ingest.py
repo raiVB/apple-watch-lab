@@ -121,9 +121,10 @@ def _compact(item):
     if isinstance(item.get("value"), str) or any(k in item for k in ("deep", "rem", "core", "asleep")):
         return item  # sleep-like record: keep whole (there are only a few)
     ds = item.get("date") or item.get("startDate")
+    src = item.get("source") or item.get("sourceName")
     for k in VALUE_KEYS:
         if item.get(k) is not None:
-            return (ds, item[k])
+            return (ds, item[k], src)
     return None
 
 
@@ -144,7 +145,7 @@ def iter_items(fileobj):
         if rest == "":
             if event in ("start_map", "end_map"):
                 for b in buf:  # group finished: release anything that was waiting for its name
-                    yield name, units, ({"date": b[0], "qty": b[1]} if isinstance(b, tuple) else b)
+                    yield name, units, ({"date": b[0], "qty": b[1], "source": b[2]} if isinstance(b, tuple) else b)
                 name = units = ""
                 got_name = got_units = False
                 buf = []
@@ -182,7 +183,8 @@ class Ingestor:
         if not name:
             self.unnamed += 1
             return
-        key = name.strip().lower().replace(" ", "_")
+        norm = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name.strip())
+        key = norm.lower().replace(" ", "_").replace("-", "_")
         if "sleep" in key:
             self._sleep(item)
             return
@@ -197,6 +199,9 @@ class Ingestor:
         if val is None:
             return
         metric = METRIC_MAP.get(key, name.strip())
+        src = item.get("source") or item.get("sourceName") or ""
+        if metric in SUM_METRICS and src and "watch" not in str(src).lower():
+            return
         try:
             val = float(val)
             dt = parse_ts(ds)
@@ -204,10 +209,22 @@ class Ingestor:
             return
         if dt is None or val != val:   # unparseable timestamp or NaN value: skip it, never crash the upload
             return
-        if metric == "WalkingSpeed" and "m/s" in units: val *= 3.6
-        elif metric == "WalkingStepLength" and units == "m": val *= 100.0
-        elif metric == "DistanceWalkingRunning" and units == "m": val /= 1000.0
-        elif metric in PCT_METRICS and val <= 1.0: val *= 100.0
+        u_low = str(units or "").strip().lower()
+        if metric == "WalkingSpeed" and "m/s" in u_low:
+            val *= 3.6
+            units = "km/h"
+        elif metric == "WalkingStepLength" and u_low == "m":
+            val *= 100.0
+            units = "cm"
+        elif metric == "DistanceWalkingRunning" and u_low == "m":
+            val /= 1000.0
+            units = "km"
+        elif metric in ("ActiveEnergyBurned", "BasalEnergyBurned") and u_low == "kj":
+            val /= 4.184
+            units = "kcal"
+        elif metric in PCT_METRICS and val <= 1.0:
+            val *= 100.0
+            units = "%"
 
         bk = (metric, int(to_epoch(dt) // 300))
         b = self.bins.get(bk)
@@ -229,6 +246,9 @@ class Ingestor:
             }
           
     def _sleep(self, item):
+        raw_val_check = str(item.get("value") or item.get("stage") or "").strip().lower()
+        if any(ib in raw_val_check for ib in ("inbed", "in_bed", "in bed")):
+            return
         # Normalise to IST wall-clock so sleep timing lines up with the IST-based 5-minute records.
         s19 = ist_str(item.get("start") or item.get("startDate")) if (item.get("start") or item.get("startDate")) else ""
         e19 = ist_str(item.get("end") or item.get("endDate")) if (item.get("end") or item.get("endDate")) else ""
@@ -237,7 +257,7 @@ class Ingestor:
             for ks, ke in (("start", "end"), ("startDate", "endDate")):
                 if item.get(ks): item[ks] = s19
                 if item.get(ke): item[ke] = e19
-        d = (s19 or str(item.get("date") or item.get("sleepEnd") or ""))[:10]
+        d = (e19 or s19 or str(item.get("date") or item.get("sleepEnd") or ""))[:10]
         if self.keep_from and d and d < self.keep_from:
             return
         if s19 and e19:
