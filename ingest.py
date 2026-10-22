@@ -206,11 +206,53 @@ class Ingestor:
             return
         try:
             val = float(val)
-            dt = parse_ts(ds)
+            s_dt = parse_ts(item.get("startDate") or item.get("date"))
+            e_dt = parse_ts(item.get("endDate") or item.get("date"))
         except (ValueError, TypeError):
             return
-        if dt is None or val != val:   # unparseable timestamp or NaN value: skip it, never crash the upload
+        if s_dt is None or e_dt is None or val != val:
             return
+            
+        u_low = str(units or "").strip().lower()
+        if metric == "WalkingSpeed" and "m/s" in u_low:
+            val *= 3.6
+            units = "km/h"
+        elif metric == "WalkingStepLength" and u_low == "m":
+            val *= 100.0
+            units = "cm"
+        elif metric == "DistanceWalkingRunning" and u_low == "m":
+            val /= 1000.0
+            units = "km"
+        elif metric in ("ActiveEnergyBurned", "BasalEnergyBurned") and u_low == "kj":
+            val /= 4.184
+            units = "kcal"
+        elif metric in PCT_METRICS and val <= 1.0:
+            val *= 100.0
+            units = "%"
+
+        # Deep Fix 22: Fractional Distribution across 5-minute boundaries
+        duration_sec = (e_dt - s_dt).total_seconds()
+        if duration_sec > 300 and metric in SUM_METRICS:
+            rate = val / duration_sec
+            curr_t = to_epoch(s_dt)
+            end_t = to_epoch(e_dt)
+            while curr_t < end_t:
+                ep = int(curr_t // 300)
+                next_bound = (ep + 1) * 300
+                chunk_end = min(end_t, next_bound)
+                chunk_dur = chunk_end - curr_t
+                chunk_val = rate * chunk_dur
+                
+                bk = (metric, ep)
+                if bk not in self.bins:
+                    self.bins[bk] = [0.0, 0, units]
+                self.bins[bk][0] += chunk_val
+                self.bins[bk][1] += 1
+                curr_t = chunk_end
+            return
+
+        # Normal single-bin insertion
+        dt = s_dt
         u_low = str(units or "").strip().lower()
         if metric == "WalkingSpeed" and "m/s" in u_low:
             val *= 3.6
