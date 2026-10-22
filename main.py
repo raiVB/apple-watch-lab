@@ -348,11 +348,7 @@ def serve_cockpit(request: Request):
     sleep_bundle = analyze_health.compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle, pred_bundle)
     sleep_bundle["diary_rows"] = clean_nans(sleep_bundle["diary_rows"])
 
-    with RENDER_LOCK:
-        analyze_health.build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=df_raw_sleep)
-        with open("biometric_science_lab.html", "r", encoding="utf-8") as f:
-            html = f.read()
-
+    html = analyze_health.build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=df_raw_sleep)
     return HTMLResponse(content=html)
 
 @app.get("/api/backtest/readiness")
