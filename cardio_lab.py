@@ -1422,16 +1422,21 @@ def detect_cardio_anomalies(
         else:
             rms_m = 0.0
 
-        # Train only on previous dates' already-causal z-vectors.
+        # Ensure we only pass highly complete vectors to the Isolation Forest to prevent zero-imputation bias.
         current_vector = [float(z) if z is not None else 0.0 for z in z_values]
-        if len(historical_vectors) >= 6:
-            score_arr = _numpy_isolation_forest_train_test_scores(
-                np.asarray(historical_vectors, dtype=float),
-                np.asarray([current_vector], dtype=float),
-                n_trees=50,
-                seed=42,
-            )
-            if_score = float(score_arr[0]) if len(score_arr) else float("nan")
+        if len(historical_vectors) >= 6 and k_obs >= 3:
+            # We only train/score on the subset of historical days that also met the high-coverage requirement
+            valid_hist = [v for v in historical_vectors if sum(1 for x in v if x != 0.0) >= 3]
+            if len(valid_hist) >= 6:
+                score_arr = _numpy_isolation_forest_train_test_scores(
+                    np.asarray(valid_hist, dtype=float),
+                    np.asarray([current_vector], dtype=float),
+                    n_trees=50,
+                    seed=42,
+                )
+                if_score = float(score_arr[0]) if len(score_arr) else float("nan")
+            else:
+                if_score = float("nan")
         else:
             if_score = float("nan")
 
