@@ -337,7 +337,36 @@ def serve_cockpit(request: Request):
     raw_rows = list(db.sleep_raw.find({"d": {"$gte": cutoff}}, {"_id": 0}))
     df_raw_sleep = pd.DataFrame(raw_rows) if raw_rows else None
 
-    log_df = pd.DataFrame(columns=[
+    # Deep Fix 21: Wire psych_checkins to the Bayesian Energy Predictor
+    checkins = list(db.psych_checkins.find({"skipped": False, "server_timestamp_ist": {"$gte": cutoff}}, {"_id": 0}))
+    log_rows = []
+    if checkins:
+        df_c = pd.DataFrame(checkins)
+        df_c["dt"] = pd.to_datetime(df_c["server_timestamp_ist"])
+        df_c["date"] = df_c["dt"].dt.strftime("%Y-%m-%d")
+        df_c["hour"] = df_c["dt"].dt.hour
+        
+        # Map 0-4 Arousal scale to 1-5 Energy Predictor scale
+        df_c["energy"] = pd.to_numeric(df_c["arousal"], errors="coerce") + 1.0
+        
+        for d_str, grp in df_c.groupby("date"):
+            e_m = grp[grp["hour"] < 12]["energy"].mean()
+            e_a = grp[(grp["hour"] >= 12) & (grp["hour"] < 17)]["energy"].mean()
+            e_e = grp[grp["hour"] >= 17]["energy"].mean()
+            day_mean = grp["energy"].mean()
+            
+            log_rows.append({
+                "date": d_str,
+                "energy_morning": e_m if not pd.isna(e_m) else day_mean,
+                "energy_afternoon": e_a if not pd.isna(e_a) else day_mean,
+                "energy_evening": e_e if not pd.isna(e_e) else day_mean,
+                "study_hours": np.nan, "productivity_rating": np.nan, 
+                "best_focus_window": np.nan, "stress_rating": np.nan, 
+                "mood_rating": np.nan, "workload_rating": np.nan, 
+                "caffeine_cups": np.nan, "calendar_event": np.nan
+            })
+            
+    log_df = pd.DataFrame(log_rows) if log_rows else pd.DataFrame(columns=[
         "date", "energy_morning", "energy_afternoon", "energy_evening",
         "study_hours", "productivity_rating", "best_focus_window",
         "stress_rating", "mood_rating", "workload_rating", "caffeine_cups", "calendar_event",
