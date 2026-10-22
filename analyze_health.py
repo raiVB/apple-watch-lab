@@ -4010,9 +4010,8 @@ async function uploadEcgJsonFile(input) {{
 </body>
 </html>"""
 
-    with open("biometric_science_lab.html", "w", encoding="utf-8") as f:
-        f.write(html)
     print("[6/6] Unified 3-Activity Biometric Science Lab HTML generated.")
+    return html
 
 
 if __name__ == "__main__":
