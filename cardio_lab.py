@@ -1586,6 +1586,11 @@ def analyze_exercise_recovery(df_raw: pd.DataFrame) -> Dict[str, Any]:
         hr=("value", "mean"), ts=("timestamp", "first"), date=("date", "first")
     ).sort_index()
     steps_df = df_raw[df_raw["metric"] == "StepCount"].groupby("epoch_5m")["value"].sum()
+    
+    # Cast to strict integers to prevent floating-point hash lookup failures
+    ex_df.index = ex_df.index.astype("int64")
+    hr_df.index = hr_df.index.astype("int64")
+    steps_df.index = steps_df.index.astype("int64")
 
     if hr_df.empty or ex_df.empty:
         return {"bouts": [], "hrr_1min_summary": hrr_summary}
