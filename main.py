@@ -355,16 +355,25 @@ def serve_cockpit(request: Request):
             e_e = grp[grp["hour"] >= 17]["energy"].mean()
             day_mean = grp["energy"].mean()
             
-            log_rows.append({
-                "date": d_str,
-                "energy_morning": e_m if not pd.isna(e_m) else day_mean,
-                "energy_afternoon": e_a if not pd.isna(e_a) else day_mean,
-                "energy_evening": e_e if not pd.isna(e_e) else day_mean,
-                "study_hours": np.nan, "productivity_rating": np.nan, 
-                "best_focus_window": np.nan, "stress_rating": np.nan, 
-                "mood_rating": np.nan, "workload_rating": np.nan, 
-                "caffeine_cups": np.nan, "calendar_event": np.nan
-            })
+            # Deep Fix 24: Bridge Class Attendance into the Stress Detective Context
+        attendance = list(db.class_attendance.find({"server_timestamp_ist": {"$gte": cutoff}}, {"_id": 0}))
+        if attendance:
+            # Group classes by date to form a daily context string
+            att_dict = {}
+            for doc in attendance:
+                # class_id is formatted as 'YYYY-MM-DD|Subject'
+                parts = str(doc.get("class_id", "")).split("|")
+                if len(parts) == 2:
+                    d_str, subj = parts[0], parts[1]
+                    status = doc.get("status", "")
+                    entry = f"{subj} ({status})"
+                    att_dict.setdefault(d_str, []).append(entry)
+            
+            # Map into log_rows
+            for row in log_rows:
+                d_str = row["date"]
+                if d_str in att_dict:
+                    row["calendar_event"] = "Classes: " + ", ".join(att_dict[d_str])
             
     log_df = pd.DataFrame(log_rows) if log_rows else pd.DataFrame(columns=[
         "date", "energy_morning", "energy_afternoon", "energy_evening",
