@@ -360,6 +360,9 @@ def analyze_export(xml_path):
                     if short_type == "WalkingSpeed" and unit == "m/s":
                         val *= 3.6
                         unit = "km/h"
+                    elif short_type in ("ActiveEnergyBurned", "BasalEnergyBurned") and str(unit).lower() == "kj":
+                        val /= 4.184
+                        unit = "kcal"
                     elif short_type == "WalkingStepLength" and unit == "m":
                         val *= 100.0
                         unit = "cm"
@@ -1242,8 +1245,9 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
 
         # Daytime HR for Nocturnal Dip %
         day_hr_sub = df_raw[(df_raw["date"] == prev_d) & (df_raw["metric"] == "HeartRate") & (df_raw["hour"] >= 10.0) & (df_raw["hour"] <= 20.0)]["value"]
-        if not day_hr_sub.empty and not pd.isna(mean_ov_hr):
-            nocturnal_dip_pct = round((1.0 - mean_ov_hr / float(day_hr_sub.mean())) * 100.0, 1)
+        day_mean = float(day_hr_sub.mean()) if not day_hr_sub.empty else np.nan
+        if not pd.isna(day_mean) and day_mean > 10.0 and not pd.isna(mean_ov_hr):
+            nocturnal_dip_pct = round((1.0 - mean_ov_hr / day_mean) * 100.0, 1)
         else:
             nocturnal_dip_pct = np.nan
 
