@@ -104,7 +104,8 @@ def ensure_indexes_once():
 
 
 ensure_indexes_once()
-
+# Run Cardio Lab mathematical self-tests once at boot
+CARDIO_SELF_TEST_RESULTS = cardio_lab.run_cardio_lab_self_tests()
 
 def check_token(request: Request):
     if WEBHOOK_TOKEN and not secrets.compare_digest(request.query_params.get("token", ""), WEBHOOK_TOKEN):
@@ -693,7 +694,7 @@ def get_cardio_lab_overview(request: Request):
     recovery_bundle = cardio_lab.analyze_exercise_recovery(df_raw)
     multimodal_bundle = cardio_lab.run_multimodal_research_and_protocol(df_raw, df_sleep, ecg_docs)
     protocol_logs = list(db.ecg_protocol_logs.find({}, {"_id": 0}).sort([("server_timestamp", -1)]).limit(30))
-    self_tests = cardio_lab.run_cardio_lab_self_tests()
+    self_tests = CARDIO_SELF_TEST_RESULTS
 
     return clean_nans({
         "ecg_count": len(ecg_docs),
