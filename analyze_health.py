@@ -2354,6 +2354,15 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         if is_summary_night:
             rows = [(k, None, None, mins_by[k]) for k in ORDER if mins_by[k] > 0]
         else:
+            # Deep Fix 23: Anchor base_day to Noon of the biological waking day to fix Plotly phase shifts
+            first_dt = night["start"].min()
+            base_day = first_dt.replace(hour=12, minute=0, second=0, microsecond=0)
+            if first_dt.hour < 12:
+                base_day -= pd.Timedelta(days=1)
+                
+            night["x0"] = (night["start"] - base_day).dt.total_seconds() / 3600
+            night["x1"] = (night["end"] - base_day).dt.total_seconds() / 3600
+
             rows = [(r.key, float(r.x0), float(r.x1), float(r.mins)) for r in night.itertuples()]
             stage_blocks = [{"key": k, "stage": STAGES[k][1], "x0": round(a, 4), "x1": round(b, 4), "mins": int(round(m))} for k, a, b, m in rows]
 
