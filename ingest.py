@@ -81,9 +81,11 @@ def parse_ts(s):
         # Health Auto Export default: "2026-10-18 23:58:00 +0530". Python < 3.11 cannot parse the
         # space before the offset (or a bare +0530), so normalise it to "+05:30" and retry.
         m = _OFFSET_FIX.search(s_str)
-        if m and len(s_str) > 19:
-            s_str = s_str[:m.start()] + f"{m.group(1)}{m.group(2)}:{m.group(3)}"
-            return datetime.fromisoformat(s_str.replace(" ", "T", 1))
+        if m:
+            # Safely rebuild standard ISO format without hardcoded index slicing
+            core = s_str[:m.start()].strip().replace(" ", "T")
+            tz = f"{m.group(1)}{m.group(2)}:{m.group(3)}"
+            return datetime.fromisoformat(f"{core}{tz}")
         return None
     except (ValueError, TypeError):
         return None
