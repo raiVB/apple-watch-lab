@@ -1155,7 +1155,29 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
 
     wake_t = float(today["wake_hr"]) if 4.0 <= today["wake_hr"] <= 11.5 else 7.5
     s0 = 0.85 * math.exp(-float(today["sleep_hrs"]) / 4.2)
-    jetlag_shift = float(today["midpoint_hr"] - med_midpoint)
+    # Render hotfix: calculate a causal circular sleep-midpoint baseline locally.
+    # The previous code referenced `med_midpoint` without defining it in this function.
+    midpoint_now = pd.to_numeric(pd.Series([today.get("midpoint_hr")]), errors="coerce").iloc[0]
+    prior_mids = pd.to_numeric(
+        df_feat.iloc[:-1]["midpoint_hr"], errors="coerce"
+    ).dropna().to_numpy(dtype=float) if len(df_feat) > 1 else np.array([], dtype=float)
+    prior_mids = prior_mids[np.isfinite(prior_mids)]
+
+    if len(prior_mids):
+        angles = prior_mids * (2.0 * math.pi / 24.0)
+        mean_angle = math.atan2(
+            float(np.mean(np.sin(angles))),
+            float(np.mean(np.cos(angles))),
+        )
+        med_midpoint = (mean_angle % (2.0 * math.pi)) * 24.0 / (2.0 * math.pi)
+    else:
+        med_midpoint = float(midpoint_now) if pd.notna(midpoint_now) and np.isfinite(midpoint_now) else 4.0
+
+    if pd.notna(midpoint_now) and np.isfinite(midpoint_now):
+        # Signed shortest circular difference, constrained to [-12, 12) hours.
+        jetlag_shift = float((float(midpoint_now) - med_midpoint + 12.0) % 24.0 - 12.0)
+    else:
+        jetlag_shift = 0.0
 
     hours_grid = [round(6.0 + 0.5 * i, 1) for i in range(37)]
     alertness_curve, adenosine_curve, circadian_curve = [], [], []
