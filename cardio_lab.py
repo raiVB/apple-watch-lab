@@ -960,12 +960,8 @@ def compute_ecg_hrv_metrics(
         "mean_nn_ms": round(mean_nn, 1),
         "median_nn_ms": round(median_nn, 1),
         "iqr_nn_ms": round(iqr_nn, 1),
-        # Explicit source/metric labels prevent confusion with background optical PPG HRV.
         "sdnn_ms": round(sdnn, 2),
-        "sdnn_label": "SDNN (ms) — Lead-I ECG",
         "rmssd_ms": round(rmssd, 2),
-        "rmssd_label": "RMSSD (ms) — Lead-I ECG",
-        "hrv_source": "Single-lead Lead-I ECG; artifact-cleaned NN intervals",
         "ln_rmssd": round(ln_rmssd, 3),
         "pnn50_pct": round(pnn50, 1),
         "sd1_ms": round(sd1, 2),
@@ -1074,27 +1070,43 @@ def ingest_ecg_from_json_file(file_path: str, db) -> Dict[str, Any]:
 # MODULE D: LONGITUDINAL PERSONAL CARDIOVASCULAR BASELINE (ROBUST STATS)
 # ==============================================================================
 
-def robust_z_score(val: float, series_vals: List[float], min_scale: float = 1.0) -> Tuple[Optional[float], float, float]:
+def robust_z_score(
+    val: float,
+    series_vals: List[float],
+    min_scale: float = 1.0,
+    window_days: int = 28,
+) -> Tuple[Optional[float], float, float]:
     """
-    Computes standardized robust deviation:
-      z_robust = 0.6745 * (x - median) / MAD
-    Safely handles MAD = 0 or small sample sizes using IQR fallback (0.7413 * IQR) and min_scale floor.
+    Causal robust Z-score from prior observations only. Callers must pass values
+    strictly earlier than the scored day; this helper limits the baseline to the
+    most recent 28 supplied observations (the caller applies calendar-date filtering).
+    MAD/IQR degeneracy is bounded by a physiological min_scale floor.
     Returns (z_robust, median_val, mad_val).
     """
-    clean = [float(x) for x in series_vals if x is not None and not pd.isna(x)]
-    if val is None or pd.isna(val) or len(clean) < 3:
-        med = float(np.median(clean)) if clean else np.nan
-        return None, med, 0.0
+    clean = []
+    for x in series_vals:
+        try:
+            xf = float(x)
+            if math.isfinite(xf):
+                clean.append(xf)
+        except (TypeError, ValueError):
+            continue
 
-    arr = np.array(clean, dtype=float)
+    # Guard against accidental full-history inputs and keep the baseline bounded.
+    clean = clean[-max(1, int(window_days)):]
+    if val is None or pd.isna(val) or not math.isfinite(float(val)) or len(clean) < 3:
+        med = float(np.median(clean)) if clean else np.nan
+        return None, round(med, 2) if math.isfinite(med) else med, 0.0
+
+    arr = np.asarray(clean, dtype=float)
     med = float(np.median(arr))
     mad = float(np.median(np.abs(arr - med)))
-    eff_sd = mad / 0.6745
-    if eff_sd < 1e-6:
+    scale = mad / 0.6745
+    if scale < 1e-9:
         iqr = float(np.percentile(arr, 75) - np.percentile(arr, 25))
-        eff_sd = iqr * 0.7413
-    eff_sd = max(eff_sd, min_scale)
-    z_rob = (float(val) - med) / eff_sd
+        scale = 0.7413 * iqr
+    scale = max(float(min_scale), scale)
+    z_rob = (float(val) - med) / scale
     return round(z_rob, 2), round(med, 2), round(mad, 2)
 
 
@@ -1151,7 +1163,7 @@ def compute_longitudinal_baseline(
     """
     candidate_sensors = [
         ("RestingHeartRate", "Resting Heart Rate", "bpm", 2.0),
-        ("HeartRateVariabilitySDNN", "SDNN (ms) — Optical PPG", "ms", 5.0),
+        ("HeartRateVariabilitySDNN", "Apple Health PPG HRV (SDNN)", "ms", 5.0),
         ("HeartRate", "Passive Heart Rate", "bpm", 3.0),
         ("RespiratoryRate", "Sleeping Respiratory Rate", "breaths/min", 0.8),
         ("AppleSleepingWristTemperature", "Sleeping Wrist Temp", "°C", 0.15),
@@ -1189,9 +1201,20 @@ def compute_longitudinal_baseline(
             continue
 
         daily_agg = sub.groupby("date")["value"].sum() if m_key in ("StepCount", "AppleExerciseTime") else sub.groupby("date")["value"].median()
+        daily_agg = daily_agg.sort_index()
         vals = daily_agg.dropna().tolist()
         latest_val = float(vals[-1]) if vals else None
-        z_rob, med_val, mad_val = robust_z_score(latest_val, vals, min_scale=min_sd)
+        latest_date = str(daily_agg.dropna().index[-1]) if vals else None
+        if latest_date is not None:
+            latest_ts = pd.to_datetime(latest_date, errors="coerce")
+            cutoff_ts = latest_ts - pd.Timedelta(days=28)
+            prior_mask = (pd.to_datetime(daily_agg.index.astype(str), errors="coerce") < latest_ts) & (
+                pd.to_datetime(daily_agg.index.astype(str), errors="coerce") >= cutoff_ts
+            )
+            baseline_vals = daily_agg[prior_mask].dropna().tolist()
+        else:
+            baseline_vals = []
+        z_rob, med_val, mad_val = robust_z_score(latest_val, baseline_vals, min_scale=min_sd)
 
         sensor_audit.append({
             "metric": m_key,
@@ -1257,10 +1280,8 @@ def compute_longitudinal_baseline(
         "rhr_daily": rhr_list,
         "rhr_ewma7": rhr_ewma7,
         "ppg_hrv_daily": hrv_list,
-        "ppg_hrv_label": "SDNN (ms) — Optical PPG",
         "ppg_hrv_ewma7": hrv_ewma7,
         "ecg_rmssd_daily": ecg_rmssd_list,
-        "ecg_rmssd_label": "RMSSD (ms) — Lead-I ECG",
         "changepoints": {
             "rhr": changepoints_rhr,
             "ppg_hrv": changepoints_hrv,
@@ -1402,7 +1423,14 @@ def detect_cardio_anomalies(
     ], dtype=float)
 
     for idx, d_str in enumerate(all_dates):
-        prior_dates = all_dates[:idx]
+        current_ts = pd.to_datetime(str(d_str), errors="coerce")
+        cutoff_ts = current_ts - pd.Timedelta(days=28) if not pd.isna(current_ts) else pd.NaT
+        prior_dates = [
+            prior_d for prior_d in all_dates[:idx]
+            if not pd.isna(current_ts)
+            and pd.to_datetime(str(prior_d), errors="coerce") >= cutoff_ts
+            and pd.to_datetime(str(prior_d), errors="coerce") < current_ts
+        ]
         vals_today = [
             float(series[d_str]) if d_str in series.index and not pd.isna(series[d_str]) else None
             for series in metric_series
@@ -1651,20 +1679,15 @@ def analyze_exercise_recovery(df_raw: pd.DataFrame) -> Dict[str, Any]:
                 t_mins.append(float(k * 5.0))
                 hr_obs.append(float(hr_df.loc[ep_k, "hr"]))
 
-        # The active exercise epoch is guaranteed to have an HR sample, so the
-        # first post-exercise observation must be t=0. Keep real 5-minute offsets
-        # for any missing intermediate bins rather than compressing elapsed time.
-        if len(t_mins) >= 4 and (hr_obs[0] - min(hr_obs)) >= 5.0 and (hr_obs[0] - hr_obs[-1]) >= 5.0:
-            t_arr = np.asarray(t_mins, dtype=float)
-            y_arr = np.asarray(hr_obs, dtype=float)
-            if not np.isclose(t_arr[0], 0.0):
-                continue
+        if len(t_mins) >= 4 and hr_obs[0] > hr_obs[-1] + 10.0:
+            t_arr = np.array(t_mins, dtype=float)
+            y_arr = np.array(hr_obs, dtype=float)
             hr_asymp = max(base_rhr, float(min(hr_obs[-1], base_rhr + 12.0)))
             a_init = max(10.0, float(y_arr[0] - hr_asymp))
 
-            # Grid-search over the bounded tau interval [0.5, 30.0] minutes (30–1800 seconds).
+            # Grid-search over tau in [1.5, 25.0] minutes for exact global least-squares fit
             best_tau, best_a, best_rhr, best_sse = 6.0, a_init, hr_asymp, 1e18
-            for cand_tau in np.linspace(0.5, 30.0, 296):
+            for cand_tau in np.linspace(1.5, 25.0, 95):
                 exp_vec = np.exp(-t_arr / cand_tau)
                 # Unbounded linear least squares for [HR_rest, A]
                 G = np.column_stack([np.ones_like(exp_vec), exp_vec])
@@ -1703,7 +1726,6 @@ def analyze_exercise_recovery(df_raw: pd.DataFrame) -> Dict[str, Any]:
                     best_sse = sse
                     best_tau, best_a, best_rhr = float(cand_tau), c_a, c_rhr
 
-            best_tau = float(np.clip(best_tau, 0.5, 30.0))
             y_pred = best_rhr + best_a * np.exp(-t_arr / best_tau)
             ss_tot = max(float(np.sum((y_arr - np.mean(y_arr)) ** 2)), 1e-6)
             r2 = max(0.0, 1.0 - best_sse / ss_tot)
@@ -1727,9 +1749,8 @@ def analyze_exercise_recovery(df_raw: pd.DataFrame) -> Dict[str, Any]:
         "bouts": bouts[::-1],
         "hrr_1min_summary": hrr_summary,
         "model_note": (
-            "Empirical mono-exponential candidate model HR(t) = HR_rest + A*exp(-t/tau) fit on relative 5-minute post-exercise bins. "
-            "Fits require at least a 5 bpm decline from the first observed peak-window HR to both the observed minimum and final sample, "
-            "and constrain tau to 0.5–30 minutes. Smartwatch HR cannot infer stroke volume, ejection fraction, or myocardial contractility."
+            "Empirical mono-exponential candidate model HR(t) = HR_rest + A*exp(-t/tau) fit on 5-minute post-exercise bins. "
+            "Smartwatch HR cannot infer stroke volume, ejection fraction, or myocardial contractility."
         ),
     }
 
