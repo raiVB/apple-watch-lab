@@ -50,6 +50,20 @@ SUM_METRICS = {"StepCount", "DistanceWalkingRunning", "ActiveEnergyBurned", "Bas
                "AppleExerciseTime", "AppleStandTime", "FlightsClimbed", "TimeInDaylight"}
 PCT_METRICS = {"OxygenSaturation", "WalkingAsymmetryPercentage", "WalkingDoubleSupportPercentage", "AppleWalkingSteadiness"}
 VALUE_KEYS = ("qty", "Avg", "avg", "value", "Value", "Min", "min")
+VALID_BOUNDS = {
+    "HeartRate": (25.0, 240.0),
+    "RestingHeartRate": (25.0, 150.0),
+    "WalkingHeartRateAverage": (35.0, 220.0),
+    "HeartRateVariabilitySDNN": (1.0, 300.0),
+    "RespiratoryRate": (4.0, 60.0),
+    "OxygenSaturation": (50.0, 100.0),
+    "AppleSleepingWristTemperature": (30.0, 43.0),
+    "VO2Max": (10.0, 95.0),
+    "WalkingSpeed": (0.1, 25.0),
+    "WalkingStepLength": (5.0, 200.0),
+    "EnvironmentalAudioExposure": (1.0, 140.0),
+    "HeadphoneAudioExposure": (1.0, 140.0),
+}
 
 STAGE_MAP = {
     "deep": "Deep Sleep (Body Repair)", "rem": "REM Sleep (Brain & Memory)",
@@ -179,6 +193,7 @@ class Ingestor:
         self.raw = {}                # key -> doc                        (collection "sleep_raw")
         self.items = 0
         self.unnamed = 0
+        self.sleep_intervals = {}
 
     def add(self, name, units, item):
         self.items += 1
@@ -201,18 +216,24 @@ class Ingestor:
         if val is None:
             return
         metric = METRIC_MAP.get(key, name.strip())
-        src = item.get("source") or item.get("sourceName") or ""
-        if metric in SUM_METRICS and src and "watch" not in str(src).lower():
+        
+        # Unicode safe source filtering: Ignore phone steps/energy
+        raw_src = item.get("source") or item.get("sourceName") or ""
+        src = re.sub(r"\s+", " ", str(raw_src)).strip().lower()
+        if metric in SUM_METRICS and src and "watch" not in src:
             return
+            
         try:
             val = float(val)
             s_dt = parse_ts(item.get("startDate") or item.get("date"))
             e_dt = parse_ts(item.get("endDate") or item.get("date"))
         except (ValueError, TypeError):
             return
+            
         if s_dt is None or e_dt is None or val != val:
             return
-            
+
+        # Fix kJ to kcal bug
         u_low = str(units or "").strip().lower()
         if metric == "WalkingSpeed" and "m/s" in u_low:
             val *= 3.6
@@ -230,7 +251,15 @@ class Ingestor:
             val *= 100.0
             units = "%"
 
-        # Deep Fix 22: Fractional Distribution across 5-minute boundaries
+        # Hardware dropout gate: drop impossible numbers
+        if metric in SUM_METRICS and val < 0.0:
+            return
+        if metric in VALID_BOUNDS:
+            lo, hi = VALID_BOUNDS[metric]
+            if not (lo <= val <= hi):
+                return
+
+        # Fractional Distribution: split big workouts across multiple bins
         duration_sec = (e_dt - s_dt).total_seconds()
         if duration_sec > 300 and metric in SUM_METRICS:
             rate = val / duration_sec
@@ -244,40 +273,28 @@ class Ingestor:
                 chunk_val = rate * chunk_dur
                 
                 bk = (metric, ep)
+                c_min, c_max = int(curr_t), int(chunk_end)
                 if bk not in self.bins:
-                    self.bins[bk] = [0.0, 0, units]
+                    self.bins[bk] = [0.0, 0, units, c_min, c_max]
                 self.bins[bk][0] += chunk_val
                 self.bins[bk][1] += 1
+                self.bins[bk][2] = units
+                self.bins[bk][3] = min(self.bins[bk][3], c_min)
+                self.bins[bk][4] = max(self.bins[bk][4], c_max)
                 curr_t = chunk_end
             return
 
-        # Normal single-bin insertion
-        dt = s_dt
-        u_low = str(units or "").strip().lower()
-        if metric == "WalkingSpeed" and "m/s" in u_low:
-            val *= 3.6
-            units = "km/h"
-        elif metric == "WalkingStepLength" and u_low == "m":
-            val *= 100.0
-            units = "cm"
-        elif metric == "DistanceWalkingRunning" and u_low == "m":
-            val /= 1000.0
-            units = "km"
-        elif metric in ("ActiveEnergyBurned", "BasalEnergyBurned") and u_low == "kj":
-            val /= 4.184
-            units = "kcal"
-        elif metric in PCT_METRICS and val <= 1.0:
-            val *= 100.0
-            units = "%"
-
-        bk = (metric, int(to_epoch(dt) // 300))
-        b = self.bins.get(bk)
-        if b is None:
-            self.bins[bk] = [val, 1, units]
-        else:
-            b[0] += val
-            b[1] += 1
-
+        # Normal insertion: track the exact start/end seconds
+        t_sec = int(to_epoch(s_dt))
+        ep = int(t_sec // 300)
+        bk = (metric, ep)
+        if bk not in self.bins:
+            self.bins[bk] = [0.0, 0, units, t_sec, t_sec]
+        self.bins[bk][0] += val
+        self.bins[bk][1] += 1
+        self.bins[bk][2] = units
+        self.bins[bk][3] = min(self.bins[bk][3], t_sec)
+        self.bins[bk][4] = max(self.bins[bk][4], t_sec)
     def record_docs(self):
         for (metric, ep), (total, n, unit) in self.bins.items():
             # Convert absolute UTC epoch to India Standard Time (+05:30) for dashboard strings
@@ -293,7 +310,13 @@ class Ingestor:
         raw_val_check = str(item.get("value") or item.get("stage") or "").strip().lower()
         if any(ib in raw_val_check for ib in ("inbed", "in_bed", "in bed")):
             return
-        # Normalise to IST wall-clock so sleep timing lines up with the IST-based 5-minute records.
+        
+        # Unicode safe watch check
+        raw_src = item.get("source") or item.get("sourceName") or ""
+        src = re.sub(r"\s+", " ", str(raw_src)).strip().lower()
+        if src and "watch" not in src:
+            return
+
         s19 = ist_str(item.get("start") or item.get("startDate")) if (item.get("start") or item.get("startDate")) else ""
         e19 = ist_str(item.get("end") or item.get("endDate")) if (item.get("end") or item.get("endDate")) else ""
         if s19 and e19:
@@ -301,16 +324,18 @@ class Ingestor:
             for ks, ke in (("start", "end"), ("startDate", "endDate")):
                 if item.get(ks): item[ks] = s19
                 if item.get(ke): item[ke] = e19
+        
+        # Deep Fix 13: Prioritize wake date (e19) for database grouping
         d = (e19 or s19 or str(item.get("date") or item.get("sleepEnd") or ""))[:10]
         if self.keep_from and d and d < self.keep_from:
             return
+
         if s19 and e19:
             k = f"{s19}|{e19}|{item.get('value') or item.get('stage') or ''}"
         else:
             k = "agg|" + (d or json.dumps(item, sort_keys=True))
         self.raw[k] = {**item, "k": k, "d": d, "s19": s19, "e19": e19}
 
-        # Old per-stage format used by the Stress and Energy engines
         if any(x in item for x in ("deep", "rem", "core", "asleep")):
             d_str = str(item.get("date") or item.get("sleepEnd") or "")[:10]
             try:
@@ -321,6 +346,18 @@ class Ingestor:
                 if s_hr < 14.0: s_hr += 24.0
                 e_hr = e_dt.hour + e_dt.minute / 60.0
                 s_ep, e_ep = int(to_epoch(s_raw) // 300), int(to_epoch(e_raw) // 300)
+                
+                # Deep Fix 33: Clamp overlaps
+                seen = self.sleep_intervals.setdefault(d, [])
+                for prev_s, prev_e in seen:
+                    if s_ep >= prev_s and e_ep <= prev_e:
+                        return
+                    if s_ep < prev_e and e_ep > prev_s:
+                        if s_ep < prev_s: e_ep = prev_s
+                        else: s_ep = prev_e
+                if e_ep <= s_ep: return
+                seen.append((s_ep, e_ep))
+
                 for stg_key, stg_label in NIGHT_STAGES:
                     hrs = float(item.get(stg_key) or 0.0)
                     if hrs > 16.0: hrs /= 60.0
@@ -344,6 +381,18 @@ class Ingestor:
                     if s_hr < 14.0: s_hr += 24.0
                     e_hr = e_dt.hour + e_dt.minute / 60.0
                     s_ep, e_ep = int(to_epoch(s_raw) // 300), int(to_epoch(e_raw) // 300)
+                    
+                    # Deep Fix 33: Clamp overlaps
+                    seen = self.sleep_intervals.setdefault(d, [])
+                    for prev_s, prev_e in seen:
+                        if s_ep >= prev_s and e_ep <= prev_e:
+                            return
+                        if s_ep < prev_e and e_ep > prev_s:
+                            if s_ep < prev_s: e_ep = prev_s
+                            else: s_ep = prev_e
+                    if e_ep <= s_ep: return
+                    seen.append((s_ep, e_ep))
+
                     self.legacy[(label, s_ep, e_ep)] = {
                         "date": e_dt.strftime("%Y-%m-%d"), "stage": label, "hours": dur, "onset_hr": s_hr,
                         "wake_hr": e_hr, "start_epoch": s_ep, "end_epoch": e_ep}
@@ -379,12 +428,62 @@ def _bulk(coll, ops):
 
 def write(db, ing, chunk=2000):
     """Upsert everything the Ingestor collected. Safe to repeat: same data = same rows."""
+    from pymongo import UpdateOne
+
     ops, n_rec = [], 0
-    for doc in ing.record_docs():
-        ops.append(UpdateOne({"metric": doc["metric"], "epoch_5m": doc["epoch_5m"]}, {"$set": doc}, upsert=True))
-        if len(ops) >= chunk:
-            _bulk(db.records, ops); n_rec += len(ops); ops = []
-    _bulk(db.records, ops); n_rec += len(ops)
+    for (m, ep), (tot, cnt, u, min_s, max_s) in ing.bins.items():
+        is_sum = m in SUM_METRICS
+        val = round(tot if is_sum else (tot / cnt), 4)
+        dt_ist = datetime.fromtimestamp(ep * 300, tz=IST)
+        d_str = dt_ist.strftime("%Y-%m-%d")
+        ts_str = dt_ist.strftime("%Y-%m-%dT%H:%M:%S")
+
+        # Disjoint check: new chunk is strictly after or strictly before existing chunk
+        is_disjoint = {
+            "$or": [
+                {"$gt": [min_s, {"$ifNull": ["$max_sec", -1]}]},
+                {"$lt": [max_s, {"$ifNull": ["$min_sec", 99999999999]}]},
+            ]
+        }
+        is_empty = {"$eq": [{"$ifNull": ["$count", 0]}, 0]}
+        is_superset = {"$gte": [cnt, {"$ifNull": ["$count", 0]}]}
+
+        if is_sum:
+            merged_val = {"$round": [{"$add": [{"$ifNull": ["$value", 0.0]}, val]}, 4]}
+        else:
+            merged_val = {
+                "$round": [
+                    {
+                        "$divide": [
+                            {"$add": [{"$multiply": [{"$ifNull": ["$value", 0.0]}, {"$ifNull": ["$count", 0]}]}, tot]},
+                            {"$add": [{"$ifNull": ["$count", 0]}, cnt]},
+                        ]
+                    },
+                    4,
+                ]
+            }
+
+        pipeline_update = [
+            {
+                "$set": {
+                    "metric": m,
+                    "epoch_5m": ep,
+                    "date": d_str,
+                    "timestamp": ts_str,
+                    "units": u,
+                    "value": {"$cond": [is_empty, val, {"$cond": [is_disjoint, merged_val, {"$cond": [is_superset, val, "$value"]}]}]},
+                    "count": {"$cond": [is_empty, cnt, {"$cond": [is_disjoint, {"$add": ["$count", cnt]}, {"$cond": [is_superset, cnt, "$count"]}]}]},
+                    "min_sec": {"$cond": [is_empty, min_s, {"$min": [{"$ifNull": ["$min_sec", min_s]}, min_s]}]},
+                    "max_sec": {"$cond": [is_empty, max_s, {"$max": [{"$ifNull": ["$max_sec", max_s]}, max_s]}]},
+                }
+            }
+        ]
+        ops.append(UpdateOne({"metric": m, "epoch_5m": ep}, pipeline_update, upsert=True))
+
+    # Send updates to MongoDB in fast, unordered batches
+    for i in range(0, len(ops), chunk):
+        _bulk(db.records, ops[i : i + chunk])
+        n_rec += len(ops[i : i + chunk])
 
     # Safe Replacement Strategy: Delete previously stored sleep records strictly for the 
     # specific dates present in this upload payload.
