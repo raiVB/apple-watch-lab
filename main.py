@@ -396,61 +396,70 @@ def serve_cockpit(request: Request):
     raw_rows = list(db.sleep_raw.find({"d": {"$gte": cutoff}}, {"_id": 0}))
     df_raw_sleep = pd.DataFrame(raw_rows) if raw_rows else None
 
-    # Deep Fix 21: Wire psych_checkins to the Bayesian Energy Predictor
-    # Deep Fix 21 & 24: Wire psych_checkins and Class Attendance to the ML Model
+    # Deep Fix 21, 24, 26 & 41: Full Outer-Join of Check-ins + Class Attendance into log_df
     checkins = list(db.psych_checkins.find({"skipped": False, "server_timestamp_ist": {"$gte": cutoff}}, {"_id": 0}))
-    log_rows = []
+    attendance = list(db.class_attendance.find({"server_timestamp_ist": {"$gte": cutoff}}, {"_id": 0}))
+
+    att_dict = {}
+    for doc in attendance:
+        parts = str(doc.get("class_id", "")).split("|")
+        if len(parts) == 2:
+            d_str, subj = parts[0], parts[1]
+            status = doc.get("status", "")
+            att_dict.setdefault(d_str, []).append(f"{subj} ({status})")
+
+    rows_by_date = {}
     if checkins:
         df_c = pd.DataFrame(checkins)
-        df_c["dt"] = pd.to_datetime(df_c["server_timestamp_ist"])
+        df_c["dt"] = pd.to_datetime(df_c["server_timestamp_ist"], errors="coerce")
+        df_c = df_c.dropna(subset=["dt"])
         df_c["date"] = df_c["dt"].dt.strftime("%Y-%m-%d")
         df_c["hour"] = df_c["dt"].dt.hour
-        
-        # Map 0-4 Arousal scale to 1-5 Energy Predictor scale
-        df_c["energy"] = pd.to_numeric(df_c["arousal"], errors="coerce") + 1.0
-        
+
+        # Map 0-4 Arousal & Stress scales to 1-5 Engine scales
+        df_c["energy"] = pd.to_numeric(df_c.get("arousal"), errors="coerce") + 1.0
+        df_c["stress_scaled"] = pd.to_numeric(df_c.get("stress"), errors="coerce") + 1.0
+
         for d_str, grp in df_c.groupby("date"):
             e_m = grp[grp["hour"] < 12]["energy"].mean()
             e_a = grp[(grp["hour"] >= 12) & (grp["hour"] < 17)]["energy"].mean()
             e_e = grp[grp["hour"] >= 17]["energy"].mean()
             day_mean = grp["energy"].mean()
-            
-            log_rows.append({
+            s_mean = grp["stress_scaled"].mean()
+
+            rows_by_date[d_str] = {
                 "date": d_str,
                 "energy_morning": e_m if not pd.isna(e_m) else day_mean,
                 "energy_afternoon": e_a if not pd.isna(e_a) else day_mean,
                 "energy_evening": e_e if not pd.isna(e_e) else day_mean,
-                "study_hours": np.nan, "productivity_rating": np.nan, 
-                "best_focus_window": np.nan, "stress_rating": np.nan, 
-                "mood_rating": np.nan, "workload_rating": np.nan, 
-                "caffeine_cups": np.nan, "calendar_event": np.nan
-            })
+                "study_hours": np.nan, "productivity_rating": np.nan,
+                "best_focus_window": np.nan,
+                "stress_rating": s_mean if not pd.isna(s_mean) else np.nan,
+                "mood_rating": np.nan, "workload_rating": np.nan,
+                "caffeine_cups": np.nan,
+                "calendar_event": "Classes: " + ", ".join(att_dict[d_str]) if d_str in att_dict else np.nan,
+            }
 
-    # Deep Fix 24: Bridge Class Attendance
-    attendance = list(db.class_attendance.find({"server_timestamp_ist": {"$gte": cutoff}}, {"_id": 0}))
-    if attendance:
-        att_dict = {}
-        for doc in attendance:
-            parts = str(doc.get("class_id", "")).split("|")
-            if len(parts) == 2:
-                d_str, subj = parts[0], parts[1]
-                status = doc.get("status", "")
-                att_dict.setdefault(d_str, []).append(f"{subj} ({status})")
-        
-        for row in log_rows:
-            d_str = row["date"]
-            if d_str in att_dict:
-                row["calendar_event"] = "Classes: " + ", ".join(att_dict[d_str])
+    # Include dates that have Class Attendance even if no psych_checkin was logged that day
+    for d_str, entries in att_dict.items():
+        if d_str not in rows_by_date:
+            rows_by_date[d_str] = {
+                "date": d_str,
+                "energy_morning": np.nan, "energy_afternoon": np.nan, "energy_evening": np.nan,
+                "study_hours": np.nan, "productivity_rating": np.nan, "best_focus_window": np.nan,
+                "stress_rating": np.nan, "mood_rating": np.nan, "workload_rating": np.nan,
+                "caffeine_cups": np.nan,
+                "calendar_event": "Classes: " + ", ".join(entries),
+            }
 
-    # Deep Fix 26: Exhaustive Schema Protection
     exhaustive_columns = [
         "date", "energy_morning", "energy_afternoon", "energy_evening",
         "study_hours", "productivity_rating", "best_focus_window",
         "stress_rating", "mood_rating", "workload_rating", "caffeine_cups", "calendar_event",
-        "caffeine_cutoff_hr", "screen_off_mins", "last_meal_hrs_before_bed", 
-        "nap_mins", "bedtime_routine", "experiment_name", "experiment_phase"
+        "caffeine_cutoff_hr", "screen_off_mins", "last_meal_hrs_before_bed",
+        "nap_mins", "bedtime_routine", "experiment_name", "experiment_phase",
     ]
-    
+    log_rows = [rows_by_date[k] for k in sorted(rows_by_date.keys())]
     log_df = pd.DataFrame(log_rows, columns=exhaustive_columns) if log_rows else pd.DataFrame(columns=exhaustive_columns)
 
     stress_bundle = analyze_health.compute_stress_detective_engine(df_raw, df_sleep, [], log_df)
