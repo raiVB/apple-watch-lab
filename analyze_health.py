@@ -2333,7 +2333,9 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         return None
 
     def clk(h):
-        h = h % 24
+        # x0/x1 are hours relative to a noon-anchored base_day; convert back
+        # to wall-clock time before formatting AM/PM.
+        h = (h + 12) % 24
         hh, mm = int(h), int(round((h - int(h)) * 60))
         if mm == 60: hh, mm = (hh + 1) % 24, 0
         return f"{(hh % 12) or 12}:{mm:02d} {'AM' if hh < 12 else 'PM'}"
