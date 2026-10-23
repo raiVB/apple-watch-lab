@@ -97,6 +97,28 @@ def ensure_indexes_once():
         db.ecg_recordings.create_index("ecg_id", unique=True)
         db.ecg_recordings.create_index([("start_epoch", -1)])
         db.ecg_recordings.create_index([("date", -1)])
+        db.records.create_index([("date", 1), ("metric", 1), ("epoch_5m", 1)], background=True)
+
+        # Idempotent In-Place Lineage Repair for Historical kJ & Unit Strings
+        db.records.update_many(
+            {"metric": {"$in": ["ActiveEnergyBurned", "BasalEnergyBurned"]}, "units": {"$in": ["kJ", "kj"]}},
+            [
+                {
+                    "$set": {
+                        "value": {"$round": [{"$divide": ["$value", 4.184]}, 4]},
+                        "units": "kcal",
+                    }
+                }
+            ],
+        )
+        db.records.update_many({"metric": "WalkingSpeed", "units": "m/s"}, {"$set": {"units": "km/h"}})
+        db.records.update_many({"metric": "WalkingStepLength", "units": "m"}, {"$set": {"units": "cm"}})
+        db.records.update_many({"metric": "DistanceWalkingRunning", "units": "m"}, {"$set": {"units": "km"}})
+        
+        # Purge corrupted out-of-bounds artifacts
+        db.records.delete_many({"metric": "HeartRate", "$or": [{"value": {"$lt": 25.0}}, {"value": {"$gt": 240.0}}]})
+        db.records.delete_many({"metric": "OxygenSaturation", "$or": [{"value": {"$lt": 50.0}}, {"value": {"$gt": 100.0}}]})
+        db.records.delete_many({"metric": "HeartRateVariabilitySDNN", "$or": [{"value": {"$lt": 1.0}}, {"value": {"$gt": 300.0}}]})
         INDEXES.update(ready=True, error=None)
     except Exception as e:
         INDEXES["error"] = str(e)
@@ -338,6 +360,7 @@ def serve_cockpit(request: Request):
     df_raw_sleep = pd.DataFrame(raw_rows) if raw_rows else None
 
     # Deep Fix 21: Wire psych_checkins to the Bayesian Energy Predictor
+    # Deep Fix 21 & 24: Wire psych_checkins and Class Attendance to the ML Model
     checkins = list(db.psych_checkins.find({"skipped": False, "server_timestamp_ist": {"$gte": cutoff}}, {"_id": 0}))
     log_rows = []
     if checkins:
@@ -355,27 +378,34 @@ def serve_cockpit(request: Request):
             e_e = grp[grp["hour"] >= 17]["energy"].mean()
             day_mean = grp["energy"].mean()
             
-            # Deep Fix 24: Bridge Class Attendance into the Stress Detective Context
-        attendance = list(db.class_attendance.find({"server_timestamp_ist": {"$gte": cutoff}}, {"_id": 0}))
-        if attendance:
-            # Group classes by date to form a daily context string
-            att_dict = {}
-            for doc in attendance:
-                # class_id is formatted as 'YYYY-MM-DD|Subject'
-                parts = str(doc.get("class_id", "")).split("|")
-                if len(parts) == 2:
-                    d_str, subj = parts[0], parts[1]
-                    status = doc.get("status", "")
-                    entry = f"{subj} ({status})"
-                    att_dict.setdefault(d_str, []).append(entry)
-            
-            # Map into log_rows
-            for row in log_rows:
-                d_str = row["date"]
-                if d_str in att_dict:
-                    row["calendar_event"] = "Classes: " + ", ".join(att_dict[d_str])
-            
-    # Deep Fix 26: Provide exact exhaustive schema to prevent Sleep Lab KeyErrors
+            log_rows.append({
+                "date": d_str,
+                "energy_morning": e_m if not pd.isna(e_m) else day_mean,
+                "energy_afternoon": e_a if not pd.isna(e_a) else day_mean,
+                "energy_evening": e_e if not pd.isna(e_e) else day_mean,
+                "study_hours": np.nan, "productivity_rating": np.nan, 
+                "best_focus_window": np.nan, "stress_rating": np.nan, 
+                "mood_rating": np.nan, "workload_rating": np.nan, 
+                "caffeine_cups": np.nan, "calendar_event": np.nan
+            })
+
+    # Deep Fix 24: Bridge Class Attendance
+    attendance = list(db.class_attendance.find({"server_timestamp_ist": {"$gte": cutoff}}, {"_id": 0}))
+    if attendance:
+        att_dict = {}
+        for doc in attendance:
+            parts = str(doc.get("class_id", "")).split("|")
+            if len(parts) == 2:
+                d_str, subj = parts[0], parts[1]
+                status = doc.get("status", "")
+                att_dict.setdefault(d_str, []).append(f"{subj} ({status})")
+        
+        for row in log_rows:
+            d_str = row["date"]
+            if d_str in att_dict:
+                row["calendar_event"] = "Classes: " + ", ".join(att_dict[d_str])
+
+    # Deep Fix 26: Exhaustive Schema Protection
     exhaustive_columns = [
         "date", "energy_morning", "energy_afternoon", "energy_evening",
         "study_hours", "productivity_rating", "best_focus_window",
