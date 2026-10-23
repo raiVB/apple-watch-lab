@@ -326,7 +326,17 @@ class Ingestor:
                 if item.get(ke): item[ke] = e19
         
         # Deep Fix 13: Prioritize wake date (e19) for database grouping
-        d = (e19 or s19 or str(item.get("date") or item.get("sleepEnd") or ""))[:10]
+        # Deep Fix 37: Anchor all stages in a night to the biological wake date to prevent split-deletions
+        end_dt_val = to_ist(parse_ts(e19 or s19 or item.get("date")))
+        if end_dt_val:
+            # If the stage ends before 14:00 (2 PM), it belongs to the morning's wake date.
+            # If it ends after 14:00, it's a daytime nap and belongs to the current date.
+            if end_dt_val.hour < 14:
+                d = end_dt_val.strftime("%Y-%m-%d")
+            else:
+                d = end_dt_val.strftime("%Y-%m-%d")
+        else:
+            d = (e19 or s19 or "")[:10]
         if self.keep_from and d and d < self.keep_from:
             return
 
