@@ -280,12 +280,33 @@ def get_records(
     total = db.records.count_documents(query)
     skip = (page - 1) * limit
 
-    rows = list(
+    # Deep Fix 39: Fetch one extra record across the pagination boundary to calculate gap_minutes
+    raw_rows = list(
         db.records.find(query, {"_id": 0})
         .sort([("epoch_5m", -1), ("metric", 1)])
         .skip(skip)
-        .limit(limit)
+        .limit(limit + 1)
     )
+    
+    rows = raw_rows[:limit]
+    boundary_row = raw_rows[limit] if len(raw_rows) > limit else None
+    
+    previous = {}
+    if boundary_row:
+        previous[boundary_row.get("metric", "Unknown")] = boundary_row.get("timestamp", "")
+        
+    for row in reversed(rows):
+        metric_name = row.get("metric", "Unknown")
+        ts = row.get("timestamp", "")
+        if metric_name in previous and previous[metric_name]:
+            row["gap_minutes"] = round(
+                (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                 - datetime.strptime(previous[metric_name], "%Y-%m-%d %H:%M:%S")
+                ).total_seconds() / 60, 1
+            )
+        else:
+            row["gap_minutes"] = None
+        previous[metric_name] = ts
 
     # Summarize the time gaps for each metric in the returned page.
     previous = {}
