@@ -86,6 +86,8 @@ def to_ist_str(iso_utc):
     except (ValueError, TypeError):
         return None
 STATUS = {"last_upload": None, "ok": None, "detail": None, "seconds": None}
+# In-memory status for asynchronous ECG uploads; job IDs are unguessable and short-lived.
+UPLOAD_JOBS = {}
 INDEXES = {"ready": False, "error": None}
 
 
@@ -172,10 +174,12 @@ def records_to_df(recs):
     return df
 
 
-def process_file(path: str, size: int):
+def process_file(path: str, size: int, job_id: Optional[str] = None):
     """Runs after the HTTP response is sent. Streams the saved file, never loads it whole."""
     with LOCK:
         t0 = time.time()
+        if job_id:
+            UPLOAD_JOBS[job_id] = {"status": "processing", "started_at": now_ist_str()}
         try:
             ensure_indexes_once()
             ing = ingest.Ingestor()
@@ -186,9 +190,21 @@ def process_file(path: str, size: int):
             detail["ecg_saved"] = ecg_detail.get("ecg_saved", 0)
             detail["upload_mb"] = round(size / 1024 / 1024, 1)
             STATUS.update(ok=True, detail=detail)
+            if job_id:
+                UPLOAD_JOBS[job_id] = {
+                    "status": "completed",
+                    "detail": detail,
+                    "finished_at": now_ist_str(),
+                }
         except Exception as e:
             traceback.print_exc()
             STATUS.update(ok=False, detail=repr(e))
+            if job_id:
+                UPLOAD_JOBS[job_id] = {
+                    "status": "failed",
+                    "error": repr(e),
+                    "finished_at": now_ist_str(),
+                }
         finally:
             STATUS.update(last_upload=now_ist_str(), seconds=round(time.time() - t0, 1))
             try:
@@ -296,49 +312,47 @@ def get_records(
     total = db.records.count_documents(query)
     skip = (page - 1) * limit
 
-    # Deep Fix 39: Fetch one extra record across the pagination boundary to calculate gap_minutes
     raw_rows = list(
         db.records.find(query, {"_id": 0})
         .sort([("epoch_5m", -1), ("metric", 1)])
         .skip(skip)
-        .limit(limit + 1)
+        .limit(limit)
     )
-    
-    rows = raw_rows[:limit]
-    boundary_row = raw_rows[limit] if len(raw_rows) > limit else None
-    
-    previous = {}
-    if boundary_row:
-        previous[boundary_row.get("metric", "Unknown")] = boundary_row.get("timestamp", "")
-        
-    for row in reversed(rows):
-        metric_name = row.get("metric", "Unknown")
-        ts = row.get("timestamp", "")
-        if metric_name in previous and previous[metric_name]:
-            row["gap_minutes"] = round(
-                (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-                 - datetime.strptime(previous[metric_name], "%Y-%m-%d %H:%M:%S")
-                ).total_seconds() / 60, 1
-            )
-        else:
-            row["gap_minutes"] = None
-        previous[metric_name] = ts
+    rows = raw_rows
 
-    # Summarize the time gaps for each metric in the returned page.
-    previous = {}
+    # Compute gaps chronologically per metric. For the oldest row of each metric
+    # on this page, fetch the nearest older row from MongoDB so pagination does
+    # not turn a real gap into None. Preserve active metric/date filters.
+    previous_timestamp = {}
     for row in reversed(rows):
         metric_name = row.get("metric", "Unknown")
         ts = row.get("timestamp", "")
-        if metric_name in previous:
-            # rows are walked oldest -> newest: this row minus the previous (older) one is positive
-            row["gap_minutes"] = round(
-                (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-                 - datetime.strptime(previous[metric_name], "%Y-%m-%d %H:%M:%S")
-                ).total_seconds() / 60, 1
+        older_ts = previous_timestamp.get(metric_name)
+
+        if older_ts is None:
+            older_query = dict(query)
+            older_query["metric"] = metric_name
+            older_query["epoch_5m"] = {"$lt": row.get("epoch_5m")}
+            older_row = db.records.find_one(
+                older_query,
+                {"_id": 0, "timestamp": 1},
+                sort=[("epoch_5m", -1)],
             )
+            older_ts = older_row.get("timestamp") if older_row else None
+
+        if older_ts and ts:
+            try:
+                row["gap_minutes"] = round(
+                    (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                     - datetime.strptime(older_ts, "%Y-%m-%d %H:%M:%S")
+                    ).total_seconds() / 60, 1
+                )
+            except (ValueError, TypeError):
+                row["gap_minutes"] = None
         else:
             row["gap_minutes"] = None
-        previous[metric_name] = ts
+
+        previous_timestamp[metric_name] = ts
 
     metrics = db.records.distinct("metric")
     return {
@@ -721,13 +735,30 @@ async def upload_ecg_json(request: Request, background: BackgroundTasks):
             f.write(chunk)
             size += len(chunk)
 
-    # Immediately release the event loop and let the locked background thread handle extraction
-    background.add_task(process_file, path, size)
+    # Return a job ID so the dashboard can wait for actual completion instead of
+    # guessing with a fixed sleep. Keep the in-memory registry bounded.
+    job_id = secrets.token_urlsafe(18)
+    if len(UPLOAD_JOBS) >= 100:
+        oldest_keys = list(UPLOAD_JOBS.keys())[:20]
+        for old_key in oldest_keys:
+            UPLOAD_JOBS.pop(old_key, None)
+    UPLOAD_JOBS[job_id] = {"status": "queued", "accepted_at": now_ist_str()}
+    background.add_task(process_file, path, size, job_id)
     return {
         "status": "accepted",
+        "job_id": job_id,
         "bytes": size,
         "message": "ECG processing safely deferred to background task."
     }
+
+
+@app.get("/api/ecg/upload/{job_id}")
+def get_ecg_upload_status(job_id: str, request: Request):
+    check_token(request)
+    job = UPLOAD_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Upload job not found or expired")
+    return {"job_id": job_id, **job}
 
 
 @app.post("/api/ecg/protocol-log")
@@ -781,7 +812,8 @@ def get_cardio_lab_overview(request: Request):
     """
     check_token(request)
 
-    # Fetch stored ECG summaries without the heavy `waveform` array so payload stays compact
+    # Fetch only the newest 200 lightweight summaries; report the true DB total separately.
+    ecg_count_total = db.ecg_recordings.count_documents({})
     ecg_docs = list(
         db.ecg_recordings.find({}, {"_id": 0, "waveform": 0})
         .sort([("start_epoch", -1)])
@@ -807,7 +839,9 @@ def get_cardio_lab_overview(request: Request):
     self_tests = CARDIO_SELF_TEST_RESULTS
 
     return clean_nans({
-        "ecg_count": len(ecg_docs),
+        "ecg_count": ecg_count_total,
+        "ecg_returned_count": len(ecg_docs),
+        "ecg_list_limit": 200,
         "ecg_recordings": ecg_docs,
         "baseline": baseline_bundle,
         "anomalies": anomaly_bundle,
