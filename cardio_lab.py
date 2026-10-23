@@ -960,8 +960,12 @@ def compute_ecg_hrv_metrics(
         "mean_nn_ms": round(mean_nn, 1),
         "median_nn_ms": round(median_nn, 1),
         "iqr_nn_ms": round(iqr_nn, 1),
+        # Explicit source/metric labels prevent confusion with background optical PPG HRV.
         "sdnn_ms": round(sdnn, 2),
+        "sdnn_label": "SDNN (ms) — Lead-I ECG",
         "rmssd_ms": round(rmssd, 2),
+        "rmssd_label": "RMSSD (ms) — Lead-I ECG",
+        "hrv_source": "Single-lead Lead-I ECG; artifact-cleaned NN intervals",
         "ln_rmssd": round(ln_rmssd, 3),
         "pnn50_pct": round(pnn50, 1),
         "sd1_ms": round(sd1, 2),
@@ -1147,7 +1151,7 @@ def compute_longitudinal_baseline(
     """
     candidate_sensors = [
         ("RestingHeartRate", "Resting Heart Rate", "bpm", 2.0),
-        ("HeartRateVariabilitySDNN", "Apple Health PPG HRV (SDNN)", "ms", 5.0),
+        ("HeartRateVariabilitySDNN", "SDNN (ms) — Optical PPG", "ms", 5.0),
         ("HeartRate", "Passive Heart Rate", "bpm", 3.0),
         ("RespiratoryRate", "Sleeping Respiratory Rate", "breaths/min", 0.8),
         ("AppleSleepingWristTemperature", "Sleeping Wrist Temp", "°C", 0.15),
@@ -1253,8 +1257,10 @@ def compute_longitudinal_baseline(
         "rhr_daily": rhr_list,
         "rhr_ewma7": rhr_ewma7,
         "ppg_hrv_daily": hrv_list,
+        "ppg_hrv_label": "SDNN (ms) — Optical PPG",
         "ppg_hrv_ewma7": hrv_ewma7,
         "ecg_rmssd_daily": ecg_rmssd_list,
+        "ecg_rmssd_label": "RMSSD (ms) — Lead-I ECG",
         "changepoints": {
             "rhr": changepoints_rhr,
             "ppg_hrv": changepoints_hrv,
