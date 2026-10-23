@@ -1645,15 +1645,20 @@ def analyze_exercise_recovery(df_raw: pd.DataFrame) -> Dict[str, Any]:
                 t_mins.append(float(k * 5.0))
                 hr_obs.append(float(hr_df.loc[ep_k, "hr"]))
 
-        if len(t_mins) >= 4 and hr_obs[0] > hr_obs[-1] + 10.0:
-            t_arr = np.array(t_mins, dtype=float)
-            y_arr = np.array(hr_obs, dtype=float)
+        # The active exercise epoch is guaranteed to have an HR sample, so the
+        # first post-exercise observation must be t=0. Keep real 5-minute offsets
+        # for any missing intermediate bins rather than compressing elapsed time.
+        if len(t_mins) >= 4 and (hr_obs[0] - min(hr_obs)) >= 5.0 and (hr_obs[0] - hr_obs[-1]) >= 5.0:
+            t_arr = np.asarray(t_mins, dtype=float)
+            y_arr = np.asarray(hr_obs, dtype=float)
+            if not np.isclose(t_arr[0], 0.0):
+                continue
             hr_asymp = max(base_rhr, float(min(hr_obs[-1], base_rhr + 12.0)))
             a_init = max(10.0, float(y_arr[0] - hr_asymp))
 
-            # Grid-search over tau in [1.5, 25.0] minutes for exact global least-squares fit
+            # Grid-search over the bounded tau interval [0.5, 30.0] minutes (30–1800 seconds).
             best_tau, best_a, best_rhr, best_sse = 6.0, a_init, hr_asymp, 1e18
-            for cand_tau in np.linspace(1.5, 25.0, 95):
+            for cand_tau in np.linspace(0.5, 30.0, 296):
                 exp_vec = np.exp(-t_arr / cand_tau)
                 # Unbounded linear least squares for [HR_rest, A]
                 G = np.column_stack([np.ones_like(exp_vec), exp_vec])
@@ -1692,6 +1697,7 @@ def analyze_exercise_recovery(df_raw: pd.DataFrame) -> Dict[str, Any]:
                     best_sse = sse
                     best_tau, best_a, best_rhr = float(cand_tau), c_a, c_rhr
 
+            best_tau = float(np.clip(best_tau, 0.5, 30.0))
             y_pred = best_rhr + best_a * np.exp(-t_arr / best_tau)
             ss_tot = max(float(np.sum((y_arr - np.mean(y_arr)) ** 2)), 1e-6)
             r2 = max(0.0, 1.0 - best_sse / ss_tot)
@@ -1715,8 +1721,9 @@ def analyze_exercise_recovery(df_raw: pd.DataFrame) -> Dict[str, Any]:
         "bouts": bouts[::-1],
         "hrr_1min_summary": hrr_summary,
         "model_note": (
-            "Empirical mono-exponential candidate model HR(t) = HR_rest + A*exp(-t/tau) fit on 5-minute post-exercise bins. "
-            "Smartwatch HR cannot infer stroke volume, ejection fraction, or myocardial contractility."
+            "Empirical mono-exponential candidate model HR(t) = HR_rest + A*exp(-t/tau) fit on relative 5-minute post-exercise bins. "
+            "Fits require at least a 5 bpm decline from the first observed peak-window HR to both the observed minimum and final sample, "
+            "and constrain tau to 0.5–30 minutes. Smartwatch HR cannot infer stroke volume, ejection fraction, or myocardial contractility."
         ),
     }
 
