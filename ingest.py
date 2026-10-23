@@ -194,6 +194,8 @@ class Ingestor:
         self.items = 0
         self.unnamed = 0
         self.sleep_intervals = {}
+        self.file_min_date = "9999-12-31"
+        self.file_max_date = "0000-00-00"
 
     def add(self, name, units, item):
         self.items += 1
@@ -206,6 +208,13 @@ class Ingestor:
             self._sleep(item)
             return
         ds = item.get("date") or item.get("startDate")
+        
+        # Deep Fix 38: Update global min/max dates for the giant eraser
+        if ds:
+            d_str = str(ds)[:10]
+            if "2000" <= d_str <= "2100":
+                if d_str < self.file_min_date: self.file_min_date = d_str
+                if d_str > self.file_max_date: self.file_max_date = d_str
         if not ds or (self.keep_from and str(ds)[:10] < self.keep_from):
             return
         val = None
@@ -495,15 +504,10 @@ def write(db, ing, chunk=2000):
         _bulk(db.records, ops[i : i + chunk])
         n_rec += len(ops[i : i + chunk])
 
-    # Safe Replacement Strategy: Delete previously stored sleep records strictly for the 
-    # specific dates present in this upload payload.
-    affected_raw_dates = list(set(d["d"] for d in ing.raw.values() if d.get("d")))
-    if affected_raw_dates:
-        db.sleep_raw.delete_many({"d": {"$in": affected_raw_dates}})
-        
-    affected_legacy_dates = list(set(d["date"] for d in ing.legacy.values() if d.get("date")))
-    if affected_legacy_dates:
-        db.sleep.delete_many({"date": {"$in": affected_legacy_dates}})
+    # Deep Fix 38: The Giant Eraser. Sweep the entire upload horizon to purge Ghost Sleep stages
+    if ing.file_min_date <= ing.file_max_date:
+        db.sleep_raw.delete_many({"d": {"$gte": ing.file_min_date, "$lte": ing.file_max_date}})
+        db.sleep.delete_many({"date": {"$gte": ing.file_min_date, "$lte": ing.file_max_date}})
         
     raw_ops = [UpdateOne({"k": d["k"]}, {"$set": d}, upsert=True) for d in ing.raw.values()]
     leg_ops = [UpdateOne({"stage": d["stage"], "start_epoch": d["start_epoch"], "end_epoch": d["end_epoch"]}, {"$set": d}, upsert=True)
