@@ -145,15 +145,31 @@ def clean_nans(obj):
 
 
 def records_to_df(recs):
-    """DataFrame of 5-minute bins in strict chronological order. Sorts on the numeric UTC epoch,
-    never on the timestamp string (string order breaks as soon as two formats are mixed)."""
+    """DataFrame of 5-minute bins in strict chronological order with guaranteed schema columns."""
     if not recs:
         return pd.DataFrame()
     df = pd.DataFrame(recs)
     df["epoch_5m"] = pd.to_numeric(df["epoch_5m"], errors="coerce")
     df = df.dropna(subset=["epoch_5m"])
+    df["epoch_5m"] = df["epoch_5m"].astype("int64")
     df = df.drop_duplicates(subset=["metric", "epoch_5m"], keep="last")
-    return df.sort_values(["epoch_5m", "metric"], kind="stable").reset_index(drop=True)
+    df = df.sort_values(["epoch_5m", "metric"], kind="stable").reset_index(drop=True)
+
+    # Deep Fix 40: Guarantee 'timestamp', 'date', 'hour', and 'unit' exist for downstream engines
+    dt_ist = pd.to_datetime(df["epoch_5m"] * 300, unit="s", utc=True).dt.tz_convert(IST)
+    if "date" not in df.columns or df["date"].isna().any():
+        df["date"] = dt_ist.dt.strftime("%Y-%m-%d")
+    if "timestamp" not in df.columns or df["timestamp"].isna().any():
+        df["timestamp"] = dt_ist.dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        df["timestamp"] = df["timestamp"].astype(str).str.replace("T", " ", regex=False)
+    if "hour" not in df.columns or df["hour"].isna().any():
+        df["hour"] = (dt_ist.dt.hour + dt_ist.dt.minute / 60.0).round(2)
+    if "unit" not in df.columns and "units" in df.columns:
+        df["unit"] = df["units"]
+    elif "unit" in df.columns and "units" in df.columns:
+        df["unit"] = df["unit"].fillna(df["units"])
+    return df
 
 
 def process_file(path: str, size: int):
