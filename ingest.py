@@ -455,7 +455,51 @@ def write(db, ing, chunk=2000):
         val = round(tot if is_sum else (tot / cnt), 4)
         dt_ist = datetime.fromtimestamp(ep * 300, tz=IST)
         d_str = dt_ist.strftime("%Y-%m-%d")
-        ts_str = dt_ist.strftime("%Y-%m-%dT%H:%M:%S")
+        ts_str = dt_ist.strftime("%Y-%m-%d %H:%M:%S")
+        hr_val = round(dt_ist.hour + dt_ist.minute / 60.0, 2)
+
+        is_disjoint = {
+            "$or": [
+                {"$gt": [min_s, {"$ifNull": ["$max_sec", -1]}]},
+                {"$lt": [max_s, {"$ifNull": ["$min_sec", 99999999999]}]},
+            ]
+        }
+        is_empty = {"$eq": [{"$ifNull": ["$count", 0]}, 0]}
+        is_superset = {"$gte": [cnt, {"$ifNull": ["$count", 0]}]}
+
+        if is_sum:
+            merged_val = {"$round": [{"$add": [{"$ifNull": ["$value", 0.0]}, val]}, 4]}
+        else:
+            merged_val = {
+                "$round": [
+                    {
+                        "$divide": [
+                            {"$add": [{"$multiply": [{"$ifNull": ["$value", 0.0]}, {"$ifNull": ["$count", 0]}]}, tot]},
+                            {"$add": [{"$ifNull": ["$count", 0]}, cnt]},
+                        ]
+                    },
+                    4,
+                ]
+            }
+
+        pipeline_update = [
+            {
+                "$set": {
+                    "metric": m,
+                    "epoch_5m": ep,
+                    "date": d_str,
+                    "timestamp": ts_str,
+                    "hour": hr_val,
+                    "unit": u,
+                    "units": u,
+                    "value": {"$cond": [is_empty, val, {"$cond": [is_disjoint, merged_val, {"$cond": [is_superset, val, "$value"]}]}]},
+                    "count": {"$cond": [is_empty, cnt, {"$cond": [is_disjoint, {"$add": ["$count", cnt]}, {"$cond": [is_superset, cnt, "$count"]}]}]},
+                    "min_sec": {"$cond": [is_empty, min_s, {"$min": [{"$ifNull": ["$min_sec", min_s]}, min_s]}]},
+                    "max_sec": {"$cond": [is_empty, max_s, {"$max": [{"$ifNull": ["$max_sec", max_s]}, max_s]}]},
+                }
+            }
+        ]
+        ops.append(UpdateOne({"metric": m, "epoch_5m": ep}, pipeline_update, upsert=True))
 
         # Disjoint check: new chunk is strictly after or strictly before existing chunk
         is_disjoint = {
