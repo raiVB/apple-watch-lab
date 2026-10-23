@@ -3604,7 +3604,7 @@ if (typeof initBodyScene === 'function') initBodyScene();
       ...base, margin:{{ ...base.margin, r:56 }},
       xaxis:{{ ...base.xaxis, title:{{ text:'Share of the night completed (0 = bedtime, 1 = wake-up)' }}, type:'linear' }},
       yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm)' }}, type:'linear' }},
-      yaxis2:{{ overlaying:'y', side:'right', title:{{ text:'HRV (ms)', font:{{ color:C.hr, size:11 }} }}, showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }}
+      yaxis2:{{ overlaying:'y', side:'right', title:{{ text:'PPG SDNN / ECG RMSSD (ms; distinct metrics)', font:{{ color:C.hr, size:11 }} }}, showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }}
     }}, cfg);
 
     const hy = document.getElementById('c_hypno');
@@ -3739,18 +3739,31 @@ async function uploadEcgJsonFile(input) {{
         headers: {{ 'Content-Type': 'application/json' }},
         body: text
       }});
-      if (res.ok) {{
-        lbl.innerText = 'Processing in background! Give it a moment...';
-        setTimeout(() => {{
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const accepted = await res.json();
+      if (!accepted.job_id) throw new Error('Server did not return an upload job ID');
+      lbl.innerText = 'Upload accepted; processing…';
+      let finished = false;
+      for (let attempt = 0; attempt < 120; attempt++) {{
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        const statusRes = await fetch('/api/ecg/upload/' + encodeURIComponent(accepted.job_id) + window.location.search);
+        if (!statusRes.ok) throw new Error('Could not check processing status (HTTP ' + statusRes.status + ')');
+        const job = await statusRes.json();
+        if (job.status === 'completed') {{
+          finished = true;
+          lbl.innerText = 'Processing complete; refreshing Cardio Lab…';
           RENDERED['cardio'] = false;
-          renderCardio();
+          await renderCardio();
           lbl.innerText = 'Upload Apple Health ECG (.json)';
-        }}, 3500);
-      }} else {{
-        lbl.innerText = 'Upload failed';
+          break;
+        }}
+        if (job.status === 'failed') throw new Error('Backend processing failed; check server logs/status.');
+        lbl.innerText = 'Processing ECG data… (' + (attempt + 1) + '/120)';
       }}
+      if (!finished) lbl.innerText = 'Still processing. Check Cardio Lab again shortly; the upload was accepted.';
+      input.value = '';
     }} catch (e) {{
-      lbl.innerText = 'Error uploading ECG JSON';
+      lbl.innerText = 'Upload/processing error: ' + e.message;
     }}
   }}
 
@@ -3891,7 +3904,7 @@ async function uploadEcgJsonFile(input) {{
     const ov = CARDIO_OVERVIEW;
     const meth = ov.methodology || {{}};
     document.getElementById('cardio_disclaimer').innerText = meth.disclaimer || '';
-    document.getElementById('ecg_count_badge').innerText = (ov.ecg_count || 0) + ' Stored ECGs';
+    document.getElementById('ecg_count_badge').innerText = (ov.ecg_count ?? 0) + ' Stored ECGs' + ((ov.ecg_count ?? 0) > (ov.ecg_returned_count ?? (ov.ecg_recordings || []).length) ? ' · latest ' + (ov.ecg_returned_count ?? (ov.ecg_recordings || []).length) + ' shown' : '');
 
     // Populate ECG selector and history table
     const ecgs = ov.ecg_recordings || [];
@@ -3913,7 +3926,7 @@ async function uploadEcgJsonFile(input) {{
           '<td>' + (sm.estimated_fs_hz ?? '—') + ' Hz (' + (sm.median_dt_ms ?? '—') + ' ms)</td>' +
           '<td><span class="pill" style="--c:' + (sq.sqi_color || '#7cc4ff') + '">' + (sq.sqi_score ?? '—') + '%</span></td>' +
           '<td>' + (bt.detected_beats ?? 0) + ' beats / ' + (bt.mean_hr_bpm ?? '—') + ' bpm</td>' +
-          '<td><b>' + (hv.rmssd_ms ? (hv.rmssd_ms + ' ms') : '—') + '</b></td></tr>';
+          '<td><b>' + (hv.rmssd_ms != null && hv.rmssd_ms !== '' ? (hv.rmssd_ms + ' ms') : '—') + '</b></td></tr>';
       }}).join('');
       await loadSelectedEcg(ecgs[0].ecg_id);
     }} else {{
@@ -3934,7 +3947,7 @@ async function uploadEcgJsonFile(input) {{
       ...base, hovermode: 'x unified', margin: {{ ...base.margin, r: 56 }},
       xaxis: {{ ...base.xaxis, title: {{ text: 'Date' }} }},
       yaxis: {{ ...base.yaxis, title: {{ text: 'Resting Heart Rate (bpm)' }} }},
-      yaxis2: {{ overlaying: 'y', side: 'right', title: {{ text: 'HRV (ms)', font: {{ color: C.hr, size: 11 }} }}, showgrid: false, zeroline: false }}
+      yaxis2: {{ overlaying: 'y', side: 'right', title: {{ text: 'PPG SDNN / ECG RMSSD (ms; distinct metrics)', font: {{ color: C.hr, size: 11 }} }}, showgrid: false, zeroline: false }}
     }}, cfg);
 
     document.getElementById('cardio_sensor_audit_rows').innerHTML = (bl.sensor_audit || []).map(s => {{
@@ -3948,7 +3961,7 @@ async function uploadEcgJsonFile(input) {{
         '<td><b>' + (s.latest ?? '—') + ' ' + (s.unit || '') + '</b></td>' +
         '<td>' + (s.median ?? '—') + ' &plusmn; ' + (s.mad ?? '—') + ' ' + (s.unit || '') + '</td>' +
         '<td>' + (s.p10 ?? '—') + ' &ndash; ' + (s.p90 ?? '—') + '</td>' +
-        '<td><span class="pill" style="--c:' + zCol + '">' + (s.latest_z_robust != null ? (s.latest_z_robust + ' SD') : '—') + '</span></td></tr>';
+        '<td><span class="pill" style="--c:' + zCol + '">' + (s.latest_z_robust != null ? (s.latest_z_robust + ' robust z') : '—') + '</span></td></tr>';
     }}).join('');
 
     // Module E: Anomaly Reports
