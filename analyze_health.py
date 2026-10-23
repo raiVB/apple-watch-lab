@@ -796,13 +796,35 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
     s_wtemp = metric_daily_series("AppleSleepingWristTemperature", "mean")
     s_noise = metric_daily_series("EnvironmentalAudioExposure", "mean")
 
-    def z_val_or_nan(val, series, default_mu, min_sd):
+    def z_val_or_nan(val, series, default_mu, min_scale, current_date):
+        """Causal robust Z: only observations strictly before current_date, within 28 calendar days.
+        During the first 28 days the baseline expands over available past observations.
+        A physiological min_scale prevents zero/near-zero dispersion from exploding scores.
+        """
         if val is None or pd.isna(val):
             return np.nan
-        valid = series.dropna()
-        mu = float(valid.median()) if len(valid) >= 2 else default_mu
-        sd = max(float(valid.std(ddof=0)), min_sd) if len(valid) >= 2 else min_sd
-        return (float(val) - mu) / sd
+
+        current_ts = pd.to_datetime(str(current_date), errors="coerce")
+        if pd.isna(current_ts):
+            return np.nan
+        idx = pd.to_datetime(series.index.astype(str), errors="coerce")
+        cutoff = current_ts - pd.Timedelta(days=28)
+        valid = series[(idx < current_ts) & (idx >= cutoff)].dropna().astype(float)
+
+        if len(valid) == 0:
+            mu = float(default_mu)
+            scale = float(min_scale)
+        else:
+            arr = valid.to_numpy(dtype=float)
+            mu = float(np.median(arr))
+            med_abs_dev = float(np.median(np.abs(arr - mu)))
+            robust_scale = med_abs_dev / 0.6745
+            if robust_scale < 1e-9:
+                iqr = float(np.percentile(arr, 75) - np.percentile(arr, 25))
+                robust_scale = 0.7413 * iqr
+            scale = max(float(min_scale), robust_scale)
+
+        return (float(val) - mu) / scale
 
     for d in all_dates:
         if not df_intra.empty:
@@ -825,14 +847,35 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         hrv_d = s_hrv.get(d, np.nan)
         ln_hrv_d = math.log(max(float(hrv_d), 1.0)) if not pd.isna(hrv_d) else np.nan
 
+        # Causal trailing-28-day baseline for the daily HRV suppression score.
+        # Keep the sign convention: lower-than-baseline HRV produces a positive score.
+        hrv_idx = pd.to_datetime(s_hrv.index.astype(str), errors="coerce")
+        current_ts = pd.to_datetime(str(d), errors="coerce")
+        if not pd.isna(current_ts):
+            hrv_cutoff = current_ts - pd.Timedelta(days=28)
+            prior_hrv = s_hrv[(hrv_idx < current_ts) & (hrv_idx >= hrv_cutoff)].dropna().astype(float)
+        else:
+            prior_hrv = pd.Series(dtype=float)
+        prior_ln_hrv = np.log(prior_hrv.clip(lower=1.0).to_numpy(dtype=float)) if not prior_hrv.empty else np.array([])
+        if len(prior_ln_hrv):
+            hrv_mu = float(np.median(prior_ln_hrv))
+            hrv_mad = float(np.median(np.abs(prior_ln_hrv - hrv_mu)))
+            hrv_scale = hrv_mad / 0.6745
+            if hrv_scale < 1e-9:
+                hrv_iqr = float(np.percentile(prior_ln_hrv, 75) - np.percentile(prior_ln_hrv, 25))
+                hrv_scale = 0.7413 * hrv_iqr
+            hrv_scale = max(0.18, hrv_scale)
+        else:
+            hrv_mu, hrv_scale = math.log(58.0), 0.18
+
         z0_non_met_hr = (non_met_hr_d / 5.0) if not pd.isna(non_met_hr_d) else np.nan
-        z1_vagal_supp = ((base_ln_hrv - ln_hrv_d) / sd_ln_hrv) if not pd.isna(ln_hrv_d) else np.nan
-        z2_rhr_elev = z_val_or_nan(s_rhr.get(d, np.nan), s_rhr, base_rhr, 2.8)
-        z3_resp_elev = z_val_or_nan(s_resp.get(d, np.nan), s_resp, 15.0, 1.0)
+        z1_vagal_supp = ((hrv_mu - ln_hrv_d) / hrv_scale) if not pd.isna(ln_hrv_d) else np.nan
+        z2_rhr_elev = z_val_or_nan(s_rhr.get(d, np.nan), s_rhr, base_rhr, 2.8, d)
+        z3_resp_elev = z_val_or_nan(s_resp.get(d, np.nan), s_resp, 15.0, 1.0, d)
         z4_slp_frag = ((slp_debt_hrs - 0.8) / 1.1) if not pd.isna(slp_debt_hrs) else np.nan
         z5_dip_blunt = ((14.0 - dip_d) / 4.5) if not pd.isna(dip_d) else np.nan
-        z6_wtemp = z_val_or_nan(s_wtemp.get(d, np.nan), s_wtemp, 36.4, 0.22)
-        z7_noise = z_val_or_nan(s_noise.get(d, np.nan), s_noise, 66.0, 6.5)
+        z6_wtemp = z_val_or_nan(s_wtemp.get(d, np.nan), s_wtemp, 36.4, 0.22, d)
+        z7_noise = z_val_or_nan(s_noise.get(d, np.nan), s_noise, 66.0, 6.5, d)
 
         z_vec = [z0_non_met_hr, z1_vagal_supp, z2_rhr_elev, z3_resp_elev, z4_slp_frag, z5_dip_blunt, z6_wtemp, z7_noise]
         d2, k_obs = subspace_mahalanobis_d2(z_vec, R_prior_8x8)
@@ -982,13 +1025,52 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
     df_feat["prev_ex_mins"] = df_feat["ex_mins"].shift(1).fillna(df_feat["ex_mins"])
     df_feat["prev_walk_mins"] = df_feat["walk_mins"].shift(1).fillna(df_feat["walk_mins"])
 
-    med_midpoint = float(df_feat["midpoint_hr"].median())
-    df_feat["timing_dev_hrs"] = (df_feat["midpoint_hr"] - med_midpoint).abs()
+    # Causal habitual sleep-midpoint baseline: each day is compared only with
+    # the preceding 28 calendar days (expanding history during the first 28 days).
+    feat_dates = pd.to_datetime(df_feat["date"].astype(str), errors="coerce")
+    midpoint_baselines = []
+    for i, current_ts in enumerate(feat_dates):
+        if pd.isna(current_ts):
+            midpoint_baselines.append(28.0)
+            continue
+        cutoff_ts = current_ts - pd.Timedelta(days=28)
+        mask = (feat_dates < current_ts) & (feat_dates >= cutoff_ts)
+        prior_midpoints = df_feat.loc[mask, "midpoint_hr"].dropna().astype(float)
+        midpoint_baselines.append(float(prior_midpoints.median()) if not prior_midpoints.empty else 28.0)
+    df_feat["timing_dev_hrs"] = np.abs(
+        df_feat["midpoint_hr"].astype(float).to_numpy() - np.asarray(midpoint_baselines, dtype=float)
+    )
 
     def calc_z(series, fallback_mean, min_sd):
-        mu = float(series.mean()) if len(series) >= 2 else fallback_mean
-        sd = max(float(series.std(ddof=0)), min_sd)
-        return (series - mu) / sd, mu, sd
+        """Per-day causal robust Z-scores with a trailing 28-calendar-day baseline."""
+        values = pd.to_numeric(series, errors="coerce").astype(float)
+        z_values = []
+        latest_mu, latest_scale = float(fallback_mean), float(min_sd)
+        for i, current_ts in enumerate(feat_dates):
+            x = values.iloc[i]
+            if pd.isna(x):
+                z_values.append(np.nan)
+                continue
+            if pd.isna(current_ts):
+                prior = values.iloc[:i].dropna()
+            else:
+                cutoff_ts = current_ts - pd.Timedelta(days=28)
+                prior_mask = (feat_dates < current_ts) & (feat_dates >= cutoff_ts)
+                prior = values.loc[prior_mask].dropna()
+            if prior.empty:
+                mu, scale = float(fallback_mean), float(min_sd)
+            else:
+                arr = prior.to_numpy(dtype=float)
+                mu = float(np.median(arr))
+                mad = float(np.median(np.abs(arr - mu)))
+                scale = mad / 0.6745
+                if scale < 1e-9:
+                    scale = 0.7413 * float(np.percentile(arr, 75) - np.percentile(arr, 25))
+                scale = max(float(min_sd), scale)
+            z_values.append((float(x) - mu) / scale)
+            if i == len(values) - 1:
+                latest_mu, latest_scale = mu, scale
+        return pd.Series(z_values, index=series.index, dtype=float), latest_mu, latest_scale
 
     df_feat["z_sleep"], mu_sleep, _ = calc_z(df_feat["sleep_hrs"], 7.5, 0.75)
     df_feat["z_timing"], mu_timing, _ = calc_z(df_feat["timing_dev_hrs"], 0.4, 0.45)
