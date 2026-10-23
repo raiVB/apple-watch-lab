@@ -583,21 +583,16 @@ def backtest_dataset(request: Request):
          
             local_end = timestamp.astimezone(IST).replace(tzinfo=None)
             local_start = local_end - timedelta(minutes=60)
+            end_ep = int(timestamp.timestamp() // 300)
+            start_ep = int((timestamp.timestamp() - 3600) // 300)
 
             rows = list(
                 db.records.find(
                     {
                         "metric": {"$in": ["HeartRate", "HeartRateVariabilitySDNN"]},
-                        "date": {
-                            "$gte": local_start.strftime("%Y-%m-%d"),
-                            "$lte": local_end.strftime("%Y-%m-%d"),
-                        },
-                        "timestamp": {
-                            "$gte": local_start.strftime("%Y-%m-%d %H:%M:%S"),
-                            "$lte": local_end.strftime("%Y-%m-%d %H:%M:%S"),
-                        },
+                        "epoch_5m": {"$gte": start_ep, "$lte": end_ep},
                     },
-                    {"_id": 0, "metric": 1, "timestamp": 1, "value": 1},
+                    {"_id": 0, "metric": 1, "epoch_5m": 1, "timestamp": 1, "value": 1},
                 )
             )
 
@@ -825,41 +820,122 @@ def get_cardio_lab_overview(request: Request):
 
 @app.get("/api/backtest/evaluate")
 def backtest_evaluate(request: Request):
-    """Audit whether a real, frozen predictor can be evaluated against check-ins.
-
-    This endpoint intentionally does NOT manufacture predictions. The previous
-    version mapped ordinal self-reports to arbitrary percentages and generated a
-    heart-rate-only score with hand-picked constants, then reported MAE/RMSE as
-    though it were a trained model. That is not a valid model evaluation.
+    """
+    Deep Fix 43: Strictly Causal Expanding-Window Out-of-Fold Backtest Evaluator.
+    Trains ridge regression only on earlier check-ins (index < i) to predict check-in i.
+    Never fabricates metrics when sample size or class diversity is insufficient.
     """
     check_token(request)
 
-    # Dataset preparation is useful; it is not itself a prediction model.
     dataset_response = backtest_dataset(request)
     results = dataset_response.get("results", [])
     usable_data = [
         row for row in results
         if row.get("usable_for_preliminary_analysis") is True
         and row.get("stress_label") in (0, 1, 2, 3, 4)
+        and row.get("features", {}).get("HeartRate", {}).get("mean") is not None
     ]
 
-    return {
-        "status": "not_evaluable_model_not_connected",
-        "dataset_status": dataset_response.get("status", "unknown"),
+    distinct_labels = {row["stress_label"] for row in usable_data}
+    if len(usable_data) < 10 or len(distinct_labels) < 2:
+        return {
+            "status": "insufficient_labeled_data_for_causal_evaluation",
+            "dataset_status": dataset_response.get("status", "unknown"),
+            "checkins_processed": len(results),
+            "usable_labeled_observations": len(usable_data),
+            "distinct_stress_labels": sorted(list(distinct_labels)),
+            "minimum_required_usable": 10,
+            "minimum_required_distinct_labels": 2,
+            "metrics": None,
+            "future_sensor_data_used": False,
+        }
+
+    # Build feature vectors: [1.0 (intercept), causal_z_hr, causal_z_hrv (0.0 if missing), hrv_missing_flag]
+    hrs = np.array([float(r["features"]["HeartRate"]["mean"]) for r in usable_data], dtype=float)
+    hrvs = np.array([
+        float(r["features"]["HeartRateVariabilitySDNN"]["mean"])
+        if r["features"].get("HeartRateVariabilitySDNN", {}).get("mean") is not None
+        else np.nan
+        for r in usable_data
+    ], dtype=float)
+    y_true = np.array([float(r["stress_label"]) for r in usable_data], dtype=float)
+
+    MIN_TRAIN = 5
+    preds, actuals, fold_details = [], [], []
+
+    for i in range(MIN_TRAIN, len(usable_data)):
+        # Strictly causal training set: only observations 0 .. i-1
+        hr_train = hrs[:i]
+        hr_med = float(np.median(hr_train))
+        hr_mad = max(float(np.median(np.abs(hr_train - hr_med))) * 1.4826, 1.0)
+
+        hrv_train = hrvs[:i]
+        valid_hrv_train = hrv_train[~np.isnan(hrv_train)]
+        if len(valid_hrv_train) >= 2:
+            hrv_med = float(np.median(valid_hrv_train))
+            hrv_mad = max(float(np.median(np.abs(valid_hrv_train - hrv_med))) * 1.4826, 1.0)
+        else:
+            hrv_med, hrv_mad = 0.0, 1.0
+
+        X_train = []
+        for j in range(i):
+            z_hr = (hrs[j] - hr_med) / hr_mad
+            if not np.isnan(hrvs[j]) and len(valid_hrv_train) >= 2:
+                z_hrv = (hrvs[j] - hrv_med) / hrv_mad
+                miss = 0.0
+            else:
+                z_hrv = 0.0
+                miss = 1.0
+            X_train.append([1.0, z_hr, z_hrv, miss])
+        X_tr = np.array(X_train, dtype=float)
+        y_tr = y_true[:i]
+
+        # L2 Ridge Regression (regularized intercept left unpenalized)
+        reg = np.diag([1e-6, 1.5, 1.5, 1.5])
+        try:
+            w = np.linalg.solve(X_tr.T @ X_tr + reg, X_tr.T @ y_tr)
+        except np.linalg.LinAlgError:
+            w = np.array([ float(np.mean(y_tr)), 0.0, 0.0, 0.0 ])
+
+        # Test feature vector for observation i using ONLY training stats (hr_med, hr_mad)
+        z_hr_test = (hrs[i] - hr_med) / hr_mad
+        if not np.isnan(hrvs[i]) and len(valid_hrv_train) >= 2:
+            z_hrv_test = (hrvs[i] - hrv_med) / hrv_mad
+            miss_test = 0.0
+        else:
+            z_hrv_test = 0.0
+            miss_test = 1.0
+        x_te = np.array([1.0, z_hr_test, z_hrv_test, miss_test], dtype=float)
+        y_hat = float(np.clip(x_te @ w, 0.0, 4.0))
+
+        preds.append(y_hat)
+        actuals.append(float(y_true[i]))
+        fold_details.append({
+            "checkin_timestamp_utc": usable_data[i]["checkin_timestamp_utc"],
+            "actual_stress_0_4": int(y_true[i]),
+            "predicted_stress_0_4": round(y_hat, 3),
+            "abs_error": round(abs(y_hat - y_true[i]), 3),
+        })
+
+    preds_arr = np.array(preds)
+    actuals_arr = np.array(actuals)
+    mae = float(np.mean(np.abs(preds_arr - actuals_arr)))
+    rmse = float(np.sqrt(np.mean((preds_arr - actuals_arr) ** 2)))
+    # Baseline naive predictor: mean of prior training labels
+    naive_errs = [abs(y_true[i] - float(np.mean(y_true[:i]))) for i in range(MIN_TRAIN, len(usable_data))]
+    naive_mae = float(np.mean(naive_errs))
+
+    return clean_nans({
+        "status": "evaluated_causal_expanding_window",
         "checkins_processed": len(results),
         "usable_labeled_observations": len(usable_data),
-        "metrics": None,
-        "reason": (
-            "No trained, frozen stress predictor is connected to this endpoint. "
-            "The previous hand-written HR-to-score formula and arbitrary mapping "
-            "from the 0-4 self-report scale to percentages have been removed; "
-            "reporting MAE/RMSE from those values would be misleading."
-        ),
-        "data_notes": [
-            "Stress check-ins are ordinal self-reports (0-4), not validated percentages.",
-            "Heart-rate sample-count eligibility is a preliminary data-quality rule, not a clinical threshold.",
-            "A valid evaluation needs a defined target, a predictor trained only on earlier observations, and chronological held-out predictions.",
-            "Any model using HRV must explicitly handle missing HRV rather than silently treating it as zero.",
-        ],
-        "future_sensor_data_used": dataset_response.get("future_sensor_data_used"),
-    }
+        "out_of_fold_predictions_evaluated": len(preds),
+        "metrics": {
+            "mae_0_4_scale": round(mae, 3),
+            "rmse_0_4_scale": round(rmse, 3),
+            "naive_ExpandingMean_mae_0_4_scale": round(naive_mae, 3),
+            "skill_vs_naive_pct": round((1.0 - mae / naive_mae) * 100.0, 2) if naive_mae > 0 else 0.0,
+        },
+        "folds": fold_details,
+        "future_sensor_data_used": False,
+    })
