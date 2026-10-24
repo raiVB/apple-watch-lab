@@ -52,7 +52,8 @@ class ECGProtocolLogRecord(BaseModel):
 # ------------------------------------------------------------------------------
 # Render environment variables
 #   MONGO_URI       required
-#   WEBHOOK_TOKEN   optional. If set, every URL needs ?token=<value>
+#   WEBHOOK_TOKEN   required. Every protected URL needs ?token=<value>
+#   MAX_UPLOAD_BYTES optional, default 250 MiB
 #   DASH_DAYS       optional, default 90. How many days the dashboard loads (keeps RAM low)
 # ------------------------------------------------------------------------------
 MONGO_URI = os.getenv("MONGO_URI")
@@ -60,6 +61,7 @@ if not MONGO_URI:
     raise RuntimeError("Set MONGO_URI in the Render Environment tab.")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 DASH_DAYS = int(os.getenv("DASH_DAYS", "90"))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(250 * 1024 * 1024)))
 
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=8000)
 db = client.biolab
@@ -107,7 +109,10 @@ ensure_indexes_once()
 
 
 def check_token(request: Request):
-    if WEBHOOK_TOKEN and not secrets.compare_digest(request.query_params.get("token", ""), WEBHOOK_TOKEN):
+    if not WEBHOOK_TOKEN:
+        raise HTTPException(status_code=503, detail="Authentication is not configured. Set WEBHOOK_TOKEN.")
+    supplied = request.query_params.get("token", "")
+    if not secrets.compare_digest(supplied, WEBHOOK_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -127,6 +132,11 @@ def records_to_df(recs):
     if not recs:
         return pd.DataFrame()
     df = pd.DataFrame(recs)
+    # Legacy rows have no auditable source provenance; never present them as Watch data.
+    if "source_policy" in df.columns:
+        df = df[df["source_policy"] == "apple_watch_only"].copy()
+    else:
+        return pd.DataFrame()
     df["epoch_5m"] = pd.to_numeric(df["epoch_5m"], errors="coerce")
     df = df.dropna(subset=["epoch_5m"])
     df = df.drop_duplicates(subset=["metric", "epoch_5m"], keep="last")
@@ -164,10 +174,17 @@ async def receive_health_data(request: Request, background: BackgroundTasks):
     # 1) Save the upload to disk piece by piece (flat memory, however big it is).
     fd, path = tempfile.mkstemp(suffix=".json")
     size = 0
-    with os.fdopen(fd, "wb") as f:
-        async for chunk in request.stream():
-            f.write(chunk)
-            size += len(chunk)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Upload exceeds MAX_UPLOAD_BYTES.")
+                f.write(chunk)
+    except HTTPException:
+        try: os.remove(path)
+        except OSError: pass
+        raise
     # 2) Answer the iPhone right away; the parsing happens in the background.
     background.add_task(process_file, path, size)
     return {"status": "accepted", "bytes": size}
@@ -252,7 +269,7 @@ def get_records(
     page = max(1, page)
     limit = min(max(1, limit), 500)
 
-    query = {}
+    query = {"source_policy": "apple_watch_only"}
     if metric:
         query["metric"] = metric
     if start:
@@ -286,7 +303,7 @@ def get_records(
             row["gap_minutes"] = None
         previous[metric_name] = ts
 
-    metrics = db.records.distinct("metric")
+    metrics = db.records.distinct("metric", {"source_policy": "apple_watch_only"})
     return {
         "page": page,
         "limit": limit,
@@ -295,6 +312,7 @@ def get_records(
         "metrics": sorted(metrics),
         "rows": rows,
         "data_type": "stored_5_minute_bins",
+        "source_policy": "apple_watch_only",
     }
 
 
@@ -305,9 +323,9 @@ def stats(request: Request):
     return {
         "last_ingest": STATUS,
         "indexes": INDEXES,
-        "records": db.records.estimated_document_count(),
-        "sleep_rows": db.sleep.estimated_document_count(),
-        "sleep_raw_rows": db.sleep_raw.estimated_document_count(),
+        "records": db.records.count_documents({"source_policy": "apple_watch_only"}),
+        "sleep_rows": db.sleep.count_documents({"source_policy": "apple_watch_only"}),
+        "sleep_raw_rows": db.sleep_raw.count_documents({"source_policy": "apple_watch_only"}),
         "ecg_recordings": db.ecg_recordings.estimated_document_count(),
         "storage_mb": round(db_stats.get("storageSize", 0) / 1024 / 1024, 1),
     }
@@ -324,22 +342,22 @@ def _waiting_page(msg):
 @app.get("/", response_class=HTMLResponse)
 def serve_cockpit(request: Request):
     check_token(request)
-    latest = db.records.find_one({}, {"date": 1, "_id": 0}, sort=[("date", -1)])
+    latest = db.records.find_one({"source_policy": "apple_watch_only"}, {"date": 1, "_id": 0}, sort=[("date", -1)])
     if not latest:
         return _waiting_page("No data yet. Send an export from your iPhone.")
 
     # Only the most recent DASH_DAYS days are loaded, so RAM stays small however big the database grows.
     cutoff = (datetime.strptime(latest["date"], "%Y-%m-%d") - timedelta(days=DASH_DAYS)).strftime("%Y-%m-%d")
-    recs = list(db.records.find({"date": {"$gte": cutoff}}, {"_id": 0}))
+    recs = list(db.records.find({"source_policy": "apple_watch_only", "date": {"$gte": cutoff}}, {"_id": 0}))
     if len(recs) < 5:
         return _waiting_page(f"Only {len(recs)} records so far.")
     df_raw = records_to_df(recs)
     del recs
 
-    sleep_rows = list(db.sleep.find({"date": {"$gte": cutoff}}, {"_id": 0}))
+    sleep_rows = list(db.sleep.find({"source_policy": "apple_watch_only", "date": {"$gte": cutoff}}, {"_id": 0}))
     df_sleep = pd.DataFrame(sleep_rows).drop_duplicates() if sleep_rows else pd.DataFrame(
         columns=["date", "stage", "hours", "onset_hr", "wake_hr", "start_epoch", "end_epoch"])
-    raw_rows = list(db.sleep_raw.find({"d": {"$gte": cutoff}}, {"_id": 0}))
+    raw_rows = list(db.sleep_raw.find({"source_policy": "apple_watch_only", "d": {"$gte": cutoff}}, {"_id": 0}))
     df_raw_sleep = pd.DataFrame(raw_rows) if raw_rows else None
 
     log_df = pd.DataFrame(columns=[
@@ -357,6 +375,24 @@ def serve_cockpit(request: Request):
         analyze_health.build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=df_raw_sleep)
         with open("biometric_science_lab.html", "r", encoding="utf-8") as f:
             html = f.read()
+
+    ingest_detail = STATUS.get("detail") if isinstance(STATUS.get("detail"), dict) else {}
+    excluded_sources = ingest_detail.get("source_excluded", {})
+    excluded_count = sum(int(v) for v in excluded_sources.values() if isinstance(v, (int, float)))
+    watch_data_notice = f"""
+    <aside role="note" aria-label="Watch-only data quality" style="
+      max-width: 1100px; margin: 18px auto; padding: 14px 18px;
+      background: #3b2f12; color: #fff1c2; border: 1px solid #a87917;
+      border-radius: 12px; font: 14px/1.5 system-ui, sans-serif;
+    ">
+      <strong>Apple Watch source filter is on.</strong>
+      The dashboard includes records explicitly attributed to Apple Watch. Mixed Watch+iPhone,
+      iPhone-only, and missing-source records are excluded. Excluded records in the latest upload:
+      <strong>{excluded_count:,}</strong>. Where Health Auto Export merged sources, the Watch-only
+      contribution cannot be recovered from that merged value; activity totals and derived scores
+      may therefore be incomplete. Use a source-separated export before treating these as full-day totals.
+    </aside>
+    """
 
     checkin_widget = r"""
     <section id="bio-checkin" style="
@@ -489,7 +525,7 @@ def serve_cockpit(request: Request):
     """
 
     if "</body>" in html:
-        html = html.replace("</body>", checkin_widget + "\n</body>", 1)
+        html = html.replace("</body>", watch_data_notice + checkin_widget + "\n</body>", 1)
     else:
         raise RuntimeError("Dashboard HTML has no closing body tag.")
 
@@ -529,13 +565,13 @@ def backtest_readiness(request: Request):
 
     # Inspect the stored heart-rate date range.
     first_hr = db.records.find_one(
-        {"metric": "HeartRate", "date": {"$exists": True}},
+        {"metric": "HeartRate", "source_policy": "apple_watch_only", "date": {"$exists": True}},
         {"_id": 0, "date": 1},
         sort=[("date", 1)],
     )
 
     last_hr = db.records.find_one(
-        {"metric": "HeartRate", "date": {"$exists": True}},
+        {"metric": "HeartRate", "source_policy": "apple_watch_only", "date": {"$exists": True}},
         {"_id": 0, "date": 1},
         sort=[("date", -1)],
     )
@@ -613,6 +649,7 @@ def backtest_dataset(request: Request):
                 db.records.find(
                     {
                         "metric": {"$in": ["HeartRate", "HeartRateVariabilitySDNN"]},
+                        "source_policy": "apple_watch_only",
                         "date": {
                             "$gte": local_start.strftime("%Y-%m-%d"),
                             "$lte": local_end.strftime("%Y-%m-%d"),
@@ -746,10 +783,17 @@ async def upload_ecg_json(request: Request, background: BackgroundTasks):
     check_token(request)
     fd, path = tempfile.mkstemp(suffix=".json")
     size = 0
-    with os.fdopen(fd, "wb") as f:
-        async for chunk in request.stream():
-            f.write(chunk)
-            size += len(chunk)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Upload exceeds MAX_UPLOAD_BYTES.")
+                f.write(chunk)
+    except HTTPException:
+        try: os.remove(path)
+        except OSError: pass
+        raise
 
     # Immediately release the event loop and let the locked background thread handle extraction
     background.add_task(process_file, path, size)
@@ -818,12 +862,12 @@ def get_cardio_lab_overview(request: Request):
         .limit(200)
     )
 
-    latest_rec = db.records.find_one({}, {"date": 1, "_id": 0}, sort=[("date", -1)])
+    latest_rec = db.records.find_one({"source_policy": "apple_watch_only"}, {"date": 1, "_id": 0}, sort=[("date", -1)])
     if latest_rec and latest_rec.get("date"):
         cutoff = (datetime.strptime(latest_rec["date"], "%Y-%m-%d") - timedelta(days=DASH_DAYS)).strftime("%Y-%m-%d")
-        recs = list(db.records.find({"date": {"$gte": cutoff}}, {"_id": 0}))
+        recs = list(db.records.find({"source_policy": "apple_watch_only", "date": {"$gte": cutoff}}, {"_id": 0}))
         df_raw = records_to_df(recs)
-        sleep_rows = list(db.sleep.find({"date": {"$gte": cutoff}}, {"_id": 0}))
+        sleep_rows = list(db.sleep.find({"source_policy": "apple_watch_only", "date": {"$gte": cutoff}}, {"_id": 0}))
         df_sleep = pd.DataFrame(sleep_rows).drop_duplicates() if sleep_rows else pd.DataFrame()
     else:
         df_raw = pd.DataFrame()
