@@ -154,15 +154,8 @@ def subspace_mahalanobis_d2(z_vec, R_prior):
     z_sub = np.array([float(z_vec[i]) for i in valid_idx], dtype=float)
     R_sub = R_prior[np.ix_(valid_idx, valid_idx)]
     R_reg = 0.85 * R_sub + 0.15 * np.eye(k)
-    
-    # Deep Fix 25: Prevent Singular Matrix HTTP 500 Crashes
-    try:
-        inv_R_z = np.linalg.solve(R_reg, z_sub)
-        d2 = float(z_sub.T @ inv_R_z)
-    except np.linalg.LinAlgError:
-        # Fallback to unweighted Euclidean distance squared if covariance matrix is ill-conditioned
-        d2 = float(np.sum(z_sub ** 2))
-        
+    inv_R_z = np.linalg.solve(R_reg, z_sub)
+    d2 = float(z_sub.T @ inv_R_z)
     return max(0.0, d2), k
 
 
@@ -367,9 +360,6 @@ def analyze_export(xml_path):
                     if short_type == "WalkingSpeed" and unit == "m/s":
                         val *= 3.6
                         unit = "km/h"
-                    elif short_type in ("ActiveEnergyBurned", "BasalEnergyBurned") and str(unit).lower() == "kj":
-                        val /= 4.184
-                        unit = "kcal"
                     elif short_type == "WalkingStepLength" and unit == "m":
                         val *= 100.0
                         unit = "cm"
@@ -529,6 +519,35 @@ def prompt_optional_daily_log(latest_date):
         print("  -> Skipping log entry and launching dashboard...")
 
     return log_df
+
+
+def main_sleep_cluster(s_sub, gap_epochs=36):
+    """Keep only the MAIN sleep period of a date. Segments more than gap_epochs 5-min bins (3 h) apart
+    start a new cluster and the cluster with the most sleep hours wins, so a daytime nap can no longer
+    stretch the 'overnight' window (onset/wake/overnight HR) across the day."""
+    need = {"start_epoch", "end_epoch", "hours", "stage"}
+    if s_sub is None or s_sub.empty or not need.issubset(set(s_sub.columns)):
+        return s_sub
+    s = s_sub.sort_values("start_epoch")
+    ids, cid, last_end = [], 0, None
+    for st, en in zip(s["start_epoch"], s["end_epoch"]):
+        if last_end is not None and st - last_end > gap_epochs:
+            cid += 1
+        last_end = en if last_end is None else max(last_end, en)
+        ids.append(cid)
+    s = s.assign(_c=ids)
+    asleep = s[s["stage"] != "Awake in Bed"]
+    pool = asleep if not asleep.empty else s
+    best = pool.groupby("_c")["hours"].sum().idxmax()
+    return s[s["_c"] == best].drop(columns="_c")
+
+
+def _safe_to_csv(df, path):
+    """Diagnostic CSV side-effects must never be able to take the dashboard down (read-only disk, races)."""
+    try:
+        df.to_csv(path, index=False)
+    except Exception as e:
+        print(f"[warn] could not write {path}: {e}")
 
 
 # ==============================================================================
@@ -796,35 +815,13 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
     s_wtemp = metric_daily_series("AppleSleepingWristTemperature", "mean")
     s_noise = metric_daily_series("EnvironmentalAudioExposure", "mean")
 
-    def z_val_or_nan(val, series, default_mu, min_scale, current_date):
-        """Causal robust Z: only observations strictly before current_date, within 28 calendar days.
-        During the first 28 days the baseline expands over available past observations.
-        A physiological min_scale prevents zero/near-zero dispersion from exploding scores.
-        """
+    def z_val_or_nan(val, series, default_mu, min_sd):
         if val is None or pd.isna(val):
             return np.nan
-
-        current_ts = pd.to_datetime(str(current_date), errors="coerce")
-        if pd.isna(current_ts):
-            return np.nan
-        idx = pd.to_datetime(series.index.astype(str), errors="coerce")
-        cutoff = current_ts - pd.Timedelta(days=28)
-        valid = series[(idx < current_ts) & (idx >= cutoff)].dropna().astype(float)
-
-        if len(valid) == 0:
-            mu = float(default_mu)
-            scale = float(min_scale)
-        else:
-            arr = valid.to_numpy(dtype=float)
-            mu = float(np.median(arr))
-            med_abs_dev = float(np.median(np.abs(arr - mu)))
-            robust_scale = med_abs_dev / 0.6745
-            if robust_scale < 1e-9:
-                iqr = float(np.percentile(arr, 75) - np.percentile(arr, 25))
-                robust_scale = 0.7413 * iqr
-            scale = max(float(min_scale), robust_scale)
-
-        return (float(val) - mu) / scale
+        valid = series.dropna()
+        mu = float(valid.median()) if len(valid) >= 2 else default_mu
+        sd = max(float(valid.std(ddof=0)), min_sd) if len(valid) >= 2 else min_sd
+        return (float(val) - mu) / sd
 
     for d in all_dates:
         if not df_intra.empty:
@@ -847,35 +844,14 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
         hrv_d = s_hrv.get(d, np.nan)
         ln_hrv_d = math.log(max(float(hrv_d), 1.0)) if not pd.isna(hrv_d) else np.nan
 
-        # Causal trailing-28-day baseline for the daily HRV suppression score.
-        # Keep the sign convention: lower-than-baseline HRV produces a positive score.
-        hrv_idx = pd.to_datetime(s_hrv.index.astype(str), errors="coerce")
-        current_ts = pd.to_datetime(str(d), errors="coerce")
-        if not pd.isna(current_ts):
-            hrv_cutoff = current_ts - pd.Timedelta(days=28)
-            prior_hrv = s_hrv[(hrv_idx < current_ts) & (hrv_idx >= hrv_cutoff)].dropna().astype(float)
-        else:
-            prior_hrv = pd.Series(dtype=float)
-        prior_ln_hrv = np.log(prior_hrv.clip(lower=1.0).to_numpy(dtype=float)) if not prior_hrv.empty else np.array([])
-        if len(prior_ln_hrv):
-            hrv_mu = float(np.median(prior_ln_hrv))
-            hrv_mad = float(np.median(np.abs(prior_ln_hrv - hrv_mu)))
-            hrv_scale = hrv_mad / 0.6745
-            if hrv_scale < 1e-9:
-                hrv_iqr = float(np.percentile(prior_ln_hrv, 75) - np.percentile(prior_ln_hrv, 25))
-                hrv_scale = 0.7413 * hrv_iqr
-            hrv_scale = max(0.18, hrv_scale)
-        else:
-            hrv_mu, hrv_scale = math.log(58.0), 0.18
-
         z0_non_met_hr = (non_met_hr_d / 5.0) if not pd.isna(non_met_hr_d) else np.nan
-        z1_vagal_supp = ((hrv_mu - ln_hrv_d) / hrv_scale) if not pd.isna(ln_hrv_d) else np.nan
-        z2_rhr_elev = z_val_or_nan(s_rhr.get(d, np.nan), s_rhr, base_rhr, 2.8, d)
-        z3_resp_elev = z_val_or_nan(s_resp.get(d, np.nan), s_resp, 15.0, 1.0, d)
+        z1_vagal_supp = ((base_ln_hrv - ln_hrv_d) / sd_ln_hrv) if not pd.isna(ln_hrv_d) else np.nan
+        z2_rhr_elev = z_val_or_nan(s_rhr.get(d, np.nan), s_rhr, base_rhr, 2.8)
+        z3_resp_elev = z_val_or_nan(s_resp.get(d, np.nan), s_resp, 15.0, 1.0)
         z4_slp_frag = ((slp_debt_hrs - 0.8) / 1.1) if not pd.isna(slp_debt_hrs) else np.nan
         z5_dip_blunt = ((14.0 - dip_d) / 4.5) if not pd.isna(dip_d) else np.nan
-        z6_wtemp = z_val_or_nan(s_wtemp.get(d, np.nan), s_wtemp, 36.4, 0.22, d)
-        z7_noise = z_val_or_nan(s_noise.get(d, np.nan), s_noise, 66.0, 6.5, d)
+        z6_wtemp = z_val_or_nan(s_wtemp.get(d, np.nan), s_wtemp, 36.4, 0.22)
+        z7_noise = z_val_or_nan(s_noise.get(d, np.nan), s_noise, 66.0, 6.5)
 
         z_vec = [z0_non_met_hr, z1_vagal_supp, z2_rhr_elev, z3_resp_elev, z4_slp_frag, z5_dip_blunt, z6_wtemp, z7_noise]
         d2, k_obs = subspace_mahalanobis_d2(z_vec, R_prior_8x8)
@@ -891,13 +867,7 @@ def compute_stress_detective_engine(df_raw, df_sleep, workout_windows, log_df):
             z_sub = np.array([float(z_vec[i]) for i in valid_idx])
             w_sub = prior_w[valid_idx]
             R_sub = 0.85 * R_prior_8x8[np.ix_(valid_idx, valid_idx)] + 0.15 * np.eye(len(valid_idx))
-            
-            # Deep Fix 29: Protect the secondary Mahalanobis solver from Singular Matrix crashes
-            try:
-                w_ortho = np.linalg.solve(R_sub, w_sub)
-            except np.linalg.LinAlgError:
-                w_ortho = w_sub # Fall back to raw priors if collinearity destroys the matrix rank
-                
+            w_ortho = np.linalg.solve(R_sub, w_sub)
             stress_logit = float(w_ortho.T @ z_sub)
             stress_likelihood = float(np.clip(100.0 / (1.0 + math.exp(-1.25 * stress_logit)), 8.0, 98.0))
         else:
@@ -983,7 +953,7 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
 
     for d in all_dates:
         sub = df_raw[df_raw["date"] == d]
-        s_sub = df_sleep[df_sleep["date"] == d]
+        s_sub = main_sleep_cluster(df_sleep[df_sleep["date"] == d])
 
         hr_vals = sub[sub["metric"] == "HeartRate"]["value"]
         rhr_vals = sub[sub["metric"] == "RestingHeartRate"]["value"]
@@ -1025,52 +995,13 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
     df_feat["prev_ex_mins"] = df_feat["ex_mins"].shift(1).fillna(df_feat["ex_mins"])
     df_feat["prev_walk_mins"] = df_feat["walk_mins"].shift(1).fillna(df_feat["walk_mins"])
 
-    # Causal habitual sleep-midpoint baseline: each day is compared only with
-    # the preceding 28 calendar days (expanding history during the first 28 days).
-    feat_dates = pd.to_datetime(df_feat["date"].astype(str), errors="coerce")
-    midpoint_baselines = []
-    for i, current_ts in enumerate(feat_dates):
-        if pd.isna(current_ts):
-            midpoint_baselines.append(28.0)
-            continue
-        cutoff_ts = current_ts - pd.Timedelta(days=28)
-        mask = (feat_dates < current_ts) & (feat_dates >= cutoff_ts)
-        prior_midpoints = df_feat.loc[mask, "midpoint_hr"].dropna().astype(float)
-        midpoint_baselines.append(float(prior_midpoints.median()) if not prior_midpoints.empty else 28.0)
-    df_feat["timing_dev_hrs"] = np.abs(
-        df_feat["midpoint_hr"].astype(float).to_numpy() - np.asarray(midpoint_baselines, dtype=float)
-    )
+    med_midpoint = float(df_feat["midpoint_hr"].median())
+    df_feat["timing_dev_hrs"] = (df_feat["midpoint_hr"] - med_midpoint).abs()
 
     def calc_z(series, fallback_mean, min_sd):
-        """Per-day causal robust Z-scores with a trailing 28-calendar-day baseline."""
-        values = pd.to_numeric(series, errors="coerce").astype(float)
-        z_values = []
-        latest_mu, latest_scale = float(fallback_mean), float(min_sd)
-        for i, current_ts in enumerate(feat_dates):
-            x = values.iloc[i]
-            if pd.isna(x):
-                z_values.append(np.nan)
-                continue
-            if pd.isna(current_ts):
-                prior = values.iloc[:i].dropna()
-            else:
-                cutoff_ts = current_ts - pd.Timedelta(days=28)
-                prior_mask = (feat_dates < current_ts) & (feat_dates >= cutoff_ts)
-                prior = values.loc[prior_mask].dropna()
-            if prior.empty:
-                mu, scale = float(fallback_mean), float(min_sd)
-            else:
-                arr = prior.to_numpy(dtype=float)
-                mu = float(np.median(arr))
-                mad = float(np.median(np.abs(arr - mu)))
-                scale = mad / 0.6745
-                if scale < 1e-9:
-                    scale = 0.7413 * float(np.percentile(arr, 75) - np.percentile(arr, 25))
-                scale = max(float(min_sd), scale)
-            z_values.append((float(x) - mu) / scale)
-            if i == len(values) - 1:
-                latest_mu, latest_scale = mu, scale
-        return pd.Series(z_values, index=series.index, dtype=float), latest_mu, latest_scale
+        mu = float(series.mean()) if len(series) >= 2 else fallback_mean
+        sd = max(float(series.std(ddof=0)), min_sd)
+        return (series - mu) / sd, mu, sd
 
     df_feat["z_sleep"], mu_sleep, _ = calc_z(df_feat["sleep_hrs"], 7.5, 0.75)
     df_feat["z_timing"], mu_timing, _ = calc_z(df_feat["timing_dev_hrs"], 0.4, 0.45)
@@ -1094,9 +1025,7 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
         log_clean["date"] = log_clean["date"].astype(str)
         log_clean["mean_energy"] = log_clean[["energy_morning", "energy_afternoon", "energy_evening"]].mean(axis=1)
         merged = pd.merge(df_feat, log_clean, on="date", how="left")
-        
-        # Deep Fix 27: Prevent Linear Algebra crashes by ensuring no NaNs enter the X feature matrix
-        valid_train = merged.dropna(subset=["mean_energy"] + feature_cols)
+        valid_train = merged.dropna(subset=["mean_energy"])
     else:
         valid_train = pd.DataFrame()
 
@@ -1110,8 +1039,7 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
         beta_map = beta_0.copy()
         model_mode = f"Biophysical Prior Mode (Log 2+ days in {LOG_CSV} to adapt personal ML weights)"
 
-    # Deep Fix 28: Prevent NaN matrix poisoning by imputing missing Z-scores to their mathematical origin (Z=0.0)
-    X_all = df_feat[feature_cols].fillna(0.0).to_numpy(dtype=float)
+    X_all = df_feat[feature_cols].to_numpy(dtype=float)
     raw_pred_centered = X_all @ beta_map
     
     # SCIENTIFIC REFINEMENT: The Homeostatic Intercept
@@ -1155,29 +1083,7 @@ def compute_energy_predictor_engine(df_raw, df_sleep, log_df):
 
     wake_t = float(today["wake_hr"]) if 4.0 <= today["wake_hr"] <= 11.5 else 7.5
     s0 = 0.85 * math.exp(-float(today["sleep_hrs"]) / 4.2)
-    # Render hotfix: calculate a causal circular sleep-midpoint baseline locally.
-    # The previous code referenced `med_midpoint` without defining it in this function.
-    midpoint_now = pd.to_numeric(pd.Series([today.get("midpoint_hr")]), errors="coerce").iloc[0]
-    prior_mids = pd.to_numeric(
-        df_feat.iloc[:-1]["midpoint_hr"], errors="coerce"
-    ).dropna().to_numpy(dtype=float) if len(df_feat) > 1 else np.array([], dtype=float)
-    prior_mids = prior_mids[np.isfinite(prior_mids)]
-
-    if len(prior_mids):
-        angles = prior_mids * (2.0 * math.pi / 24.0)
-        mean_angle = math.atan2(
-            float(np.mean(np.sin(angles))),
-            float(np.mean(np.cos(angles))),
-        )
-        med_midpoint = (mean_angle % (2.0 * math.pi)) * 24.0 / (2.0 * math.pi)
-    else:
-        med_midpoint = float(midpoint_now) if pd.notna(midpoint_now) and np.isfinite(midpoint_now) else 4.0
-
-    if pd.notna(midpoint_now) and np.isfinite(midpoint_now):
-        # Signed shortest circular difference, constrained to [-12, 12) hours.
-        jetlag_shift = float((float(midpoint_now) - med_midpoint + 12.0) % 24.0 - 12.0)
-    else:
-        jetlag_shift = 0.0
+    jetlag_shift = float(today["midpoint_hr"] - med_midpoint)
 
     hours_grid = [round(6.0 + 0.5 * i, 1) for i in range(37)]
     alertness_curve, adenosine_curve, circadian_curve = [], [], []
@@ -1274,8 +1180,9 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
     pooled_tau_hrv = {t: [] for t in tau_grid}
 
     for idx, d in enumerate(all_dates):
-        prev_d = all_dates[idx - 1] if idx > 0 else d
-        s_sub = df_sleep[df_sleep["date"] == d].sort_values("start_epoch")
+        # calendar previous day (NOT the previous row): a missing day must give NaN, not a day from last week
+        prev_d = (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        s_sub = main_sleep_cluster(df_sleep[df_sleep["date"] == d]).sort_values("start_epoch")
 
         # 1. Sleep Stages, Duration, Timing & Shannon Fragmentation Entropy
         if not s_sub.empty:
@@ -1365,9 +1272,8 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
 
         # Daytime HR for Nocturnal Dip %
         day_hr_sub = df_raw[(df_raw["date"] == prev_d) & (df_raw["metric"] == "HeartRate") & (df_raw["hour"] >= 10.0) & (df_raw["hour"] <= 20.0)]["value"]
-        day_mean = float(day_hr_sub.mean()) if not day_hr_sub.empty else np.nan
-        if not pd.isna(day_mean) and day_mean > 10.0 and not pd.isna(mean_ov_hr):
-            nocturnal_dip_pct = round((1.0 - mean_ov_hr / day_mean) * 100.0, 1)
+        if not day_hr_sub.empty and not pd.isna(mean_ov_hr):
+            nocturnal_dip_pct = round((1.0 - mean_ov_hr / float(day_hr_sub.mean())) * 100.0, 1)
         else:
             nocturnal_dip_pct = np.nan
 
@@ -1478,7 +1384,7 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
         })
 
     df_nights = pd.DataFrame(night_records)
-    # df_nights.to_csv("sleep_360_diary.csv", index=False)  # Disabled for cloud deployment
+    _safe_to_csv(df_nights, "sleep_360_diary.csv")
 
     # --- PART B: CIRCULAR CLOCK CONSISTENCY & SOCIAL JETLAG ---
     mean_onset, sd_onset, reg_onset = circular_clock_stats(df_nights["onset_hr"].tolist())
@@ -1624,7 +1530,7 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
             "badge_col": badge_col,
         })
 
-    # pd.DataFrame(experiment_results).to_csv(EXP_CSV, index=False)  # Disabled for cloud deployment
+    _safe_to_csv(pd.DataFrame(experiment_results), EXP_CSV)
 
     # Generate Personalized Experiment Recommendations Based on Data Gaps
     recommendations = []
@@ -1646,15 +1552,14 @@ def compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle,
         )
 
     latest_n = df_nights.iloc[-1]
-    slp_q = latest_n["sleep_quality_score"]
-    if pd.isna(slp_q):
-        slp_label, slp_col = "No Sleep Data", "#8c95a6"
-    elif slp_q >= 75.0:
+    slp_q = latest_n["sleep_quality_score"] if latest_n["sleep_quality_score"] is not None else 74.0
+    if slp_q >= 75.0:
         slp_label, slp_col = "Restorative & Phase-Aligned", "#10b981"
     elif slp_q >= 55.0:
         slp_label, slp_col = "Moderate Restoration", "#f59e0b"
     else:
         slp_label, slp_col = "Fragmented / Recovery Debt", "#ef4444"
+
     return {
         "latest_quality": round(float(slp_q), 1),
         "quality_label": slp_label,
@@ -2333,9 +2238,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         return None
 
     def clk(h):
-        # x0/x1 are hours relative to a noon-anchored base_day; convert back
-        # to wall-clock time before formatting AM/PM.
-        h = (h + 12) % 24
+        h = h % 24
         hh, mm = int(h), int(round((h - int(h)) * 60))
         if mm == 60: hh, mm = (hh + 1) % 24, 0
         return f"{(hh % 12) or 12}:{mm:02d} {'AM' if hh < 12 else 'PM'}"
@@ -2476,15 +2379,6 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         if is_summary_night:
             rows = [(k, None, None, mins_by[k]) for k in ORDER if mins_by[k] > 0]
         else:
-            # Deep Fix 23: Anchor base_day to Noon of the biological waking day to fix Plotly phase shifts
-            first_dt = night["start"].min()
-            base_day = first_dt.replace(hour=12, minute=0, second=0, microsecond=0)
-            if first_dt.hour < 12:
-                base_day -= pd.Timedelta(days=1)
-                
-            night["x0"] = (night["start"] - base_day).dt.total_seconds() / 3600
-            night["x1"] = (night["end"] - base_day).dt.total_seconds() / 3600
-
             rows = [(r.key, float(r.x0), float(r.x1), float(r.mins)) for r in night.itertuples()]
             stage_blocks = [{"key": k, "stage": STAGES[k][1], "x0": round(a, 4), "x1": round(b, 4), "mins": int(round(m))} for k, a, b, m in rows]
 
@@ -3376,10 +3270,6 @@ if (typeof initBodyScene === 'function') initBodyScene();
           b.innerText = 'Needs Data';
           b.style.setProperty('--c', C.warn);
           m.innerHTML = data.detail + ' Open this dashboard in a Private/Incognito window to log more check-ins.';
-        }} else if (data.status === 'not_evaluable_model_not_connected') {{
-          b.innerText = 'Model Disconnected';
-          b.style.setProperty('--c', C.dim);
-          m.innerHTML = data.reason;
         }} else if (data.status === 'validation_complete') {{
           b.innerText = 'N = ' + data.n_samples_tested + ' Check-ins';
           b.style.setProperty('--c', C.energy);
@@ -3387,6 +3277,10 @@ if (typeof initBodyScene === 'function') initBodyScene();
             '<div style="background:var(--s2);padding:14px;border-radius:14px;border:1px solid var(--line);"><b>Model RMSE (Error Rate)</b><br><span style="font-size:24px;font-weight:800;color:var(--tx);letter-spacing:-0.02em;">' + data.metrics.RMSE + '%</span></div>' +
             '<div style="background:var(--s2);padding:14px;border-radius:14px;border:1px solid var(--line);"><b>Baseline Guessing RMSE</b><br><span style="font-size:24px;font-weight:800;color:var(--dim);letter-spacing:-0.02em;">' + data.metrics.Baseline_Guess_MAE + '%</span></div>' +
             '</div><span style="color:var(--energy);font-weight:600;">' + data.interpretation + '</span>';
+        }} else {{
+          b.innerText = 'Not evaluable yet';
+          b.style.setProperty('--c', C.warn);
+          m.textContent = data.reason || data.detail || data.status || 'The validation model is not connected yet.';
         }}
       }}).catch(e => console.error('Validation fetch error:', e));
     Plotly.newPlot('c_st_intra', [
@@ -3628,7 +3522,7 @@ if (typeof initBodyScene === 'function') initBodyScene();
       ...base, margin:{{ ...base.margin, r:56 }},
       xaxis:{{ ...base.xaxis, title:{{ text:'Share of the night completed (0 = bedtime, 1 = wake-up)' }}, type:'linear' }},
       yaxis:{{ ...base.yaxis, title:{{ text:'Heart rate (bpm)' }}, type:'linear' }},
-      yaxis2:{{ overlaying:'y', side:'right', title:{{ text:'PPG SDNN / ECG RMSSD (ms; distinct metrics)', font:{{ color:C.hr, size:11 }} }}, showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }}
+      yaxis2:{{ overlaying:'y', side:'right', title:{{ text:'HRV (ms)', font:{{ color:C.hr, size:11 }} }}, showgrid:false, zeroline:false, tickfont:{{ color:C.hr, size:11 }} }}
     }}, cfg);
 
     const hy = document.getElementById('c_hypno');
@@ -3763,31 +3657,18 @@ async function uploadEcgJsonFile(input) {{
         headers: {{ 'Content-Type': 'application/json' }},
         body: text
       }});
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const accepted = await res.json();
-      if (!accepted.job_id) throw new Error('Server did not return an upload job ID');
-      lbl.innerText = 'Upload accepted; processing…';
-      let finished = false;
-      for (let attempt = 0; attempt < 120; attempt++) {{
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        const statusRes = await fetch('/api/ecg/upload/' + encodeURIComponent(accepted.job_id) + window.location.search);
-        if (!statusRes.ok) throw new Error('Could not check processing status (HTTP ' + statusRes.status + ')');
-        const job = await statusRes.json();
-        if (job.status === 'completed') {{
-          finished = true;
-          lbl.innerText = 'Processing complete; refreshing Cardio Lab…';
+      if (res.ok) {{
+        lbl.innerText = 'Processing in background! Give it a moment...';
+        setTimeout(() => {{
           RENDERED['cardio'] = false;
-          await renderCardio();
+          renderCardio();
           lbl.innerText = 'Upload Apple Health ECG (.json)';
-          break;
-        }}
-        if (job.status === 'failed') throw new Error('Backend processing failed; check server logs/status.');
-        lbl.innerText = 'Processing ECG data… (' + (attempt + 1) + '/120)';
+        }}, 3500);
+      }} else {{
+        lbl.innerText = 'Upload failed';
       }}
-      if (!finished) lbl.innerText = 'Still processing. Check Cardio Lab again shortly; the upload was accepted.';
-      input.value = '';
     }} catch (e) {{
-      lbl.innerText = 'Upload/processing error: ' + e.message;
+      lbl.innerText = 'Error uploading ECG JSON';
     }}
   }}
 
@@ -3928,7 +3809,7 @@ async function uploadEcgJsonFile(input) {{
     const ov = CARDIO_OVERVIEW;
     const meth = ov.methodology || {{}};
     document.getElementById('cardio_disclaimer').innerText = meth.disclaimer || '';
-    document.getElementById('ecg_count_badge').innerText = (ov.ecg_count ?? 0) + ' Stored ECGs' + ((ov.ecg_count ?? 0) > (ov.ecg_returned_count ?? (ov.ecg_recordings || []).length) ? ' · latest ' + (ov.ecg_returned_count ?? (ov.ecg_recordings || []).length) + ' shown' : '');
+    document.getElementById('ecg_count_badge').innerText = (ov.ecg_count || 0) + ' Stored ECGs';
 
     // Populate ECG selector and history table
     const ecgs = ov.ecg_recordings || [];
@@ -3950,7 +3831,7 @@ async function uploadEcgJsonFile(input) {{
           '<td>' + (sm.estimated_fs_hz ?? '—') + ' Hz (' + (sm.median_dt_ms ?? '—') + ' ms)</td>' +
           '<td><span class="pill" style="--c:' + (sq.sqi_color || '#7cc4ff') + '">' + (sq.sqi_score ?? '—') + '%</span></td>' +
           '<td>' + (bt.detected_beats ?? 0) + ' beats / ' + (bt.mean_hr_bpm ?? '—') + ' bpm</td>' +
-          '<td><b>' + (hv.rmssd_ms != null && hv.rmssd_ms !== '' ? (hv.rmssd_ms + ' ms') : '—') + '</b></td></tr>';
+          '<td><b>' + (hv.rmssd_ms ? (hv.rmssd_ms + ' ms') : '—') + '</b></td></tr>';
       }}).join('');
       await loadSelectedEcg(ecgs[0].ecg_id);
     }} else {{
@@ -3971,7 +3852,7 @@ async function uploadEcgJsonFile(input) {{
       ...base, hovermode: 'x unified', margin: {{ ...base.margin, r: 56 }},
       xaxis: {{ ...base.xaxis, title: {{ text: 'Date' }} }},
       yaxis: {{ ...base.yaxis, title: {{ text: 'Resting Heart Rate (bpm)' }} }},
-      yaxis2: {{ overlaying: 'y', side: 'right', title: {{ text: 'PPG SDNN / ECG RMSSD (ms; distinct metrics)', font: {{ color: C.hr, size: 11 }} }}, showgrid: false, zeroline: false }}
+      yaxis2: {{ overlaying: 'y', side: 'right', title: {{ text: 'HRV (ms)', font: {{ color: C.hr, size: 11 }} }}, showgrid: false, zeroline: false }}
     }}, cfg);
 
     document.getElementById('cardio_sensor_audit_rows').innerHTML = (bl.sensor_audit || []).map(s => {{
@@ -3985,7 +3866,7 @@ async function uploadEcgJsonFile(input) {{
         '<td><b>' + (s.latest ?? '—') + ' ' + (s.unit || '') + '</b></td>' +
         '<td>' + (s.median ?? '—') + ' &plusmn; ' + (s.mad ?? '—') + ' ' + (s.unit || '') + '</td>' +
         '<td>' + (s.p10 ?? '—') + ' &ndash; ' + (s.p90 ?? '—') + '</td>' +
-        '<td><span class="pill" style="--c:' + zCol + '">' + (s.latest_z_robust != null ? (s.latest_z_robust + ' robust z') : '—') + '</span></td></tr>';
+        '<td><span class="pill" style="--c:' + zCol + '">' + (s.latest_z_robust != null ? (s.latest_z_robust + ' SD') : '—') + '</span></td></tr>';
     }}).join('');
 
     // Module E: Anomaly Reports
@@ -4159,8 +4040,9 @@ async function uploadEcgJsonFile(input) {{
 </body>
 </html>"""
 
-    print("[6/6] Unified 3-Activity Biometric Science Lab HTML generated.")
-    return html
+    with open("biometric_science_lab.html", "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"[6/6] Unified 3-Activity Biometric Science Lab written: {os.path.abspath(HTML_DASHBOARD)}")
 
 
 if __name__ == "__main__":
@@ -4172,3 +4054,8 @@ if __name__ == "__main__":
     pred_bundle = compute_energy_predictor_engine(df_raw, df_sleep, log_df)
     sleep_bundle = compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle, pred_bundle)
     build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle)
+    _p = os.path.abspath(HTML_DASHBOARD)          # local CLI only: open the page in a browser
+    try:
+        os.startfile(_p)
+    except AttributeError:
+        webbrowser.open("file://" + _p)
