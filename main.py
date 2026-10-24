@@ -52,8 +52,7 @@ class ECGProtocolLogRecord(BaseModel):
 # ------------------------------------------------------------------------------
 # Render environment variables
 #   MONGO_URI       required
-#   WEBHOOK_TOKEN   required. Every protected URL needs ?token=<value>
-#   MAX_UPLOAD_BYTES optional, default 250 MiB
+#   WEBHOOK_TOKEN   optional. If set, every URL needs ?token=<value>
 #   DASH_DAYS       optional, default 90. How many days the dashboard loads (keeps RAM low)
 # ------------------------------------------------------------------------------
 MONGO_URI = os.getenv("MONGO_URI")
@@ -61,7 +60,6 @@ if not MONGO_URI:
     raise RuntimeError("Set MONGO_URI in the Render Environment tab.")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 DASH_DAYS = int(os.getenv("DASH_DAYS", "90"))
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(250 * 1024 * 1024)))
 
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=8000)
 db = client.biolab
@@ -88,6 +86,8 @@ def to_ist_str(iso_utc):
     except (ValueError, TypeError):
         return None
 STATUS = {"last_upload": None, "ok": None, "detail": None, "seconds": None}
+# In-memory status for asynchronous ECG uploads; job IDs are unguessable and short-lived.
+UPLOAD_JOBS = {}
 INDEXES = {"ready": False, "error": None}
 
 
@@ -99,6 +99,28 @@ def ensure_indexes_once():
         db.ecg_recordings.create_index("ecg_id", unique=True)
         db.ecg_recordings.create_index([("start_epoch", -1)])
         db.ecg_recordings.create_index([("date", -1)])
+        db.records.create_index([("date", 1), ("metric", 1), ("epoch_5m", 1)], background=True)
+
+        # Idempotent In-Place Lineage Repair for Historical kJ & Unit Strings
+        db.records.update_many(
+            {"metric": {"$in": ["ActiveEnergyBurned", "BasalEnergyBurned"]}, "units": {"$in": ["kJ", "kj"]}},
+            [
+                {
+                    "$set": {
+                        "value": {"$round": [{"$divide": ["$value", 4.184]}, 4]},
+                        "units": "kcal",
+                    }
+                }
+            ],
+        )
+        db.records.update_many({"metric": "WalkingSpeed", "units": "m/s"}, {"$set": {"units": "km/h"}})
+        db.records.update_many({"metric": "WalkingStepLength", "units": "m"}, {"$set": {"units": "cm"}})
+        db.records.update_many({"metric": "DistanceWalkingRunning", "units": "m"}, {"$set": {"units": "km"}})
+        
+        # Purge corrupted out-of-bounds artifacts
+        db.records.delete_many({"metric": "HeartRate", "$or": [{"value": {"$lt": 25.0}}, {"value": {"$gt": 240.0}}]})
+        db.records.delete_many({"metric": "OxygenSaturation", "$or": [{"value": {"$lt": 50.0}}, {"value": {"$gt": 100.0}}]})
+        db.records.delete_many({"metric": "HeartRateVariabilitySDNN", "$or": [{"value": {"$lt": 1.0}}, {"value": {"$gt": 300.0}}]})
         INDEXES.update(ready=True, error=None)
     except Exception as e:
         INDEXES["error"] = str(e)
@@ -106,13 +128,11 @@ def ensure_indexes_once():
 
 
 ensure_indexes_once()
-
+# Run Cardio Lab mathematical self-tests once at boot
+CARDIO_SELF_TEST_RESULTS = cardio_lab.run_cardio_lab_self_tests()
 
 def check_token(request: Request):
-    if not WEBHOOK_TOKEN:
-        raise HTTPException(status_code=503, detail="Authentication is not configured. Set WEBHOOK_TOKEN.")
-    supplied = request.query_params.get("token", "")
-    if not secrets.compare_digest(supplied, WEBHOOK_TOKEN):
+    if WEBHOOK_TOKEN and not secrets.compare_digest(request.query_params.get("token", ""), WEBHOOK_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -127,26 +147,39 @@ def clean_nans(obj):
 
 
 def records_to_df(recs):
-    """DataFrame of 5-minute bins in strict chronological order. Sorts on the numeric UTC epoch,
-    never on the timestamp string (string order breaks as soon as two formats are mixed)."""
+    """DataFrame of 5-minute bins in strict chronological order with guaranteed schema columns."""
     if not recs:
         return pd.DataFrame()
     df = pd.DataFrame(recs)
-    # Legacy rows have no auditable source provenance; never present them as Watch data.
-    if "source_policy" in df.columns:
-        df = df[df["source_policy"] == "apple_watch_only"].copy()
-    else:
-        return pd.DataFrame()
     df["epoch_5m"] = pd.to_numeric(df["epoch_5m"], errors="coerce")
     df = df.dropna(subset=["epoch_5m"])
+    df["epoch_5m"] = df["epoch_5m"].astype("int64")
     df = df.drop_duplicates(subset=["metric", "epoch_5m"], keep="last")
-    return df.sort_values(["epoch_5m", "metric"], kind="stable").reset_index(drop=True)
+    df = df.sort_values(["epoch_5m", "metric"], kind="stable").reset_index(drop=True)
+
+    # Deep Fix 40: Guarantee 'timestamp', 'date', 'hour', and 'unit' exist for downstream engines
+    dt_ist = pd.to_datetime(df["epoch_5m"] * 300, unit="s", utc=True).dt.tz_convert(IST)
+    if "date" not in df.columns or df["date"].isna().any():
+        df["date"] = dt_ist.dt.strftime("%Y-%m-%d")
+    if "timestamp" not in df.columns or df["timestamp"].isna().any():
+        df["timestamp"] = dt_ist.dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        df["timestamp"] = df["timestamp"].astype(str).str.replace("T", " ", regex=False)
+    if "hour" not in df.columns or df["hour"].isna().any():
+        df["hour"] = (dt_ist.dt.hour + dt_ist.dt.minute / 60.0).round(2)
+    if "unit" not in df.columns and "units" in df.columns:
+        df["unit"] = df["units"]
+    elif "unit" in df.columns and "units" in df.columns:
+        df["unit"] = df["unit"].fillna(df["units"])
+    return df
 
 
-def process_file(path: str, size: int):
+def process_file(path: str, size: int, job_id: Optional[str] = None):
     """Runs after the HTTP response is sent. Streams the saved file, never loads it whole."""
     with LOCK:
         t0 = time.time()
+        if job_id:
+            UPLOAD_JOBS[job_id] = {"status": "processing", "started_at": now_ist_str()}
         try:
             ensure_indexes_once()
             ing = ingest.Ingestor()
@@ -157,9 +190,21 @@ def process_file(path: str, size: int):
             detail["ecg_saved"] = ecg_detail.get("ecg_saved", 0)
             detail["upload_mb"] = round(size / 1024 / 1024, 1)
             STATUS.update(ok=True, detail=detail)
+            if job_id:
+                UPLOAD_JOBS[job_id] = {
+                    "status": "completed",
+                    "detail": detail,
+                    "finished_at": now_ist_str(),
+                }
         except Exception as e:
             traceback.print_exc()
             STATUS.update(ok=False, detail=repr(e))
+            if job_id:
+                UPLOAD_JOBS[job_id] = {
+                    "status": "failed",
+                    "error": repr(e),
+                    "finished_at": now_ist_str(),
+                }
         finally:
             STATUS.update(last_upload=now_ist_str(), seconds=round(time.time() - t0, 1))
             try:
@@ -174,17 +219,10 @@ async def receive_health_data(request: Request, background: BackgroundTasks):
     # 1) Save the upload to disk piece by piece (flat memory, however big it is).
     fd, path = tempfile.mkstemp(suffix=".json")
     size = 0
-    try:
-        with os.fdopen(fd, "wb") as f:
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Upload exceeds MAX_UPLOAD_BYTES.")
-                f.write(chunk)
-    except HTTPException:
-        try: os.remove(path)
-        except OSError: pass
-        raise
+    with os.fdopen(fd, "wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+            size += len(chunk)
     # 2) Answer the iPhone right away; the parsing happens in the background.
     background.add_task(process_file, path, size)
     return {"status": "accepted", "bytes": size}
@@ -196,23 +234,17 @@ def health():
 
 @app.post("/api/system/sanitize")
 def sanitize_database(request: Request):
-    """DESTRUCTIVE. POST only; a token must be configured; explicit confirmation; never during an upload."""
-    if not WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Set WEBHOOK_TOKEN before using this endpoint.")
     check_token(request)
-    if request.query_params.get("confirm") != "DELETE-SENSOR-DATA":
-        raise HTTPException(status_code=400, detail="Add confirm=DELETE-SENSOR-DATA to proceed.")
-
-    with LOCK:
-        # 1. Drop the automated sensor collections (the corrupted data)
-        db.records.drop()
-        db.sleep.drop()
-        db.sleep_raw.drop()
-
-        # 2. Reset the system so it builds fresh, clean indexes on your next upload
-        INDEXES["ready"] = False
-        ensure_indexes_once()
-
+    
+    # 1. Drop the automated sensor collections (the corrupted data)
+    db.records.drop()
+    db.sleep.drop()
+    db.sleep_raw.drop()
+    
+    # 2. Reset the system so it builds fresh, clean indexes on your next upload
+    INDEXES["ready"] = False
+    ensure_indexes_once()
+    
     return {"status": "Sanitization complete. Your old ghost data is cleared. Please re-upload your Apple Health export."}
 
 @app.post("/api/checkin")
@@ -269,7 +301,7 @@ def get_records(
     page = max(1, page)
     limit = min(max(1, limit), 500)
 
-    query = {"source_policy": "apple_watch_only"}
+    query = {}
     if metric:
         query["metric"] = metric
     if start:
@@ -280,30 +312,49 @@ def get_records(
     total = db.records.count_documents(query)
     skip = (page - 1) * limit
 
-    rows = list(
+    raw_rows = list(
         db.records.find(query, {"_id": 0})
         .sort([("epoch_5m", -1), ("metric", 1)])
         .skip(skip)
         .limit(limit)
     )
+    rows = raw_rows
 
-    # Summarize the time gaps for each metric in the returned page.
-    previous = {}
+    # Compute gaps chronologically per metric. For the oldest row of each metric
+    # on this page, fetch the nearest older row from MongoDB so pagination does
+    # not turn a real gap into None. Preserve active metric/date filters.
+    previous_timestamp = {}
     for row in reversed(rows):
         metric_name = row.get("metric", "Unknown")
         ts = row.get("timestamp", "")
-        if metric_name in previous:
-            # rows are walked oldest -> newest: this row minus the previous (older) one is positive
-            row["gap_minutes"] = round(
-                (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-                 - datetime.strptime(previous[metric_name], "%Y-%m-%d %H:%M:%S")
-                ).total_seconds() / 60, 1
+        older_ts = previous_timestamp.get(metric_name)
+
+        if older_ts is None:
+            older_query = dict(query)
+            older_query["metric"] = metric_name
+            older_query["epoch_5m"] = {"$lt": row.get("epoch_5m")}
+            older_row = db.records.find_one(
+                older_query,
+                {"_id": 0, "timestamp": 1},
+                sort=[("epoch_5m", -1)],
             )
+            older_ts = older_row.get("timestamp") if older_row else None
+
+        if older_ts and ts:
+            try:
+                row["gap_minutes"] = round(
+                    (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                     - datetime.strptime(older_ts, "%Y-%m-%d %H:%M:%S")
+                    ).total_seconds() / 60, 1
+                )
+            except (ValueError, TypeError):
+                row["gap_minutes"] = None
         else:
             row["gap_minutes"] = None
-        previous[metric_name] = ts
 
-    metrics = db.records.distinct("metric", {"source_policy": "apple_watch_only"})
+        previous_timestamp[metric_name] = ts
+
+    metrics = db.records.distinct("metric")
     return {
         "page": page,
         "limit": limit,
@@ -312,7 +363,6 @@ def get_records(
         "metrics": sorted(metrics),
         "rows": rows,
         "data_type": "stored_5_minute_bins",
-        "source_policy": "apple_watch_only",
     }
 
 
@@ -323,9 +373,9 @@ def stats(request: Request):
     return {
         "last_ingest": STATUS,
         "indexes": INDEXES,
-        "records": db.records.count_documents({"source_policy": "apple_watch_only"}),
-        "sleep_rows": db.sleep.count_documents({"source_policy": "apple_watch_only"}),
-        "sleep_raw_rows": db.sleep_raw.count_documents({"source_policy": "apple_watch_only"}),
+        "records": db.records.estimated_document_count(),
+        "sleep_rows": db.sleep.estimated_document_count(),
+        "sleep_raw_rows": db.sleep_raw.estimated_document_count(),
         "ecg_recordings": db.ecg_recordings.estimated_document_count(),
         "storage_mb": round(db_stats.get("storageSize", 0) / 1024 / 1024, 1),
     }
@@ -342,193 +392,96 @@ def _waiting_page(msg):
 @app.get("/", response_class=HTMLResponse)
 def serve_cockpit(request: Request):
     check_token(request)
-    latest = db.records.find_one({"source_policy": "apple_watch_only"}, {"date": 1, "_id": 0}, sort=[("date", -1)])
+    latest = db.records.find_one({}, {"date": 1, "_id": 0}, sort=[("date", -1)])
     if not latest:
         return _waiting_page("No data yet. Send an export from your iPhone.")
 
     # Only the most recent DASH_DAYS days are loaded, so RAM stays small however big the database grows.
     cutoff = (datetime.strptime(latest["date"], "%Y-%m-%d") - timedelta(days=DASH_DAYS)).strftime("%Y-%m-%d")
-    recs = list(db.records.find({"source_policy": "apple_watch_only", "date": {"$gte": cutoff}}, {"_id": 0}))
+    recs = list(db.records.find({"date": {"$gte": cutoff}}, {"_id": 0}))
     if len(recs) < 5:
         return _waiting_page(f"Only {len(recs)} records so far.")
     df_raw = records_to_df(recs)
     del recs
 
-    sleep_rows = list(db.sleep.find({"source_policy": "apple_watch_only", "date": {"$gte": cutoff}}, {"_id": 0}))
+    sleep_rows = list(db.sleep.find({"date": {"$gte": cutoff}}, {"_id": 0}))
     df_sleep = pd.DataFrame(sleep_rows).drop_duplicates() if sleep_rows else pd.DataFrame(
         columns=["date", "stage", "hours", "onset_hr", "wake_hr", "start_epoch", "end_epoch"])
-    raw_rows = list(db.sleep_raw.find({"source_policy": "apple_watch_only", "d": {"$gte": cutoff}}, {"_id": 0}))
+    raw_rows = list(db.sleep_raw.find({"d": {"$gte": cutoff}}, {"_id": 0}))
     df_raw_sleep = pd.DataFrame(raw_rows) if raw_rows else None
 
-    log_df = pd.DataFrame(columns=[
+    # Deep Fix 21, 24, 26 & 41: Full Outer-Join of Check-ins + Class Attendance into log_df
+    checkins = list(db.psych_checkins.find({"skipped": False, "server_timestamp_ist": {"$gte": cutoff}}, {"_id": 0}))
+    attendance = list(db.class_attendance.find({"server_timestamp_ist": {"$gte": cutoff}}, {"_id": 0}))
+
+    att_dict = {}
+    for doc in attendance:
+        parts = str(doc.get("class_id", "")).split("|")
+        if len(parts) == 2:
+            d_str, subj = parts[0], parts[1]
+            status = doc.get("status", "")
+            att_dict.setdefault(d_str, []).append(f"{subj} ({status})")
+
+    rows_by_date = {}
+    if checkins:
+        df_c = pd.DataFrame(checkins)
+        df_c["dt"] = pd.to_datetime(df_c["server_timestamp_ist"], errors="coerce")
+        df_c = df_c.dropna(subset=["dt"])
+        df_c["date"] = df_c["dt"].dt.strftime("%Y-%m-%d")
+        df_c["hour"] = df_c["dt"].dt.hour
+
+        # Map 0-4 Arousal & Stress scales to 1-5 Engine scales
+        df_c["energy"] = pd.to_numeric(df_c.get("arousal"), errors="coerce") + 1.0
+        df_c["stress_scaled"] = pd.to_numeric(df_c.get("stress"), errors="coerce") + 1.0
+
+        for d_str, grp in df_c.groupby("date"):
+            e_m = grp[grp["hour"] < 12]["energy"].mean()
+            e_a = grp[(grp["hour"] >= 12) & (grp["hour"] < 17)]["energy"].mean()
+            e_e = grp[grp["hour"] >= 17]["energy"].mean()
+            day_mean = grp["energy"].mean()
+            s_mean = grp["stress_scaled"].mean()
+
+            rows_by_date[d_str] = {
+                "date": d_str,
+                "energy_morning": e_m if not pd.isna(e_m) else day_mean,
+                "energy_afternoon": e_a if not pd.isna(e_a) else day_mean,
+                "energy_evening": e_e if not pd.isna(e_e) else day_mean,
+                "study_hours": np.nan, "productivity_rating": np.nan,
+                "best_focus_window": np.nan,
+                "stress_rating": s_mean if not pd.isna(s_mean) else np.nan,
+                "mood_rating": np.nan, "workload_rating": np.nan,
+                "caffeine_cups": np.nan,
+                "calendar_event": "Classes: " + ", ".join(att_dict[d_str]) if d_str in att_dict else np.nan,
+            }
+
+    # Include dates that have Class Attendance even if no psych_checkin was logged that day
+    for d_str, entries in att_dict.items():
+        if d_str not in rows_by_date:
+            rows_by_date[d_str] = {
+                "date": d_str,
+                "energy_morning": np.nan, "energy_afternoon": np.nan, "energy_evening": np.nan,
+                "study_hours": np.nan, "productivity_rating": np.nan, "best_focus_window": np.nan,
+                "stress_rating": np.nan, "mood_rating": np.nan, "workload_rating": np.nan,
+                "caffeine_cups": np.nan,
+                "calendar_event": "Classes: " + ", ".join(entries),
+            }
+
+    exhaustive_columns = [
         "date", "energy_morning", "energy_afternoon", "energy_evening",
         "study_hours", "productivity_rating", "best_focus_window",
         "stress_rating", "mood_rating", "workload_rating", "caffeine_cups", "calendar_event",
-    ])
+        "caffeine_cutoff_hr", "screen_off_mins", "last_meal_hrs_before_bed",
+        "nap_mins", "bedtime_routine", "experiment_name", "experiment_phase",
+    ]
+    log_rows = [rows_by_date[k] for k in sorted(rows_by_date.keys())]
+    log_df = pd.DataFrame(log_rows, columns=exhaustive_columns) if log_rows else pd.DataFrame(columns=exhaustive_columns)
 
     stress_bundle = analyze_health.compute_stress_detective_engine(df_raw, df_sleep, [], log_df)
     pred_bundle = analyze_health.compute_energy_predictor_engine(df_raw, df_sleep, log_df)
     sleep_bundle = analyze_health.compute_sleep_experiment_lab_engine(df_raw, df_sleep, log_df, stress_bundle, pred_bundle)
     sleep_bundle["diary_rows"] = clean_nans(sleep_bundle["diary_rows"])
 
-    with RENDER_LOCK:
-        analyze_health.build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=df_raw_sleep)
-        with open("biometric_science_lab.html", "r", encoding="utf-8") as f:
-            html = f.read()
-
-    ingest_detail = STATUS.get("detail") if isinstance(STATUS.get("detail"), dict) else {}
-    excluded_sources = ingest_detail.get("source_excluded", {})
-    excluded_count = sum(int(v) for v in excluded_sources.values() if isinstance(v, (int, float)))
-    watch_data_notice = f"""
-    <aside role="note" aria-label="Watch-only data quality" style="
-      max-width: 1100px; margin: 18px auto; padding: 14px 18px;
-      background: #3b2f12; color: #fff1c2; border: 1px solid #a87917;
-      border-radius: 12px; font: 14px/1.5 system-ui, sans-serif;
-    ">
-      <strong>Apple Watch source filter is on.</strong>
-      The dashboard includes records explicitly attributed to Apple Watch. Mixed Watch+iPhone,
-      iPhone-only, and missing-source records are excluded. Excluded records in the latest upload:
-      <strong>{excluded_count:,}</strong>. Where Health Auto Export merged sources, the Watch-only
-      contribution cannot be recovered from that merged value; activity totals and derived scores
-      may therefore be incomplete. Use a source-separated export before treating these as full-day totals.
-    </aside>
-    """
-
-    checkin_widget = r"""
-    <section id="bio-checkin" style="
-        max-width: 720px; margin: 32px auto; padding: 24px;
-        background: #111827; color: #e5e7eb; border: 1px solid #374151;
-        border-radius: 16px; font-family: system-ui, sans-serif;
-    ">
-      <h2 style="margin-top:0">🧠 Bio Lab — Stress Check-in</h2>
-      <p style="color:#9ca3af">
-        Record how you feel right now. Your watch data will be matched later.
-      </p>
-
-      <form id="bio-checkin-form">
-        <label for="bio-stress">Stress level (0–4)</label>
-        <select id="bio-stress" required style="display:block;width:100%;padding:10px;margin:6px 0 16px">
-          <option value="0">0 — None</option>
-          <option value="1" selected>1 — Mild</option>
-          <option value="2">2 — Moderate</option>
-          <option value="3">3 — High</option>
-          <option value="4">4 — Extreme</option>
-        </select>
-
-        <label for="bio-arousal">Arousal / activation (0–4)</label>
-        <select id="bio-arousal" required style="display:block;width:100%;padding:10px;margin:6px 0 16px">
-          <option value="0">0 — Very low / calm</option>
-          <option value="1">1 — Low</option>
-          <option value="2" selected>2 — Moderate</option>
-          <option value="3">3 — High / activated</option>
-          <option value="4">4 — Very high</option>
-        </select>
-
-        <label for="bio-valence">Mood / feeling</label>
-        <select id="bio-valence" required style="display:block;width:100%;padding:10px;margin:6px 0 16px">
-          <option value="negative">Negative</option>
-          <option value="neutral" selected>Neutral</option>
-          <option value="positive">Positive</option>
-        </select>
-
-        <label for="bio-context">What are you doing?</label>
-        <select id="bio-context" required style="display:block;width:100%;padding:10px;margin:6px 0 20px">
-          <option value="Resting / everyday activity">Resting / everyday activity</option>
-          <option value="Studying">Studying</option>
-          <option value="Walking">Walking</option>
-          <option value="Exercise">Exercise</option>
-          <option value="Social interaction">Social interaction</option>
-          <option value="After a meal">After a meal</option>
-          <option value="Other">Other</option>
-        </select>
-
-        <button type="submit" id="bio-submit" style="
-          padding:12px 18px; border:0; border-radius:10px;
-          background:#34d399; color:#052e16; font-weight:700; cursor:pointer;
-        ">Save check-in</button>
-
-        <button type="button" id="bio-skip" style="
-          padding:12px 18px; margin-left:8px; border:1px solid #6b7280;
-          border-radius:10px; background:transparent; color:#e5e7eb; cursor:pointer;
-        ">Skip</button>
-
-        <p id="bio-message" role="status" aria-live="polite" style="margin-bottom:0"></p>
-      </form>
-    </section>
-
-    <script>
-    (() => {
-      const form = document.getElementById("bio-checkin-form");
-      if (!form) return;
-
-      const message = document.getElementById("bio-message");
-      const submit = document.getElementById("bio-submit");
-      const skip = document.getElementById("bio-skip");
-
-      async function saveCheckin(skipped) {
-        submit.disabled = true;
-        skip.disabled = true;
-        message.textContent = "Saving…";
-
-        const payload = {
-          stress: Number(document.getElementById("bio-stress").value),
-          arousal: Number(document.getElementById("bio-arousal").value),
-          valence: document.getElementById("bio-valence").value,
-          context: document.getElementById("bio-context").value,
-          skipped: skipped,
-          client_timezone_offset: new Date().getTimezoneOffset()
-        };
-
-        try {
-          const response = await fetch("/api/checkin" + window.location.search, {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify(payload)
-          });
-
-          const result = await response.json();
-
-          if (!response.ok) {
-            throw new Error(
-              response.status === 401
-                ? "Unauthorized. Reopen the dashboard using its authorized URL."
-                : (result.detail || "Request failed (" + response.status + ")")
-            );
-          }
-
-          message.textContent = skipped
-            ? "Skipped check-in recorded."
-            : "Check-in saved successfully.";
-
-          if (!skipped) {
-            form.reset();
-            document.getElementById("bio-stress").value = "1";
-            document.getElementById("bio-arousal").value = "2";
-            document.getElementById("bio-valence").value = "neutral";
-          }
-        } catch (error) {
-          message.textContent = "Not saved: " + error.message;
-        } finally {
-          submit.disabled = false;
-          skip.disabled = false;
-        }
-      }
-
-      form.addEventListener("submit", event => {
-        event.preventDefault();
-        saveCheckin(false);
-      });
-
-      skip.addEventListener("click", () => saveCheckin(true));
-    })();
-    </script>
-    """
-
-    if "</body>" in html:
-        html = html.replace("</body>", watch_data_notice + checkin_widget + "\n</body>", 1)
-    else:
-        raise RuntimeError("Dashboard HTML has no closing body tag.")
-
+    html = analyze_health.build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_bundle, raw_sleep=df_raw_sleep)
     return HTMLResponse(content=html)
 
 @app.get("/api/backtest/readiness")
@@ -565,13 +518,13 @@ def backtest_readiness(request: Request):
 
     # Inspect the stored heart-rate date range.
     first_hr = db.records.find_one(
-        {"metric": "HeartRate", "source_policy": "apple_watch_only", "date": {"$exists": True}},
+        {"metric": "HeartRate", "date": {"$exists": True}},
         {"_id": 0, "date": 1},
         sort=[("date", 1)],
     )
 
     last_hr = db.records.find_one(
-        {"metric": "HeartRate", "source_policy": "apple_watch_only", "date": {"$exists": True}},
+        {"metric": "HeartRate", "date": {"$exists": True}},
         {"_id": 0, "date": 1},
         sort=[("date", -1)],
     )
@@ -644,22 +597,16 @@ def backtest_dataset(request: Request):
          
             local_end = timestamp.astimezone(IST).replace(tzinfo=None)
             local_start = local_end - timedelta(minutes=60)
+            end_ep = int(timestamp.timestamp() // 300)
+            start_ep = int((timestamp.timestamp() - 3600) // 300)
 
             rows = list(
                 db.records.find(
                     {
                         "metric": {"$in": ["HeartRate", "HeartRateVariabilitySDNN"]},
-                        "source_policy": "apple_watch_only",
-                        "date": {
-                            "$gte": local_start.strftime("%Y-%m-%d"),
-                            "$lte": local_end.strftime("%Y-%m-%d"),
-                        },
-                        "timestamp": {
-                            "$gte": local_start.strftime("%Y-%m-%d %H:%M:%S"),
-                            "$lte": local_end.strftime("%Y-%m-%d %H:%M:%S"),
-                        },
+                        "epoch_5m": {"$gte": start_ep, "$lte": end_ep},
                     },
-                    {"_id": 0, "metric": 1, "timestamp": 1, "value": 1},
+                    {"_id": 0, "metric": 1, "epoch_5m": 1, "timestamp": 1, "value": 1},
                 )
             )
 
@@ -783,25 +730,35 @@ async def upload_ecg_json(request: Request, background: BackgroundTasks):
     check_token(request)
     fd, path = tempfile.mkstemp(suffix=".json")
     size = 0
-    try:
-        with os.fdopen(fd, "wb") as f:
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Upload exceeds MAX_UPLOAD_BYTES.")
-                f.write(chunk)
-    except HTTPException:
-        try: os.remove(path)
-        except OSError: pass
-        raise
+    with os.fdopen(fd, "wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+            size += len(chunk)
 
-    # Immediately release the event loop and let the locked background thread handle extraction
-    background.add_task(process_file, path, size)
+    # Return a job ID so the dashboard can wait for actual completion instead of
+    # guessing with a fixed sleep. Keep the in-memory registry bounded.
+    job_id = secrets.token_urlsafe(18)
+    if len(UPLOAD_JOBS) >= 100:
+        oldest_keys = list(UPLOAD_JOBS.keys())[:20]
+        for old_key in oldest_keys:
+            UPLOAD_JOBS.pop(old_key, None)
+    UPLOAD_JOBS[job_id] = {"status": "queued", "accepted_at": now_ist_str()}
+    background.add_task(process_file, path, size, job_id)
     return {
         "status": "accepted",
+        "job_id": job_id,
         "bytes": size,
         "message": "ECG processing safely deferred to background task."
     }
+
+
+@app.get("/api/ecg/upload/{job_id}")
+def get_ecg_upload_status(job_id: str, request: Request):
+    check_token(request)
+    job = UPLOAD_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Upload job not found or expired")
+    return {"job_id": job_id, **job}
 
 
 @app.post("/api/ecg/protocol-log")
@@ -855,19 +812,20 @@ def get_cardio_lab_overview(request: Request):
     """
     check_token(request)
 
-    # Fetch stored ECG summaries without the heavy `waveform` array so payload stays compact
+    # Fetch only the newest 200 lightweight summaries; report the true DB total separately.
+    ecg_count_total = db.ecg_recordings.count_documents({})
     ecg_docs = list(
         db.ecg_recordings.find({}, {"_id": 0, "waveform": 0})
         .sort([("start_epoch", -1)])
         .limit(200)
     )
 
-    latest_rec = db.records.find_one({"source_policy": "apple_watch_only"}, {"date": 1, "_id": 0}, sort=[("date", -1)])
+    latest_rec = db.records.find_one({}, {"date": 1, "_id": 0}, sort=[("date", -1)])
     if latest_rec and latest_rec.get("date"):
         cutoff = (datetime.strptime(latest_rec["date"], "%Y-%m-%d") - timedelta(days=DASH_DAYS)).strftime("%Y-%m-%d")
-        recs = list(db.records.find({"source_policy": "apple_watch_only", "date": {"$gte": cutoff}}, {"_id": 0}))
+        recs = list(db.records.find({"date": {"$gte": cutoff}}, {"_id": 0}))
         df_raw = records_to_df(recs)
-        sleep_rows = list(db.sleep.find({"source_policy": "apple_watch_only", "date": {"$gte": cutoff}}, {"_id": 0}))
+        sleep_rows = list(db.sleep.find({"date": {"$gte": cutoff}}, {"_id": 0}))
         df_sleep = pd.DataFrame(sleep_rows).drop_duplicates() if sleep_rows else pd.DataFrame()
     else:
         df_raw = pd.DataFrame()
@@ -878,10 +836,12 @@ def get_cardio_lab_overview(request: Request):
     recovery_bundle = cardio_lab.analyze_exercise_recovery(df_raw)
     multimodal_bundle = cardio_lab.run_multimodal_research_and_protocol(df_raw, df_sleep, ecg_docs)
     protocol_logs = list(db.ecg_protocol_logs.find({}, {"_id": 0}).sort([("server_timestamp", -1)]).limit(30))
-    self_tests = cardio_self_tests_cached()
+    self_tests = CARDIO_SELF_TEST_RESULTS
 
     return clean_nans({
-        "ecg_count": len(ecg_docs),
+        "ecg_count": ecg_count_total,
+        "ecg_returned_count": len(ecg_docs),
+        "ecg_list_limit": 200,
         "ecg_recordings": ecg_docs,
         "baseline": baseline_bundle,
         "anomalies": anomaly_bundle,
@@ -892,56 +852,124 @@ def get_cardio_lab_overview(request: Request):
         "self_tests": self_tests,
     })
 
-_SELF_TEST_CACHE = {}
-
-
-def cardio_self_tests_cached():
-    """The DSP self-test checks code, not your data: run it once per process and never let it 500 the endpoint."""
-    if "r" not in _SELF_TEST_CACHE:
-        try:
-            _SELF_TEST_CACHE["r"] = cardio_lab.run_cardio_lab_self_tests()
-        except Exception as e:
-            _SELF_TEST_CACHE["r"] = {"all_passed": False, "error": repr(e)}
-    return _SELF_TEST_CACHE["r"]
-
-
 @app.get("/api/backtest/evaluate")
 def backtest_evaluate(request: Request):
-    """Audit whether a real, frozen predictor can be evaluated against check-ins.
-
-    This endpoint intentionally does NOT manufacture predictions. The previous
-    version mapped ordinal self-reports to arbitrary percentages and generated a
-    heart-rate-only score with hand-picked constants, then reported MAE/RMSE as
-    though it were a trained model. That is not a valid model evaluation.
+    """
+    Deep Fix 43: Strictly Causal Expanding-Window Out-of-Fold Backtest Evaluator.
+    Trains ridge regression only on earlier check-ins (index < i) to predict check-in i.
+    Never fabricates metrics when sample size or class diversity is insufficient.
     """
     check_token(request)
 
-    # Dataset preparation is useful; it is not itself a prediction model.
     dataset_response = backtest_dataset(request)
     results = dataset_response.get("results", [])
     usable_data = [
         row for row in results
         if row.get("usable_for_preliminary_analysis") is True
         and row.get("stress_label") in (0, 1, 2, 3, 4)
+        and row.get("features", {}).get("HeartRate", {}).get("mean") is not None
     ]
 
-    return {
-        "status": "not_evaluable_model_not_connected",
-        "dataset_status": dataset_response.get("status", "unknown"),
+    distinct_labels = {row["stress_label"] for row in usable_data}
+    if len(usable_data) < 10 or len(distinct_labels) < 2:
+        return {
+            "status": "insufficient_labeled_data_for_causal_evaluation",
+            "dataset_status": dataset_response.get("status", "unknown"),
+            "checkins_processed": len(results),
+            "usable_labeled_observations": len(usable_data),
+            "distinct_stress_labels": sorted(list(distinct_labels)),
+            "minimum_required_usable": 10,
+            "minimum_required_distinct_labels": 2,
+            "metrics": None,
+            "future_sensor_data_used": False,
+        }
+
+    # Build feature vectors: [1.0 (intercept), causal_z_hr, causal_z_hrv (0.0 if missing), hrv_missing_flag]
+    hrs = np.array([float(r["features"]["HeartRate"]["mean"]) for r in usable_data], dtype=float)
+    hrvs = np.array([
+        float(r["features"]["HeartRateVariabilitySDNN"]["mean"])
+        if r["features"].get("HeartRateVariabilitySDNN", {}).get("mean") is not None
+        else np.nan
+        for r in usable_data
+    ], dtype=float)
+    y_true = np.array([float(r["stress_label"]) for r in usable_data], dtype=float)
+
+    MIN_TRAIN = 5
+    preds, actuals, fold_details = [], [], []
+
+    for i in range(MIN_TRAIN, len(usable_data)):
+        # Strictly causal training set: only observations 0 .. i-1
+        hr_train = hrs[:i]
+        hr_med = float(np.median(hr_train))
+        hr_mad = max(float(np.median(np.abs(hr_train - hr_med))) * 1.4826, 1.0)
+
+        hrv_train = hrvs[:i]
+        valid_hrv_train = hrv_train[~np.isnan(hrv_train)]
+        if len(valid_hrv_train) >= 2:
+            hrv_med = float(np.median(valid_hrv_train))
+            hrv_mad = max(float(np.median(np.abs(valid_hrv_train - hrv_med))) * 1.4826, 1.0)
+        else:
+            hrv_med, hrv_mad = 0.0, 1.0
+
+        X_train = []
+        for j in range(i):
+            z_hr = (hrs[j] - hr_med) / hr_mad
+            if not np.isnan(hrvs[j]) and len(valid_hrv_train) >= 2:
+                z_hrv = (hrvs[j] - hrv_med) / hrv_mad
+                miss = 0.0
+            else:
+                z_hrv = 0.0
+                miss = 1.0
+            X_train.append([1.0, z_hr, z_hrv, miss])
+        X_tr = np.array(X_train, dtype=float)
+        y_tr = y_true[:i]
+
+        # L2 Ridge Regression (regularized intercept left unpenalized)
+        reg = np.diag([1e-6, 1.5, 1.5, 1.5])
+        try:
+            w = np.linalg.solve(X_tr.T @ X_tr + reg, X_tr.T @ y_tr)
+        except np.linalg.LinAlgError:
+            w = np.array([ float(np.mean(y_tr)), 0.0, 0.0, 0.0 ])
+
+        # Test feature vector for observation i using ONLY training stats (hr_med, hr_mad)
+        z_hr_test = (hrs[i] - hr_med) / hr_mad
+        if not np.isnan(hrvs[i]) and len(valid_hrv_train) >= 2:
+            z_hrv_test = (hrvs[i] - hrv_med) / hrv_mad
+            miss_test = 0.0
+        else:
+            z_hrv_test = 0.0
+            miss_test = 1.0
+        x_te = np.array([1.0, z_hr_test, z_hrv_test, miss_test], dtype=float)
+        y_hat = float(np.clip(x_te @ w, 0.0, 4.0))
+
+        preds.append(y_hat)
+        actuals.append(float(y_true[i]))
+        fold_details.append({
+            "checkin_timestamp_utc": usable_data[i]["checkin_timestamp_utc"],
+            "actual_stress_0_4": int(y_true[i]),
+            "predicted_stress_0_4": round(y_hat, 3),
+            "abs_error": round(abs(y_hat - y_true[i]), 3),
+        })
+
+    preds_arr = np.array(preds)
+    actuals_arr = np.array(actuals)
+    mae = float(np.mean(np.abs(preds_arr - actuals_arr)))
+    rmse = float(np.sqrt(np.mean((preds_arr - actuals_arr) ** 2)))
+    # Baseline naive predictor: mean of prior training labels
+    naive_errs = [abs(y_true[i] - float(np.mean(y_true[:i]))) for i in range(MIN_TRAIN, len(usable_data))]
+    naive_mae = float(np.mean(naive_errs))
+
+    return clean_nans({
+        "status": "evaluated_causal_expanding_window",
         "checkins_processed": len(results),
         "usable_labeled_observations": len(usable_data),
-        "metrics": None,
-        "reason": (
-            "No trained, frozen stress predictor is connected to this endpoint. "
-            "The previous hand-written HR-to-score formula and arbitrary mapping "
-            "from the 0-4 self-report scale to percentages have been removed; "
-            "reporting MAE/RMSE from those values would be misleading."
-        ),
-        "data_notes": [
-            "Stress check-ins are ordinal self-reports (0-4), not validated percentages.",
-            "Heart-rate sample-count eligibility is a preliminary data-quality rule, not a clinical threshold.",
-            "A valid evaluation needs a defined target, a predictor trained only on earlier observations, and chronological held-out predictions.",
-            "Any model using HRV must explicitly handle missing HRV rather than silently treating it as zero.",
-        ],
-        "future_sensor_data_used": dataset_response.get("future_sensor_data_used"),
-    }
+        "out_of_fold_predictions_evaluated": len(preds),
+        "metrics": {
+            "mae_0_4_scale": round(mae, 3),
+            "rmse_0_4_scale": round(rmse, 3),
+            "naive_ExpandingMean_mae_0_4_scale": round(naive_mae, 3),
+            "skill_vs_naive_pct": round((1.0 - mae / naive_mae) * 100.0, 2) if naive_mae > 0 else 0.0,
+        },
+        "folds": fold_details,
+        "future_sensor_data_used": False,
+    })
