@@ -28,6 +28,7 @@ METRIC_MAP = {
     "basal_energy_burned": "BasalEnergyBurned", "resting_energy": "BasalEnergyBurned",
     "apple_exercise_time": "AppleExerciseTime", "exercise_time": "AppleExerciseTime",
     "apple_stand_time": "AppleStandTime", "stand_time": "AppleStandTime",
+    "apple_stand_hour": "AppleStandHour",
     "flights_climbed": "FlightsClimbed",
     "respiratory_rate": "RespiratoryRate",
     "walking_speed": "WalkingSpeed",
@@ -38,6 +39,9 @@ METRIC_MAP = {
     "walking_heart_rate_average": "WalkingHeartRateAverage",
     "environmental_audio_exposure": "EnvironmentalAudioExposure",
     "headphone_audio_exposure": "HeadphoneAudioExposure",
+    "breathing_disturbances": "BreathingDisturbances",
+    "physical_effort": "PhysicalEffort",
+    "stair_speed_up": "StairSpeedUp", "stair_speed_down": "StairSpeedDown",
     "time_in_daylight": "TimeInDaylight",
     "blood_oxygen_saturation": "OxygenSaturation", "oxygen_saturation": "OxygenSaturation",
     "apple_sleeping_wrist_temperature": "AppleSleepingWristTemperature", "wrist_temperature": "AppleSleepingWristTemperature",
@@ -47,9 +51,9 @@ METRIC_MAP = {
 
 # Metrics that add up inside a 5-minute bin. Everything else is averaged.
 SUM_METRICS = {"StepCount", "DistanceWalkingRunning", "ActiveEnergyBurned", "BasalEnergyBurned",
-               "AppleExerciseTime", "AppleStandTime", "FlightsClimbed", "TimeInDaylight"}
+               "AppleExerciseTime", "AppleStandTime", "AppleStandHour", "FlightsClimbed", "TimeInDaylight"}
 PCT_METRICS = {"OxygenSaturation", "WalkingAsymmetryPercentage", "WalkingDoubleSupportPercentage", "AppleWalkingSteadiness"}
-VALUE_KEYS = ("qty", "Avg", "avg", "value", "Value", "Min", "min")
+VALUE_KEYS = ("qty", "Avg", "avg", "value", "Value")  # never substitute a minimum for a reading
 ENERGY_METRICS = {"ActiveEnergyBurned", "BasalEnergyBurned"}
 # Only these metric groups are real sleep data. (The old test was `"sleep" in name`, which also
 # captured apple_sleeping_wrist_temperature and silently kept it out of `records`.)
@@ -122,6 +126,15 @@ def to_epoch(dt):
 
     return dt.timestamp()
 
+def is_apple_watch_source(source):
+    """Fail closed: mixed/unknown source attribution cannot establish Watch-only provenance."""
+    if not isinstance(source, str) or not source.strip():
+        return False
+    # HAE may emit a non-breaking space in display names (Apple\u00a0Watch).
+    s = re.sub(r"\s+", " ", source.replace("|", "| ").strip().casefold())
+    return "apple watch" in s and "iphone" not in s and "|" not in s
+
+
 def _compact(item):
     """Tiny stand-in for an item whose group name isn't known yet (keeps RAM low)."""
     if isinstance(item.get("value"), str) or any(k in item for k in ("deep", "rem", "core", "asleep")):
@@ -129,7 +142,7 @@ def _compact(item):
     ds = item.get("date") or item.get("startDate")
     for k in VALUE_KEYS:
         if item.get(k) is not None:
-            return (ds, item[k])
+            return (ds, item[k], item.get("source"))
     return None
 
 
@@ -150,7 +163,7 @@ def iter_items(fileobj):
         if rest == "":
             if event in ("start_map", "end_map"):
                 for b in buf:  # group finished: release anything that was waiting for its name
-                    yield name, units, ({"date": b[0], "qty": b[1]} if isinstance(b, tuple) else b)
+                    yield name, units, ({"date": b[0], "qty": b[1], "source": b[2]} if isinstance(b, tuple) else b)
                 name = units = ""
                 got_name = got_units = False
                 buf = []
@@ -181,6 +194,8 @@ class Ingestor:
         self.legacy_win = []
         self.raw = {}                # key -> doc                        (collection "sleep_raw")
         self.items = 0
+        self.source_included = 0
+        self.source_excluded = {"missing": 0, "mixed_or_iphone": 0, "other": 0}
         self.unnamed = 0
         self.skipped_stages = 0
 
@@ -189,6 +204,12 @@ class Ingestor:
         if not name:
             self.unnamed += 1
             return
+        source = str(item.get("source") or "").strip()
+        if not is_apple_watch_source(source):
+            reason = "missing" if not source else ("mixed_or_iphone" if "iphone" in source.casefold() or "|" in source else "other")
+            self.source_excluded[reason] += 1
+            return
+        self.source_included += 1
         key = name.strip().lower().replace(" ", "_")
         if key in SLEEP_GROUPS:
             self._sleep(item, units)
@@ -231,20 +252,22 @@ class Ingestor:
         bk = (metric, int(to_epoch(dt) // 300))
         b = self.bins.get(bk)
         if b is None:
-            self.bins[bk] = [val, 1, u]
+            self.bins[bk] = [val, 1, u, {source}]
         else:
             b[0] += val
             b[1] += 1
+            b[3].add(source)
 
     def record_docs(self):
-        for (metric, ep), (total, n, unit) in self.bins.items():
+        for (metric, ep), (total, n, unit, sources) in self.bins.items():
             # Convert absolute UTC epoch to India Standard Time (+05:30) for dashboard strings
             bs_utc = EPOCH0 + timedelta(seconds=ep * 300)
             bs_ist = bs_utc + timedelta(hours=5, minutes=30)
             yield {
                 "metric": metric, "timestamp": bs_ist.strftime("%Y-%m-%d %H:%M:%S"), "date": bs_ist.strftime("%Y-%m-%d"),
                 "hour": round(bs_ist.hour + bs_ist.minute / 60.0, 2), "epoch_5m": ep,
-                "value": round(total if metric in SUM_METRICS else total / n, 4), "unit": unit,
+                "value": float(total if metric in SUM_METRICS else total / n), "unit": unit,
+                "sources": sorted(sources), "source_policy": "apple_watch_only",
             }
           
     def _sleep(self, item, units=""):
@@ -263,7 +286,7 @@ class Ingestor:
             k = f"{s19}|{e19}|{item.get('value') or item.get('stage') or ''}"
         else:
             k = "agg|" + (d or json.dumps(item, sort_keys=True))
-        self.raw[k] = {**item, "k": k, "d": d, "s19": s19, "e19": e19}
+        self.raw[k] = {**item, "k": k, "d": d, "s19": s19, "e19": e19, "source_policy": "apple_watch_only"}
 
         # Old per-stage format used by the Stress and Energy engines
         if any(x in item for x in ("deep", "rem", "core", "asleep")):
@@ -284,6 +307,7 @@ class Ingestor:
                     if hrs > 0:
                         self.legacy[(stg_label, s_ep, e_ep)] = {
                             "date": d_str, "stage": stg_label, "hours": hrs, "onset_hr": s_hr,
+                            "source": item.get("source"), "source_policy": "apple_watch_only",
                             "wake_hr": e_hr, "start_epoch": s_ep, "end_epoch": e_ep}
             except (ValueError, TypeError, AttributeError):
                 pass
@@ -309,6 +333,7 @@ class Ingestor:
                     s_ep, e_ep = int(to_epoch(s_raw) // 300), int(to_epoch(e_raw) // 300)
                     self.legacy[(label, s_ep, e_ep)] = {
                         "date": e_dt.strftime("%Y-%m-%d"), "stage": label, "hours": dur, "onset_hr": s_hr,
+                        "source": item.get("source"), "source_policy": "apple_watch_only",
                         "wake_hr": e_hr, "start_epoch": s_ep, "end_epoch": e_ep}
                     self.legacy_win.append((s_ep, e_ep))
             except (ValueError, TypeError, AttributeError):
@@ -389,4 +414,5 @@ def write(db, ing, chunk=2000):
     for i in range(0, len(leg_ops), chunk): _bulk(db.sleep, leg_ops[i:i + chunk])
     
     return {"items_read": ing.items, "bins_written": n_rec, "sleep_segments": len(ing.raw), "unnamed_skipped": ing.unnamed,
-            "unknown_sleep_stages_skipped": ing.skipped_stages}
+            "source_included": ing.source_included, "source_excluded": dict(ing.source_excluded),
+            "unknown_sleep_stages_skipped": ing.skipped_stages, "source_policy": "apple_watch_only"}
