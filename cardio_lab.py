@@ -335,7 +335,19 @@ def process_raw_ecg_recording(ecg_obj: Dict[str, Any]) -> Dict[str, Any]:
     t0 = float(t_arr[0])
     t_rel = t_arr - t0
     if rec_start_epoch is None or rec_start_epoch < 1e8:
-        rec_start_epoch = t0 if t0 > 1e8 else datetime.now(timezone.utc).timestamp()
+        if t0 > 1e8:
+            rec_start_epoch = t0
+        else:
+            # No trustworthy start time anywhere in the record: never invent "now" as the recording time.
+            return {
+                "ecg_id": hashlib.sha1(f"notime_{n_raw}_{float(v_arr[0]):.4f}".encode("utf-8")).hexdigest()[:16],
+                "valid": False,
+                "error": "Recording start time could not be determined; excluded from time-based analysis.",
+                "start_timestamp": rec_start_str,
+                "classification": classification,
+                "sample_count": n_raw,
+                "malformed_samples": malformed_count,
+            }
     if not rec_start_str or len(rec_start_str) < 10:
         rec_start_str = datetime.fromtimestamp(rec_start_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     # Keep the original string only to build a stable ecg_id (so re-uploads overwrite, not duplicate).
@@ -983,6 +995,22 @@ def compute_ecg_hrv_metrics(
 # STREAMING JSON EXTRACTOR & MONGODB PERSISTENCE / CACHING
 # ==============================================================================
 
+def _file_has_ecg_marker(file_path: str) -> bool:
+    """Cheap chunked byte scan so uploads with no ECG never trigger three parse passes plus a full json.load."""
+    needles = (b"voltageMeasurements", b"rhythmClassification", b'"classification"')
+    keep = max(len(n) for n in needles) - 1
+    tail = b""
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                return False
+            buf = tail + chunk
+            if any(n in buf for n in needles):
+                return True
+            tail = buf[-keep:]
+
+
 def extract_ecg_objects_from_json(file_path: str) -> List[Dict[str, Any]]:
     """
     Extracts ECG recording objects from an Apple Health / Health Auto Export JSON file.
@@ -990,6 +1018,8 @@ def extract_ecg_objects_from_json(file_path: str) -> List[Dict[str, Any]]:
     """
     ecg_list: List[Dict[str, Any]] = []
     if not os.path.exists(file_path):
+        return ecg_list
+    if not _file_has_ecg_marker(file_path):
         return ecg_list
 
     # 1. Try streaming `data.ecg.item` or `ecg.item` via ijson first to keep RAM low
@@ -1070,43 +1100,27 @@ def ingest_ecg_from_json_file(file_path: str, db) -> Dict[str, Any]:
 # MODULE D: LONGITUDINAL PERSONAL CARDIOVASCULAR BASELINE (ROBUST STATS)
 # ==============================================================================
 
-def robust_z_score(
-    val: float,
-    series_vals: List[float],
-    min_scale: float = 1.0,
-    window_days: int = 28,
-) -> Tuple[Optional[float], float, float]:
+def robust_z_score(val: float, series_vals: List[float], min_scale: float = 1.0) -> Tuple[Optional[float], float, float]:
     """
-    Causal robust Z-score from prior observations only. Callers must pass values
-    strictly earlier than the scored day; this helper limits the baseline to the
-    most recent 28 supplied observations (the caller applies calendar-date filtering).
-    MAD/IQR degeneracy is bounded by a physiological min_scale floor.
+    Computes standardized robust deviation:
+      z_robust = 0.6745 * (x - median) / MAD
+    Safely handles MAD = 0 or small sample sizes using IQR fallback (0.7413 * IQR) and min_scale floor.
     Returns (z_robust, median_val, mad_val).
     """
-    clean = []
-    for x in series_vals:
-        try:
-            xf = float(x)
-            if math.isfinite(xf):
-                clean.append(xf)
-        except (TypeError, ValueError):
-            continue
-
-    # Guard against accidental full-history inputs and keep the baseline bounded.
-    clean = clean[-max(1, int(window_days)):]
-    if val is None or pd.isna(val) or not math.isfinite(float(val)) or len(clean) < 3:
+    clean = [float(x) for x in series_vals if x is not None and not pd.isna(x)]
+    if val is None or pd.isna(val) or len(clean) < 3:
         med = float(np.median(clean)) if clean else np.nan
-        return None, round(med, 2) if math.isfinite(med) else med, 0.0
+        return None, med, 0.0
 
-    arr = np.asarray(clean, dtype=float)
+    arr = np.array(clean, dtype=float)
     med = float(np.median(arr))
     mad = float(np.median(np.abs(arr - med)))
-    scale = mad / 0.6745
-    if scale < 1e-9:
+    eff_sd = mad / 0.6745
+    if eff_sd < 1e-6:
         iqr = float(np.percentile(arr, 75) - np.percentile(arr, 25))
-        scale = 0.7413 * iqr
-    scale = max(float(min_scale), scale)
-    z_rob = (float(val) - med) / scale
+        eff_sd = iqr * 0.7413
+    eff_sd = max(eff_sd, min_scale)
+    z_rob = (float(val) - med) / eff_sd
     return round(z_rob, 2), round(med, 2), round(mad, 2)
 
 
@@ -1201,20 +1215,9 @@ def compute_longitudinal_baseline(
             continue
 
         daily_agg = sub.groupby("date")["value"].sum() if m_key in ("StepCount", "AppleExerciseTime") else sub.groupby("date")["value"].median()
-        daily_agg = daily_agg.sort_index()
         vals = daily_agg.dropna().tolist()
         latest_val = float(vals[-1]) if vals else None
-        latest_date = str(daily_agg.dropna().index[-1]) if vals else None
-        if latest_date is not None:
-            latest_ts = pd.to_datetime(latest_date, errors="coerce")
-            cutoff_ts = latest_ts - pd.Timedelta(days=28)
-            prior_mask = (pd.to_datetime(daily_agg.index.astype(str), errors="coerce") < latest_ts) & (
-                pd.to_datetime(daily_agg.index.astype(str), errors="coerce") >= cutoff_ts
-            )
-            baseline_vals = daily_agg[prior_mask].dropna().tolist()
-        else:
-            baseline_vals = []
-        z_rob, med_val, mad_val = robust_z_score(latest_val, baseline_vals, min_scale=min_sd)
+        z_rob, med_val, mad_val = robust_z_score(latest_val, vals, min_scale=min_sd)
 
         sensor_audit.append({
             "metric": m_key,
@@ -1408,7 +1411,7 @@ def detect_cardio_anomalies(
     calibration_days_required = 20
     alert_quantile = 0.95
     day_records: List[Dict[str, Any]] = []
-    historical_vectors: List[Tuple[List[float], int, int]] = []
+    historical_vectors: List[List[float]] = []
     anomalies = []
     prior_flag = False
     prior_date = None
@@ -1423,20 +1426,11 @@ def detect_cardio_anomalies(
     ], dtype=float)
 
     for idx, d_str in enumerate(all_dates):
-        current_ts = pd.to_datetime(str(d_str), errors="coerce")
-        cutoff_ts = current_ts - pd.Timedelta(days=28) if not pd.isna(current_ts) else pd.NaT
-        prior_dates = [
-            prior_d for prior_d in all_dates[:idx]
-            if not pd.isna(current_ts)
-            and pd.to_datetime(str(prior_d), errors="coerce") >= cutoff_ts
-            and pd.to_datetime(str(prior_d), errors="coerce") < current_ts
-        ]
+        prior_dates = all_dates[:idx]
         vals_today = [
             float(series[d_str]) if d_str in series.index and not pd.isna(series[d_str]) else None
             for series in metric_series
         ]
-        # Count raw sensor availability independently of whether a past-only z-score can be computed.
-        valid_sensor_count = sum(value is not None for value in vals_today)
         z_values, med_values, mad_values = [], [], []
         for series, value, min_scale in zip(metric_series, vals_today, min_scales):
             past_vals = [float(series[d]) for d in prior_dates if d in series.index and not pd.isna(series[d])]
@@ -1447,9 +1441,7 @@ def detect_cardio_anomalies(
 
         valid_idx = [i for i, z in enumerate(z_values) if z is not None]
         k_obs = len(valid_idx)
-        # Multivariate distances are unavailable unless at least two sensors were
-        # actually observed AND at least two past-only robust z-scores are computable.
-        if valid_sensor_count >= 2 and k_obs >= 2:
+        if k_obs:
             z_sub = np.array([float(z_values[i]) for i in valid_idx], dtype=float)
             R_sub = 0.85 * R_prior_4x4[np.ix_(valid_idx, valid_idx)] + 0.15 * np.eye(k_obs)
             try:
@@ -1458,28 +1450,18 @@ def detect_cardio_anomalies(
             except np.linalg.LinAlgError:
                 rms_m = float(np.sqrt(np.mean(z_sub ** 2)))
         else:
-            rms_m = None
+            rms_m = 0.0
 
-        # Keep explicit observation metadata: a real z-score may legitimately equal zero,
-        # so zero values cannot be used to infer whether a sensor was observed.
+        # Train only on previous dates' already-causal z-vectors.
         current_vector = [float(z) if z is not None else 0.0 for z in z_values]
-        if len(historical_vectors) >= 6 and valid_sensor_count >= 2 and k_obs >= 2:
-            # Only historical rows with >=2 actually observed sensors and >=2 computable
-            # past-only z-scores are eligible for the four-feature Isolation Forest.
-            valid_hist = [
-                v for v, sensor_count, z_count in historical_vectors
-                if sensor_count >= 2 and z_count >= 2
-            ]
-            if len(valid_hist) >= 6:
-                score_arr = _numpy_isolation_forest_train_test_scores(
-                    np.asarray(valid_hist, dtype=float),
-                    np.asarray([current_vector], dtype=float),
-                    n_trees=50,
-                    seed=42,
-                )
-                if_score = float(score_arr[0]) if len(score_arr) else float("nan")
-            else:
-                if_score = float("nan")
+        if len(historical_vectors) >= 6:
+            score_arr = _numpy_isolation_forest_train_test_scores(
+                np.asarray(historical_vectors, dtype=float),
+                np.asarray([current_vector], dtype=float),
+                n_trees=50,
+                seed=42,
+            )
+            if_score = float(score_arr[0]) if len(score_arr) else float("nan")
         else:
             if_score = float("nan")
 
@@ -1489,8 +1471,7 @@ def detect_cardio_anomalies(
             "v_hrv": vals_today[1], "med_hrv": med_values[1], "z_hrv": z_values[1],
             "v_resp": vals_today[2], "med_resp": med_values[2], "z_resp": z_values[2],
             "v_wt": vals_today[3], "med_wt": med_values[3], "z_wt": z_values[3],
-            "k_obs": k_obs, "valid_sensor_count": valid_sensor_count,
-            "rms_m": round(rms_m, 2) if rms_m is not None else None,
+            "k_obs": k_obs, "rms_m": round(rms_m, 2),
             "iforest_score": if_score,
             "ex_mins": float(ex_s.get(d_str, 0.0)),
             "steps": float(steps_s.get(d_str, 0.0)),
@@ -1508,32 +1489,22 @@ def detect_cardio_anomalies(
             quantile=alert_quantile, min_calibration=calibration_days_required
         )
         mahal_threshold = _empirical_upper_threshold(
-            [
-                r.get("rms_m") for r in day_records
-                if r.get("valid_sensor_count", 0) >= 2
-                and r.get("k_obs", 0) >= 2
-                and r.get("rms_m") is not None
-            ],
+            [r.get("rms_m") for r in day_records if r.get("k_obs", 0) >= 2],
             quantile=alert_quantile, min_calibration=calibration_days_required
         )
         forest_threshold = _empirical_upper_threshold(
-            [
-                r.get("iforest_score") for r in day_records
-                if r.get("valid_sensor_count", 0) >= 2
-                and r.get("k_obs", 0) >= 2
-                and math.isfinite(r.get("iforest_score", float("nan")))
-            ],
+            [r.get("iforest_score") for r in day_records if r.get("k_obs", 0) >= 2 and math.isfinite(r.get("iforest_score", float("nan")))],
             quantile=alert_quantile, min_calibration=calibration_days_required
         )
         rec["thresholds"] = {"robust_z": z_threshold, "mahalanobis_rms": mahal_threshold, "isolation_forest": forest_threshold}
         rec["calibration_counts"] = {
             "robust_z": sum(1 for r in day_records if r.get("k_obs", 0) >= 1),
-            "mahalanobis_rms": sum(1 for r in day_records if r.get("valid_sensor_count", 0) >= 2 and r.get("k_obs", 0) >= 2 and r.get("rms_m") is not None),
-            "isolation_forest": sum(1 for r in day_records if r.get("valid_sensor_count", 0) >= 2 and r.get("k_obs", 0) >= 2 and math.isfinite(r.get("iforest_score", float("nan")))),
+            "mahalanobis_rms": sum(1 for r in day_records if r.get("k_obs", 0) >= 2),
+            "isolation_forest": sum(1 for r in day_records if r.get("k_obs", 0) >= 2 and math.isfinite(r.get("iforest_score", float("nan")))),
         }
         m1_flag = z_threshold is not None and max_abs_z > z_threshold and rec["k_obs"] >= 1
-        m2_flag = mahal_threshold is not None and rec["rms_m"] is not None and rec["rms_m"] > mahal_threshold and rec["valid_sensor_count"] >= 2 and rec["k_obs"] >= 2
-        m3_flag = forest_threshold is not None and math.isfinite(if_score) and if_score > forest_threshold and rec["valid_sensor_count"] >= 2 and rec["k_obs"] >= 2
+        m2_flag = mahal_threshold is not None and rec["rms_m"] > mahal_threshold and rec["k_obs"] >= 2
+        m3_flag = forest_threshold is not None and math.isfinite(if_score) and if_score > forest_threshold and rec["k_obs"] >= 2
         flagged = m1_flag or m2_flag or m3_flag
 
         if flagged:
@@ -1547,7 +1518,7 @@ def detect_cardio_anomalies(
             if rec["z_wt"] is not None and abs(rec["z_wt"]) >= 1.5:
                 changed.append(f"Wrist Temp {rec['v_wt']:.2f} °C ({rec['z_wt']:+.2f} z_rob vs prior median {rec['med_wt']:.2f} °C)")
             if not changed:
-                changed.append(f"Multivariate combination shift (RMS-M = {rec['rms_m']:.2f})" if rec["rms_m"] is not None else "Univariate shift; multivariate score unavailable (<2 observed sensors or insufficient baseline)")
+                changed.append(f"Multivariate combination shift (RMS-M = {rec['rms_m']:.2f})")
 
             methods_triggered = []
             if m1_flag:
@@ -1569,16 +1540,9 @@ def detect_cardio_anomalies(
             anomalies.append({
                 "time_and_duration": f"{rec['date']} (24h resting & overnight physiological composite)",
                 "measurements_changed": "; ".join(changed),
-                "direction_and_magnitude": (
-                    f"Max |z_robust| = {max_abs_z:.2f} SD | "
-                    f"Mahalanobis RMS-M = {rec['rms_m']:.2f}" if rec["rms_m"] is not None
-                    else f"Max |z_robust| = {max_abs_z:.2f} SD | Mahalanobis RMS-M = unavailable"
-                ) + (
-                    f" | Isolation Score = {if_score:.2f}" if math.isfinite(if_score)
-                    else " | Isolation Score = unavailable (insufficient eligible history/data)"
-                ),
+                "direction_and_magnitude": f"Max |z_robust| = {max_abs_z:.2f} SD | Mahalanobis RMS-M = {rec['rms_m']:.2f} | Isolation Score = {if_score:.2f}" if math.isfinite(if_score) else f"Max |z_robust| = {max_abs_z:.2f} SD | Mahalanobis RMS-M = {rec['rms_m']:.2f} | Isolation Score = unavailable (need >=6 prior days)",
                 "baseline_comparison": f"Compared against prior observations only ({rec['baseline_days']} prior calendar dates; metric-specific available history may be smaller)",
-                "data_quality_missingness": f"{rec['valid_sensor_count']}/4 core sensors actually observed ({int(rec['valid_sensor_count']*25)}% coverage); {rec['k_obs']}/4 robust z-scores computable",
+                "data_quality_missingness": f"{rec['k_obs']}/4 core resting/overnight sensors observed ({int(rec['k_obs']*25)}% coverage)",
                 "model_confidence": f"{len(methods_triggered)}/3 detectors agreed ({', '.join(methods_triggered)}) — agreement, not calibrated confidence",
                 "threshold_calibration": (
                     f"Past-only empirical {int(alert_quantile*100)}th-percentile thresholds; prior usable scores: "
@@ -1598,7 +1562,7 @@ def detect_cardio_anomalies(
         prior_date = d_str
         # Append current row only after scoring/calibration so it cannot set its own threshold.
         day_records.append(rec)
-        historical_vectors.append((current_vector, valid_sensor_count, k_obs))
+        historical_vectors.append(current_vector)
 
     weeks = max(len(all_dates) / 7.0, 1.0)
     return {
@@ -1647,11 +1611,6 @@ def analyze_exercise_recovery(df_raw: pd.DataFrame) -> Dict[str, Any]:
         hr=("value", "mean"), ts=("timestamp", "first"), date=("date", "first")
     ).sort_index()
     steps_df = df_raw[df_raw["metric"] == "StepCount"].groupby("epoch_5m")["value"].sum()
-    
-    # Cast to strict integers to prevent floating-point hash lookup failures
-    ex_df.index = ex_df.index.astype("int64")
-    hr_df.index = hr_df.index.astype("int64")
-    steps_df.index = steps_df.index.astype("int64")
 
     if hr_df.empty or ex_df.empty:
         return {"bouts": [], "hrr_1min_summary": hrr_summary}
