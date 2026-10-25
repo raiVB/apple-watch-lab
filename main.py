@@ -8,6 +8,7 @@ import traceback
 import uuid as uuidlib
 import json
 import base64
+import html
 from datetime import datetime, timedelta, timezone
 
 import certifi
@@ -462,6 +463,73 @@ async def import_puls_json_export(request: Request):
 def health():
     return {"ok": True}
 
+
+@app.get("/import", response_class=HTMLResponse)
+def puls_manual_import_page(request: Request):
+    """Manual PulsHealth JSON + manifest uploader, also reachable before metrics exist."""
+    check_token(request)
+    page = """<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Import PulsHealth export</title>
+<body style="margin:0;background:#0b0f19;color:#e7edf7;font:16px system-ui,sans-serif;padding:32px">
+<main style="max-width:720px;margin:auto;background:#111827;border:1px solid #283448;border-radius:16px;padding:28px">
+  <h1 style="margin-top:0">Import a PulsHealth export</h1>
+  <p>Choose the PulsHealth <b>.json</b> export and its matching <b>-manifest.json</b> file together.</p>
+  <p>The server checks that the manifest marks the export complete and validates every batch before writing. Re-importing overlapping exports is safe. Non-Apple-Watch sources are excluded.</p>
+  <label style="display:inline-block;padding:12px 18px;background:#2563eb;color:white;border-radius:10px;cursor:pointer">
+    <span id="puls-status">Choose export JSON + manifest</span>
+    <input id="puls-file" type="file" accept=".json,application/json" multiple hidden>
+  </label>
+  <p id="puls-message" role="status" style="white-space:pre-wrap;color:#aab7ca"></p>
+  <p><a href="/__dashboard__" style="color:#7cc4ff">Back to dashboard</a></p>
+</main>
+<script>
+const input = document.getElementById('puls-file');
+const label = document.getElementById('puls-status');
+const message = document.getElementById('puls-message');
+input.addEventListener('change', async () => {
+  const files = Array.from(input.files || []);
+  const dataFile = files.find(f => !f.name.toLowerCase().endsWith('-manifest.json'));
+  const manifestFile = files.find(f => f.name.toLowerCase().endsWith('-manifest.json'));
+  if (files.length !== 2 || !dataFile || !manifestFile) {
+    label.textContent = 'Choose export JSON + manifest';
+    message.textContent = 'Select exactly two files: the PulsHealth .json export and its matching -manifest.json.';
+    input.value = '';
+    return;
+  }
+  try {
+    const manifestText = await manifestFile.text();
+    const manifest = JSON.parse(manifestText);
+    if (manifest.schemaVersion !== 1 || manifest.format !== 'json' || manifest.complete !== true || (manifest.failures || []).length) {
+      throw new Error('This export is incomplete or is not a supported PulsHealth JSON export.');
+    }
+    if (!Array.isArray(manifest.files) || manifest.files.length !== 1 || manifest.files[0].bytes !== dataFile.size) {
+      throw new Error('The manifest does not match the selected data file. Select the matching pair.');
+    }
+    label.textContent = 'Uploading...';
+    message.textContent = 'Uploading and validating batches. Keep this page open.';
+    const manifestHeader = btoa(unescape(encodeURIComponent(manifestText)));
+    const response = await fetch('/api/puls/import' + window.location.search, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','X-Puls-Manifest':manifestHeader},
+      body: dataFile
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.detail || result.error || 'The server rejected the export.');
+    label.textContent = 'Import complete';
+    message.textContent = `Batches: ${result.batches}\nNew Watch samples: ${result.accepted}\nAlready present: ${result.duplicates}\nNon-Watch items excluded: ${result.excludedSources}\nECG recordings are stored separately from dashboard metric rows.`;
+    setTimeout(() => { window.location.href = '/' + window.location.search; }, 4000);
+  } catch (error) {
+    label.textContent = 'Choose export JSON + manifest';
+    message.textContent = 'Import failed: ' + (error.message || 'check the selected files and server logs');
+  } finally {
+    input.value = '';
+  }
+});
+</script>
+</body></html>"""
+    return HTMLResponse(page.replace("/__dashboard__", "/"))
+
 @app.post("/api/system/sanitize")
 def sanitize_database(request: Request):
     """DESTRUCTIVE. POST only; a token must be configured; explicit confirmation; never during an upload."""
@@ -610,11 +678,14 @@ def stats(request: Request):
     }
 
 
-def _waiting_page(msg):
+def _waiting_page(msg, query_string=""):
+    safe_query = html.escape(query_string, quote=True)
+    import_href = f"/import?{safe_query}" if safe_query else "/import"
     return ("<html><body style='background:#0b0f19;color:#38bdf8;font-family:sans-serif;padding:32px;'>"
             "<h2>Biometric Cloud Engine Ready</h2>"
             f"<p style='color:#94a3b8;'>{msg}</p>"
             f"<p style='color:#10b981;'>Last upload: {STATUS['last_upload']} (ok: {STATUS['ok']})</p>"
+            f"<p><a style='color:#7cc4ff' href='{import_href}'>Import a PulsHealth export</a></p>"
             "</body></html>")
 
 
@@ -623,13 +694,13 @@ def serve_cockpit(request: Request):
     check_token(request)
     latest = db.records.find_one({"source_policy": "apple_watch_only"}, {"date": 1, "_id": 0}, sort=[("date", -1)])
     if not latest:
-        return _waiting_page("No data yet. Send an export from your iPhone.")
+        return _waiting_page("No data yet. Send an export from your iPhone.", request.url.query)
 
     # Only the most recent DASH_DAYS days are loaded, so RAM stays small however big the database grows.
     cutoff = (datetime.strptime(latest["date"], "%Y-%m-%d") - timedelta(days=DASH_DAYS)).strftime("%Y-%m-%d")
     recs = list(db.records.find({"source_policy": "apple_watch_only", "date": {"$gte": cutoff}}, {"_id": 0}))
     if len(recs) < 5:
-        return _waiting_page(f"Only {len(recs)} records so far.")
+        return _waiting_page(f"Only {len(recs)} records so far.", request.url.query)
     df_raw = records_to_df(recs)
     del recs
 
