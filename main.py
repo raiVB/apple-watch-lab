@@ -6,11 +6,14 @@ import tempfile
 import threading
 import traceback
 import uuid as uuidlib
+import json
+import base64
 from datetime import datetime, timedelta, timezone
 
 import certifi
 import numpy as np
 import pandas as pd
+import ijson
 from typing import Optional
 from pydantic import BaseModel
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
@@ -295,6 +298,159 @@ async def receive_puls_batch(request: Request):
     except Exception as exc:
         traceback.print_exc()
         return JSONResponse({"error": "temporary database or receiver failure; retry this batch"}, status_code=503)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _preflight_puls_json_export(path: str, expected_batches: int, temp_dir: str):
+    """Split a PulsHealth on-device JSON array into protocol batches and validate all first."""
+    batch_paths = []
+    current_path = None
+    current_file = None
+    total_batch_bytes = 0
+
+    def finish_batch():
+        nonlocal current_path, current_file, total_batch_bytes
+        if current_file is None:
+            return
+        current_file.flush()
+        current_file.close()
+        current_file = None
+        # This performs the receiver's full framing/schema/count validation without DB writes.
+        plain_path, _, _ = puls_receiver.decode_and_validate(current_path, "identity", "1")
+        try:
+            os.remove(plain_path)
+        except OSError:
+            pass
+        batch_paths.append(current_path)
+        current_path = None
+        total_batch_bytes = 0
+
+    try:
+        with open(path, "rb") as source:
+            for obj in ijson.items(source, "item", use_float=True):
+                if not isinstance(obj, dict):
+                    raise puls_receiver.ProtocolError("export JSON array contains a non-object item", 400)
+                is_header = "batchID" in obj
+                if is_header:
+                    finish_batch()
+                    fd, current_path = tempfile.mkstemp(prefix="puls-manual-", suffix=".ndjson", dir=temp_dir)
+                    current_file = os.fdopen(fd, "wb")
+                elif current_file is None:
+                    raise puls_receiver.ProtocolError("export has data before its first batch header", 400)
+
+                encoded = json.dumps(obj, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n"
+                if len(encoded) > puls_receiver.MAX_LINE_BYTES:
+                    raise puls_receiver.ProtocolError("an export line exceeds the receiver limit", 413)
+                total_batch_bytes += len(encoded)
+                if total_batch_bytes > puls_receiver.MAX_DECOMPRESSED_BYTES:
+                    raise puls_receiver.ProtocolError("an export batch exceeds the receiver limit", 413)
+                current_file.write(encoded)
+        finish_batch()
+    except puls_receiver.ProtocolError:
+        raise
+    except Exception as exc:
+        raise puls_receiver.ProtocolError(f"invalid PulsHealth JSON export: {exc}", 400) from exc
+    finally:
+        if current_file is not None:
+            current_file.close()
+        if current_path:
+            try:
+                os.remove(current_path)
+            except OSError:
+                pass
+
+    if not batch_paths:
+        raise puls_receiver.ProtocolError("export contains no PulsHealth batches", 400)
+    if len(batch_paths) != expected_batches:
+        raise puls_receiver.ProtocolError(
+            f"manifest says {expected_batches} batches but the file contains {len(batch_paths)}", 400
+        )
+    return batch_paths
+
+
+def _import_puls_json_export(path: str, manifest: dict, size: int, user_id: str):
+    files = manifest.get("files")
+    if (
+        not isinstance(files, list)
+        or len(files) != 1
+        or not isinstance(files[0], dict)
+        or files[0].get("bytes") != size
+    ):
+        raise puls_receiver.ProtocolError("manifest does not match the uploaded export file", 400)
+    batches_declared = manifest.get("batches")
+    if isinstance(batches_declared, bool) or not isinstance(batches_declared, int) or batches_declared < 1:
+        raise puls_receiver.ProtocolError("manifest has an invalid batch count", 400)
+
+    with tempfile.TemporaryDirectory(prefix="puls-export-") as temp_dir:
+        batch_paths = _preflight_puls_json_export(path, batches_declared, temp_dir)
+        totals = {"batches": 0, "accepted": 0, "deleted": 0, "duplicates": 0,
+                  "excludedSources": 0, "routePoints": 0, "seriesPoints": 0,
+                  "aggregateSamples": 0, "activitySummaries": 0}
+        for batch_path in batch_paths:
+            result = puls_receiver.receive_batch(db, batch_path, "identity", "1", user_id)
+            totals["batches"] += 1
+            for key in totals:
+                if key != "batches":
+                    totals[key] += int(result.get(key, 0))
+    return totals
+
+
+@app.post("/api/puls/import")
+async def import_puls_json_export(request: Request):
+    """Import a complete PulsHealth on-device JSON export through the validated batch receiver."""
+    check_token(request)
+    encoded_manifest = request.headers.get("x-puls-manifest", "")
+    if not encoded_manifest or len(encoded_manifest) > 64 * 1024:
+        raise HTTPException(status_code=400, detail="Upload the matching PulsHealth manifest with the JSON export.")
+    try:
+        manifest_bytes = base64.b64decode(encoded_manifest, validate=True)
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="PulsHealth manifest header is invalid.")
+    if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 1 or manifest.get("format") != "json":
+        raise HTTPException(status_code=400, detail="Expected a PulsHealth schema v1 JSON export and matching manifest.")
+    if manifest.get("complete") is not True or manifest.get("failures"):
+        raise HTTPException(status_code=400, detail="This export is marked incomplete; export it again before importing.")
+
+    fd, path = tempfile.mkstemp(prefix="puls-manual-upload-", suffix=".json")
+    size = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="PulsHealth export exceeds the upload size limit.")
+                out.write(chunk)
+
+        files = manifest.get("files")
+        if (
+            not isinstance(files, list)
+            or len(files) != 1
+            or not isinstance(files[0], dict)
+            or files[0].get("bytes") != size
+        ):
+            raise HTTPException(status_code=400, detail="Manifest does not match the uploaded JSON file.")
+
+        def import_under_lock():
+            with LOCK:
+                return _import_puls_json_export(path, manifest, size, PULS_USER_ID)
+
+        result = await run_in_threadpool(import_under_lock)
+        result["status"] = "imported"
+        result["watchOnly"] = True
+        result["reimportSafe"] = True
+        return JSONResponse(result)
+    except puls_receiver.ProtocolError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=503, detail="Import failed while writing batches. Re-upload is safe; Puls record IDs are deduplicated.")
     finally:
         try:
             os.remove(path)
