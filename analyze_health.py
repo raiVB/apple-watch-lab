@@ -2849,8 +2849,8 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       <header class="ph">
         <div><h1>Sleep lab</h1><p>Your sleep stages, minute by minute, and how your heart recovered overnight.</p></div>
         <label class="up-btn">
-          <span id="up_txt">Upload raw .json file</span>
-          <input type="file" accept=".json,application/json" hidden onchange="uploadJsonFile(this)">
+          <span id="up_txt">Upload Apple Health export (.xml or .json)</span>
+          <input type="file" accept=".xml,text/xml,application/xml,.json,application/json" hidden onchange="uploadJsonFile(this)">
         </label>
       </header>
 
@@ -3114,11 +3114,11 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
     const lbl = document.getElementById('up_txt');
     lbl.innerText = 'Uploading...';
     try {{
-      const text = await file.text();
+      const isXml = /\\.xml$/i.test(file.name);
       const res = await fetch('/webhook' + window.location.search, {{
         method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: text
+        headers: {{ 'Content-Type': isXml ? 'application/xml' : 'application/json' }},
+        body: file
       }});
       if (res.ok) {{
         lbl.innerText = 'Success! Reloading...';
@@ -3128,7 +3128,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         lbl.innerText = 'Upload failed';
       }}
     }} catch (e) {{
-      lbl.innerText = 'Error uploading JSON';
+      lbl.innerText = 'Error uploading Apple Health export';
     }}
   }}
 
