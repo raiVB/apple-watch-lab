@@ -3164,8 +3164,13 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         headers: {{ 'Content-Type': 'application/json', 'X-Puls-Manifest': manifestHeader }},
         body: dataFile
       }});
-      let result = await res.json().catch(() => ({{}}));
-      if (!res.ok) throw new Error(result.detail || result.error || 'Server rejected the export.');
+      const responseText = await res.text();
+      let result = {{}};
+      try {{ result = responseText ? JSON.parse(responseText) : {{}}; }} catch (_) {{}}
+      if (!res.ok) {{
+        const bodyMessage = result.detail || result.error || responseText.replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 240);
+        throw new Error(`HTTP ${{res.status}}: ${{bodyMessage || res.statusText || 'server rejected the export'}}`);
+      }}
       if (result.status === 'queued' && result.job_id) {{
         const jobId = encodeURIComponent(result.job_id);
         while (true) {{
