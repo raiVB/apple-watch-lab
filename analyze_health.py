@@ -3164,8 +3164,20 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
         headers: {{ 'Content-Type': 'application/json', 'X-Puls-Manifest': manifestHeader }},
         body: dataFile
       }});
-      const result = await res.json().catch(() => ({{}}));
+      let result = await res.json().catch(() => ({{}}));
       if (!res.ok) throw new Error(result.detail || result.error || 'Server rejected the export.');
+      if (result.status === 'queued' && result.job_id) {{
+        const jobId = encodeURIComponent(result.job_id);
+        while (true) {{
+          await new Promise(resolve => setTimeout(resolve, 1500));
+          const statusRes = await fetch('/api/puls/import/' + jobId + window.location.search, {{ cache: 'no-store' }});
+          const job = await statusRes.json().catch(() => ({{}}));
+          if (!statusRes.ok) throw new Error(job.detail || 'Could not read import progress.');
+          if (job.status === 'failed') throw new Error(job.error || 'Import failed.');
+          if (job.status === 'completed') {{ result = job.detail; break; }}
+          lbl.innerText = `${{job.phase === 'validation' ? 'Validating' : job.phase === 'import' ? 'Importing' : 'Queued'}} Puls batches: ${{job.completed || 0}}/${{job.total || manifest.batches}}`;
+        }}
+      }}
       lbl.innerText = `Imported ${{result.batches}} batches; ${{result.accepted}} new Watch records, ${{result.duplicates}} already present, ${{result.excludedSources}} non-Watch items excluded.`;
       location.hash = '#sleep';
       setTimeout(() => location.reload(), 3500);
