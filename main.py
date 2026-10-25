@@ -306,7 +306,7 @@ async def receive_puls_batch(request: Request):
             pass
 
 
-def _preflight_puls_json_export(path: str, expected_batches: int, temp_dir: str):
+def _preflight_puls_json_export(path: str, expected_batches: int, temp_dir: str, progress=None):
     """Split a PulsHealth on-device JSON array into protocol batches and validate all first."""
     batch_paths = []
     current_path = None
@@ -327,6 +327,8 @@ def _preflight_puls_json_export(path: str, expected_batches: int, temp_dir: str)
         except OSError:
             pass
         batch_paths.append(current_path)
+        if progress:
+            progress("validation", len(batch_paths), expected_batches)
         current_path = None
         total_batch_bytes = 0
 
@@ -373,7 +375,7 @@ def _preflight_puls_json_export(path: str, expected_batches: int, temp_dir: str)
     return batch_paths
 
 
-def _import_puls_json_export(path: str, manifest: dict, size: int, user_id: str):
+def _import_puls_json_export(path: str, manifest: dict, size: int, user_id: str, progress=None):
     files = manifest.get("files")
     if (
         not isinstance(files, list)
@@ -387,22 +389,57 @@ def _import_puls_json_export(path: str, manifest: dict, size: int, user_id: str)
         raise puls_receiver.ProtocolError("manifest has an invalid batch count", 400)
 
     with tempfile.TemporaryDirectory(prefix="puls-export-") as temp_dir:
-        batch_paths = _preflight_puls_json_export(path, batches_declared, temp_dir)
+        if progress:
+            progress("validation", 0, batches_declared)
+        batch_paths = _preflight_puls_json_export(path, batches_declared, temp_dir, progress)
+        if progress:
+            progress("import", 0, len(batch_paths))
         totals = {"batches": 0, "accepted": 0, "deleted": 0, "duplicates": 0,
                   "excludedSources": 0, "routePoints": 0, "seriesPoints": 0,
                   "aggregateSamples": 0, "activitySummaries": 0}
-        for batch_path in batch_paths:
+        for index, batch_path in enumerate(batch_paths, start=1):
             result = puls_receiver.receive_batch(db, batch_path, "identity", "1", user_id)
             totals["batches"] += 1
             for key in totals:
                 if key != "batches":
                     totals[key] += int(result.get(key, 0))
+            if progress:
+                progress("import", index, len(batch_paths))
     return totals
 
 
+def _run_puls_import_job(path: str, manifest: dict, size: int, job_id: str):
+    def update_progress(phase, completed, total):
+        job = dict(UPLOAD_JOBS.get(job_id, {}))
+        job.update(status="processing", phase=phase, completed=completed, total=total,
+                   updated_at=now_ist_str())
+        UPLOAD_JOBS[job_id] = job
+
+    try:
+        update_progress("queued", 0, int(manifest.get("batches", 0)))
+        with LOCK:
+            detail = _import_puls_json_export(path, manifest, size, PULS_USER_ID, update_progress)
+        detail.update(status="completed", watchOnly=True, reimportSafe=True)
+        UPLOAD_JOBS[job_id] = {"status": "completed", "detail": detail, "finished_at": now_ist_str()}
+    except puls_receiver.ProtocolError as exc:
+        UPLOAD_JOBS[job_id] = {"status": "failed", "error": str(exc), "finished_at": now_ist_str()}
+    except Exception:
+        traceback.print_exc()
+        UPLOAD_JOBS[job_id] = {
+            "status": "failed",
+            "error": "Import failed while writing batches. Some batches may already be stored; retry is safe because records are deduplicated.",
+            "finished_at": now_ist_str(),
+        }
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 @app.post("/api/puls/import")
-async def import_puls_json_export(request: Request):
-    """Import a complete PulsHealth on-device JSON export through the validated batch receiver."""
+async def import_puls_json_export(request: Request, background: BackgroundTasks):
+    """Queue a complete PulsHealth on-device JSON export for validated batch import."""
     check_token(request)
     encoded_manifest = request.headers.get("x-puls-manifest", "")
     if not encoded_manifest or len(encoded_manifest) > 64 * 1024:
@@ -419,6 +456,7 @@ async def import_puls_json_export(request: Request):
 
     fd, path = tempfile.mkstemp(prefix="puls-manual-upload-", suffix=".json")
     size = 0
+    queued = False
     try:
         with os.fdopen(fd, "wb") as out:
             async for chunk in request.stream():
@@ -436,27 +474,37 @@ async def import_puls_json_export(request: Request):
         ):
             raise HTTPException(status_code=400, detail="Manifest does not match the uploaded JSON file.")
 
-        def import_under_lock():
-            with LOCK:
-                return _import_puls_json_export(path, manifest, size, PULS_USER_ID)
-
-        result = await run_in_threadpool(import_under_lock)
-        result["status"] = "imported"
-        result["watchOnly"] = True
-        result["reimportSafe"] = True
-        return JSONResponse(result)
-    except puls_receiver.ProtocolError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+        job_id = secrets.token_urlsafe(18)
+        if len(UPLOAD_JOBS) >= 100:
+            for old_id, old_job in list(UPLOAD_JOBS.items()):
+                if old_job.get("status") in ("completed", "failed"):
+                    UPLOAD_JOBS.pop(old_id, None)
+                if len(UPLOAD_JOBS) < 80:
+                    break
+        UPLOAD_JOBS[job_id] = {
+            "status": "queued", "phase": "queued", "completed": 0,
+            "total": manifest["batches"], "accepted_at": now_ist_str(),
+        }
+        background.add_task(_run_puls_import_job, path, manifest, size, job_id)
+        queued = True
+        return JSONResponse({"status": "queued", "job_id": job_id}, status_code=202)
     except HTTPException:
         raise
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=503, detail="Import failed while writing batches. Re-upload is safe; Puls record IDs are deduplicated.")
     finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        if not queued:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+@app.get("/api/puls/import/{job_id}")
+def get_puls_import_status(job_id: str, request: Request):
+    check_token(request)
+    job = UPLOAD_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Import job not found or expired.")
+    return {"job_id": job_id, **job}
 
 
 @app.get("/health")
@@ -507,17 +555,29 @@ input.addEventListener('change', async () => {
       throw new Error('The manifest does not match the selected data file. Select the matching pair.');
     }
     label.textContent = 'Uploading...';
-    message.textContent = 'Uploading and validating batches. Keep this page open.';
+    message.textContent = 'Uploading the file first. Batch validation and import progress will appear here.';
     const manifestHeader = btoa(unescape(encodeURIComponent(manifestText)));
     const response = await fetch('/api/puls/import' + window.location.search, {
       method: 'POST',
       headers: {'Content-Type':'application/json','X-Puls-Manifest':manifestHeader},
       body: dataFile
     });
-    const result = await response.json().catch(() => ({}));
+    let result = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(result.detail || result.error || 'The server rejected the export.');
+    if (result.status === 'queued' && result.job_id) {
+      const jobId = encodeURIComponent(result.job_id);
+      while (true) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        const statusResponse = await fetch('/api/puls/import/' + jobId + window.location.search, {cache:'no-store'});
+        const job = await statusResponse.json().catch(() => ({}));
+        if (!statusResponse.ok) throw new Error(job.detail || 'Could not read import progress.');
+        if (job.status === 'failed') throw new Error(job.error || 'Import failed.');
+        if (job.status === 'completed') { result = job.detail; break; }
+        message.textContent = `${job.phase === 'validation' ? 'Validating' : job.phase === 'import' ? 'Importing' : 'Queued'} batches: ${job.completed || 0}/${job.total || manifest.batches}. Keep this page open.`;
+      }
+    }
     label.textContent = 'Import complete';
-    message.textContent = `Batches: ${result.batches}\nNew Watch samples: ${result.accepted}\nAlready present: ${result.duplicates}\nNon-Watch items excluded: ${result.excludedSources}\nECG recordings are stored separately from dashboard metric rows.`;
+    message.textContent = `Batches: ${result.batches}\nNew Watch records: ${result.accepted}\nAlready present: ${result.duplicates}\nNon-Watch items excluded: ${result.excludedSources}\nECG recordings are stored separately from dashboard metric rows.`;
     setTimeout(() => { window.location.href = '/' + window.location.search; }, 4000);
   } catch (error) {
     label.textContent = 'Choose export JSON + manifest';
