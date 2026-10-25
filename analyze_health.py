@@ -3166,7 +3166,7 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       }});
       const result = await res.json().catch(() => ({{}}));
       if (!res.ok) throw new Error(result.detail || result.error || 'Server rejected the export.');
-      lbl.innerText = `Imported ${{result.batches}} batches; ${{result.accepted}} new Watch samples, ${{result.duplicates}} already present, ${{result.excludedSources}} non-Watch items excluded.`;
+      lbl.innerText = `Imported ${{result.batches}} batches; ${{result.accepted}} new Watch records, ${{result.duplicates}} already present, ${{result.excludedSources}} non-Watch items excluded.`;
       location.hash = '#sleep';
       setTimeout(() => location.reload(), 3500);
     }} catch (e) {{
