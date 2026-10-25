@@ -2852,6 +2852,10 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
           <span id="up_txt">Upload Apple Health export (.xml or .json)</span>
           <input type="file" accept=".xml,text/xml,application/xml,.json,application/json" hidden onchange="uploadJsonFile(this)">
         </label>
+        <label class="up-btn">
+          <span id="puls_up_txt">Import PulsHealth export (.json + manifest)</span>
+          <input type="file" accept=".json,application/json" multiple hidden onchange="uploadPulsExport(this)">
+        </label>
       </header>
 
       {sleep_stats_html}
@@ -3129,6 +3133,46 @@ def build_dashboard(df_raw, df_sleep, log_df, stress_bundle, pred_bundle, sleep_
       }}
     }} catch (e) {{
       lbl.innerText = 'Error uploading Apple Health export';
+    }}
+  }}
+
+  async function uploadPulsExport(input) {{
+    const files = Array.from(input.files || []);
+    if (!files.length) return;
+    const dataFile = files.find(f => !f.name.toLowerCase().endsWith('-manifest.json'));
+    const manifestFile = files.find(f => f.name.toLowerCase().endsWith('-manifest.json'));
+    const lbl = document.getElementById('puls_up_txt');
+    if (files.length !== 2 || !dataFile || !manifestFile) {{
+      lbl.innerText = 'Select the export .json and its matching -manifest.json';
+      input.value = '';
+      return;
+    }}
+    lbl.innerText = 'Checking PulsHealth export...';
+    try {{
+      const manifestText = await manifestFile.text();
+      const manifest = JSON.parse(manifestText);
+      if (manifest.schemaVersion !== 1 || manifest.format !== 'json' || manifest.complete !== true || (manifest.failures || []).length) {{
+        throw new Error('Export is incomplete or not a supported PulsHealth JSON export.');
+      }}
+      if (!Array.isArray(manifest.files) || manifest.files.length !== 1 || manifest.files[0].bytes !== dataFile.size) {{
+        throw new Error('The manifest does not match this data file. Select the matching pair.');
+      }}
+      lbl.innerText = 'Uploading and importing... keep this page open';
+      const manifestHeader = btoa(unescape(encodeURIComponent(manifestText)));
+      const res = await fetch('/api/puls/import' + window.location.search, {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json', 'X-Puls-Manifest': manifestHeader }},
+        body: dataFile
+      }});
+      const result = await res.json().catch(() => ({{}}));
+      if (!res.ok) throw new Error(result.detail || result.error || 'Server rejected the export.');
+      lbl.innerText = `Imported ${{result.batches}} batches; ${{result.accepted}} new Watch samples, ${{result.duplicates}} already present, ${{result.excludedSources}} non-Watch items excluded.`;
+      location.hash = '#sleep';
+      setTimeout(() => location.reload(), 3500);
+    }} catch (e) {{
+      lbl.innerText = 'Puls import failed: ' + (e.message || 'check the selected files and server logs');
+    }} finally {{
+      input.value = '';
     }}
   }}
 
