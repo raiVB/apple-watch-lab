@@ -100,6 +100,7 @@ def to_ist_str(iso_utc):
     except (ValueError, TypeError):
         return None
 STATUS = {"last_upload": None, "ok": None, "detail": None, "seconds": None}
+UPLOAD_JOBS = {}  # bounded in-memory status for asynchronous ECG and PulsHealth uploads
 INDEXES = {"ready": False, "error": None}
 
 
@@ -562,8 +563,13 @@ input.addEventListener('change', async () => {
       headers: {'Content-Type':'application/json','X-Puls-Manifest':manifestHeader},
       body: dataFile
     });
-    let result = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(result.detail || result.error || 'The server rejected the export.');
+    const responseText = await response.text();
+    let result = {};
+    try { result = responseText ? JSON.parse(responseText) : {}; } catch (_) {}
+    if (!response.ok) {
+      const bodyMessage = result.detail || result.error || responseText.replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 240);
+      throw new Error(`HTTP ${response.status}: ${bodyMessage || response.statusText || 'server rejected the export'}`);
+    }
     if (result.status === 'queued' && result.job_id) {
       const jobId = encodeURIComponent(result.job_id);
       while (true) {
