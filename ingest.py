@@ -50,6 +50,12 @@ SUM_METRICS = {"StepCount", "DistanceWalkingRunning", "ActiveEnergyBurned", "Bas
                "AppleExerciseTime", "AppleStandTime", "FlightsClimbed", "TimeInDaylight"}
 PCT_METRICS = {"OxygenSaturation", "WalkingAsymmetryPercentage", "WalkingDoubleSupportPercentage", "AppleWalkingSteadiness"}
 VALUE_KEYS = ("qty", "Avg", "avg", "value", "Value", "Min", "min")
+ENERGY_METRICS = {"ActiveEnergyBurned", "BasalEnergyBurned"}
+# Only these metric groups are real sleep data. (The old test was `"sleep" in name`, which also
+# captured apple_sleeping_wrist_temperature and silently kept it out of `records`.)
+SLEEP_GROUPS = {"sleep_analysis", "sleepanalysis", "sleep"}
+# Nightly values whose HAE `date` is the START of the night; they belong to the wake-up date.
+END_DATED = {"AppleSleepingWristTemperature"}
 VALID_BOUNDS = {
     "HeartRate": (25.0, 240.0),
     "RestingHeartRate": (25.0, 150.0),
@@ -193,6 +199,7 @@ class Ingestor:
         self.raw = {}                # key -> doc                        (collection "sleep_raw")
         self.items = 0
         self.unnamed = 0
+        self.skipped_stages = 0
         self.sleep_intervals = {}
         self.file_min_date = "9999-12-31"
         self.file_max_date = "0000-00-00"
