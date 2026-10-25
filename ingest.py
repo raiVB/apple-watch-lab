@@ -11,6 +11,7 @@ import calendar
 import json
 import os
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
 import ijson
@@ -28,6 +29,7 @@ METRIC_MAP = {
     "basal_energy_burned": "BasalEnergyBurned", "resting_energy": "BasalEnergyBurned",
     "apple_exercise_time": "AppleExerciseTime", "exercise_time": "AppleExerciseTime",
     "apple_stand_time": "AppleStandTime", "stand_time": "AppleStandTime",
+    "apple_stand_hour": "AppleStandHour",
     "flights_climbed": "FlightsClimbed",
     "respiratory_rate": "RespiratoryRate",
     "walking_speed": "WalkingSpeed",
@@ -38,6 +40,9 @@ METRIC_MAP = {
     "walking_heart_rate_average": "WalkingHeartRateAverage",
     "environmental_audio_exposure": "EnvironmentalAudioExposure",
     "headphone_audio_exposure": "HeadphoneAudioExposure",
+    "breathing_disturbances": "BreathingDisturbances",
+    "physical_effort": "PhysicalEffort",
+    "stair_speed_up": "StairSpeedUp", "stair_speed_down": "StairSpeedDown",
     "time_in_daylight": "TimeInDaylight",
     "blood_oxygen_saturation": "OxygenSaturation", "oxygen_saturation": "OxygenSaturation",
     "apple_sleeping_wrist_temperature": "AppleSleepingWristTemperature", "wrist_temperature": "AppleSleepingWristTemperature",
@@ -45,31 +50,55 @@ METRIC_MAP = {
     "heart_rate_recovery": "HeartRateRecoveryOneMinute", "heart_rate_recovery_one_minute": "HeartRateRecoveryOneMinute",
 }
 
+# Native Apple Health export.xml identifiers mapped to Health Auto Export names.
+# XML records are individual samples and carry sourceName, so Watch-only provenance is explicit.
+XML_METRIC_MAP = {
+    "HKQuantityTypeIdentifierHeartRate": "heart_rate",
+    "HKQuantityTypeIdentifierHeartRateVariabilitySDNN": "heart_rate_variability",
+    "HKQuantityTypeIdentifierRestingHeartRate": "resting_heart_rate",
+    "HKQuantityTypeIdentifierStepCount": "step_count",
+    "HKQuantityTypeIdentifierDistanceWalkingRunning": "walking_running_distance",
+    "HKQuantityTypeIdentifierActiveEnergyBurned": "active_energy",
+    "HKQuantityTypeIdentifierBasalEnergyBurned": "basal_energy_burned",
+    "HKQuantityTypeIdentifierAppleExerciseTime": "apple_exercise_time",
+    "HKQuantityTypeIdentifierAppleStandTime": "apple_stand_time",
+    "HKQuantityTypeIdentifierAppleStandHour": "apple_stand_hour",
+    "HKQuantityTypeIdentifierFlightsClimbed": "flights_climbed",
+    "HKQuantityTypeIdentifierRespiratoryRate": "respiratory_rate",
+    "HKQuantityTypeIdentifierWalkingSpeed": "walking_speed",
+    "HKQuantityTypeIdentifierWalkingStepLength": "walking_step_length",
+    "HKQuantityTypeIdentifierWalkingDoubleSupportPercentage": "walking_double_support_percentage",
+    "HKQuantityTypeIdentifierWalkingAsymmetryPercentage": "walking_asymmetry_percentage",
+    "HKQuantityTypeIdentifierAppleWalkingSteadiness": "apple_walking_steadiness",
+    "HKQuantityTypeIdentifierWalkingHeartRateAverage": "walking_heart_rate_average",
+    "HKQuantityTypeIdentifierEnvironmentalAudioExposure": "environmental_audio_exposure",
+    "HKQuantityTypeIdentifierHeadphoneAudioExposure": "headphone_audio_exposure",
+    "HKQuantityTypeIdentifierTimeInDaylight": "time_in_daylight",
+    "HKQuantityTypeIdentifierOxygenSaturation": "blood_oxygen_saturation",
+    "HKQuantityTypeIdentifierAppleSleepingWristTemperature": "apple_sleeping_wrist_temperature",
+    "HKQuantityTypeIdentifierVO2Max": "vo2_max",
+    "HKQuantityTypeIdentifierHeartRateRecoveryOneMinute": "heart_rate_recovery_one_minute",
+}
+
+SLEEP_XML_STAGES = {
+    "HKCategoryValueSleepAnalysisAsleepDeep": "deep",
+    "HKCategoryValueSleepAnalysisAsleepREM": "rem",
+    "HKCategoryValueSleepAnalysisAsleepCore": "core",
+    "HKCategoryValueSleepAnalysisAsleepUnspecified": "asleep",
+    "HKCategoryValueSleepAnalysisAwake": "awake",
+}
+
 # Metrics that add up inside a 5-minute bin. Everything else is averaged.
 SUM_METRICS = {"StepCount", "DistanceWalkingRunning", "ActiveEnergyBurned", "BasalEnergyBurned",
-               "AppleExerciseTime", "AppleStandTime", "FlightsClimbed", "TimeInDaylight"}
+               "AppleExerciseTime", "AppleStandTime", "AppleStandHour", "FlightsClimbed", "TimeInDaylight"}
 PCT_METRICS = {"OxygenSaturation", "WalkingAsymmetryPercentage", "WalkingDoubleSupportPercentage", "AppleWalkingSteadiness"}
-VALUE_KEYS = ("qty", "Avg", "avg", "value", "Value", "Min", "min")
+VALUE_KEYS = ("qty", "Avg", "avg", "value", "Value")  # never substitute a minimum for a reading
 ENERGY_METRICS = {"ActiveEnergyBurned", "BasalEnergyBurned"}
 # Only these metric groups are real sleep data. (The old test was `"sleep" in name`, which also
 # captured apple_sleeping_wrist_temperature and silently kept it out of `records`.)
 SLEEP_GROUPS = {"sleep_analysis", "sleepanalysis", "sleep"}
 # Nightly values whose HAE `date` is the START of the night; they belong to the wake-up date.
 END_DATED = {"AppleSleepingWristTemperature"}
-VALID_BOUNDS = {
-    "HeartRate": (25.0, 240.0),
-    "RestingHeartRate": (25.0, 150.0),
-    "WalkingHeartRateAverage": (35.0, 220.0),
-    "HeartRateVariabilitySDNN": (1.0, 300.0),
-    "RespiratoryRate": (4.0, 60.0),
-    "OxygenSaturation": (50.0, 100.0),
-    "AppleSleepingWristTemperature": (30.0, 43.0),
-    "VO2Max": (10.0, 95.0),
-    "WalkingSpeed": (0.1, 25.0),
-    "WalkingStepLength": (5.0, 200.0),
-    "EnvironmentalAudioExposure": (1.0, 140.0),
-    "HeadphoneAudioExposure": (1.0, 140.0),
-}
 
 STAGE_MAP = {
     "deep": "Deep Sleep (Body Repair)", "rem": "REM Sleep (Brain & Memory)",
@@ -101,11 +130,9 @@ def parse_ts(s):
         # Health Auto Export default: "2026-10-18 23:58:00 +0530". Python < 3.11 cannot parse the
         # space before the offset (or a bare +0530), so normalise it to "+05:30" and retry.
         m = _OFFSET_FIX.search(s_str)
-        if m:
-            # Safely rebuild standard ISO format without hardcoded index slicing
-            core = s_str[:m.start()].strip().replace(" ", "T")
-            tz = f"{m.group(1)}{m.group(2)}:{m.group(3)}"
-            return datetime.fromisoformat(f"{core}{tz}")
+        if m and len(s_str) > 19:
+            s_str = s_str[:m.start()] + f"{m.group(1)}{m.group(2)}:{m.group(3)}"
+            return datetime.fromisoformat(s_str.replace(" ", "T", 1))
         return None
     except (ValueError, TypeError):
         return None
@@ -138,15 +165,23 @@ def to_epoch(dt):
 
     return dt.timestamp()
 
+def is_apple_watch_source(source):
+    """Fail closed: mixed/unknown source attribution cannot establish Watch-only provenance."""
+    if not isinstance(source, str) or not source.strip():
+        return False
+    # HAE may emit a non-breaking space in display names (Apple\u00a0Watch).
+    s = re.sub(r"\s+", " ", source.replace("|", "| ").strip().casefold())
+    return "apple watch" in s and "iphone" not in s and "|" not in s
+
+
 def _compact(item):
     """Tiny stand-in for an item whose group name isn't known yet (keeps RAM low)."""
     if isinstance(item.get("value"), str) or any(k in item for k in ("deep", "rem", "core", "asleep")):
         return item  # sleep-like record: keep whole (there are only a few)
     ds = item.get("date") or item.get("startDate")
-    src = item.get("source") or item.get("sourceName")
     for k in VALUE_KEYS:
         if item.get(k) is not None:
-            return (ds, item[k], src)
+            return (ds, item[k], item.get("source"))
     return None
 
 
@@ -198,30 +233,27 @@ class Ingestor:
         self.legacy_win = []
         self.raw = {}                # key -> doc                        (collection "sleep_raw")
         self.items = 0
+        self.source_included = 0
+        self.source_excluded = {"missing": 0, "mixed_or_iphone": 0, "other": 0}
         self.unnamed = 0
         self.skipped_stages = 0
-        self.sleep_intervals = {}
-        self.file_min_date = "9999-12-31"
-        self.file_max_date = "0000-00-00"
 
     def add(self, name, units, item):
         self.items += 1
         if not name:
             self.unnamed += 1
             return
-        norm = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name.strip())
-        key = norm.lower().replace(" ", "_").replace("-", "_")
-        if "sleep" in key:
-            self._sleep(item)
+        source = str(item.get("source") or "").strip()
+        if not is_apple_watch_source(source):
+            reason = "missing" if not source else ("mixed_or_iphone" if "iphone" in source.casefold() or "|" in source else "other")
+            self.source_excluded[reason] += 1
+            return
+        self.source_included += 1
+        key = name.strip().lower().replace(" ", "_")
+        if key in SLEEP_GROUPS:
+            self._sleep(item, units)
             return
         ds = item.get("date") or item.get("startDate")
-        
-        # Deep Fix 38: Update global min/max dates for the giant eraser
-        if ds:
-            d_str = str(ds)[:10]
-            if "2000" <= d_str <= "2100":
-                if d_str < self.file_min_date: self.file_min_date = d_str
-                if d_str > self.file_max_date: self.file_max_date = d_str
         if not ds or (self.keep_from and str(ds)[:10] < self.keep_from):
             return
         val = None
@@ -232,107 +264,53 @@ class Ingestor:
         if val is None:
             return
         metric = METRIC_MAP.get(key, name.strip())
-        
-        # Unicode safe source filtering: Ignore phone steps/energy
-        raw_src = item.get("source") or item.get("sourceName") or ""
-        src = re.sub(r"\s+", " ", str(raw_src)).strip().lower()
-        if metric in SUM_METRICS and src and "watch" not in src:
-            return
-            
+        if metric in END_DATED and item.get("end"):
+            ds = item["end"]   # attribute the nightly value to the wake-up date, like sleep.date
         try:
             val = float(val)
-            s_dt = parse_ts(item.get("startDate") or item.get("date"))
-            e_dt = parse_ts(item.get("endDate") or item.get("date"))
+            dt = parse_ts(ds)
         except (ValueError, TypeError):
             return
-            
-        if s_dt is None or e_dt is None or val != val:
+        if dt is None or val != val:   # unparseable timestamp or NaN value: skip it, never crash the upload
             return
+        u = (units or "").strip()
+        ul = u.lower()
+        if metric == "WalkingSpeed":
+            if "m/s" in ul and "km" not in ul: val *= 3.6; u = "km/hr"
+            elif ul in ("mph", "mi/hr", "mi/h"): val *= 1.609344; u = "km/hr"
+        elif metric == "WalkingStepLength" and ul == "m": val *= 100.0; u = "cm"
+        elif metric == "DistanceWalkingRunning":
+            if ul == "m": val /= 1000.0; u = "km"
+            elif ul in ("mi", "mile", "miles"): val *= 1.609344; u = "km"
+        elif metric in ENERGY_METRICS and ul in ("kj", "kilojoule", "kilojoules"):
+            val /= 4.184; u = "kcal"       # HAE can export energy in kJ; every engine/label expects kcal
+        elif metric in PCT_METRICS:
+            # HAE already sends unit "%" as 0-100. Only a unit-less fraction (0-1) needs x100.
+            if "%" not in u and val <= 1.0: val *= 100.0; u = "%"
 
-        # Fix kJ to kcal bug
-        u_low = str(units or "").strip().lower()
-        if metric == "WalkingSpeed" and "m/s" in u_low:
-            val *= 3.6
-            units = "km/h"
-        elif metric == "WalkingStepLength" and u_low == "m":
-            val *= 100.0
-            units = "cm"
-        elif metric == "DistanceWalkingRunning" and u_low == "m":
-            val /= 1000.0
-            units = "km"
-        elif metric in ("ActiveEnergyBurned", "BasalEnergyBurned") and u_low == "kj":
-            val /= 4.184
-            units = "kcal"
-        elif metric in PCT_METRICS and val <= 1.0:
-            val *= 100.0
-            units = "%"
+        bk = (metric, int(to_epoch(dt) // 300))
+        b = self.bins.get(bk)
+        if b is None:
+            self.bins[bk] = [val, 1, u, {source}]
+        else:
+            b[0] += val
+            b[1] += 1
+            b[3].add(source)
 
-        # Hardware dropout gate: drop impossible numbers
-        if metric in SUM_METRICS and val < 0.0:
-            return
-        if metric in VALID_BOUNDS:
-            lo, hi = VALID_BOUNDS[metric]
-            if not (lo <= val <= hi):
-                return
-
-        # Fractional Distribution: split big workouts across multiple bins
-        duration_sec = (e_dt - s_dt).total_seconds()
-        if duration_sec > 300 and metric in SUM_METRICS:
-            rate = val / duration_sec
-            curr_t = to_epoch(s_dt)
-            end_t = to_epoch(e_dt)
-            while curr_t < end_t:
-                ep = int(curr_t // 300)
-                next_bound = (ep + 1) * 300
-                chunk_end = min(end_t, next_bound)
-                chunk_dur = chunk_end - curr_t
-                chunk_val = rate * chunk_dur
-                
-                bk = (metric, ep)
-                c_min, c_max = int(curr_t), int(chunk_end)
-                if bk not in self.bins:
-                    self.bins[bk] = [0.0, 0, units, c_min, c_max]
-                self.bins[bk][0] += chunk_val
-                self.bins[bk][1] += 1
-                self.bins[bk][2] = units
-                self.bins[bk][3] = min(self.bins[bk][3], c_min)
-                self.bins[bk][4] = max(self.bins[bk][4], c_max)
-                curr_t = chunk_end
-            return
-
-        # Normal insertion: track the exact start/end seconds
-        t_sec = int(to_epoch(s_dt))
-        ep = int(t_sec // 300)
-        bk = (metric, ep)
-        if bk not in self.bins:
-            self.bins[bk] = [0.0, 0, units, t_sec, t_sec]
-        self.bins[bk][0] += val
-        self.bins[bk][1] += 1
-        self.bins[bk][2] = units
-        self.bins[bk][3] = min(self.bins[bk][3], t_sec)
-        self.bins[bk][4] = max(self.bins[bk][4], t_sec)
     def record_docs(self):
-        for (metric, ep), (total, n, unit) in self.bins.items():
+        for (metric, ep), (total, n, unit, sources) in self.bins.items():
             # Convert absolute UTC epoch to India Standard Time (+05:30) for dashboard strings
             bs_utc = EPOCH0 + timedelta(seconds=ep * 300)
             bs_ist = bs_utc + timedelta(hours=5, minutes=30)
             yield {
                 "metric": metric, "timestamp": bs_ist.strftime("%Y-%m-%d %H:%M:%S"), "date": bs_ist.strftime("%Y-%m-%d"),
                 "hour": round(bs_ist.hour + bs_ist.minute / 60.0, 2), "epoch_5m": ep,
-                "value": round(total if metric in SUM_METRICS else total / n, 4), "unit": unit,
+                "value": float(total if metric in SUM_METRICS else total / n), "unit": unit,
+                "sources": sorted(sources), "source_policy": "apple_watch_only",
             }
           
-    def _sleep(self, item):
-        raw_val_check = str(item.get("value") or item.get("stage") or "").strip().lower()
-        if any(ib in raw_val_check for ib in ("inbed", "in_bed", "in bed")):
-            return
-        
-        # Unicode safe watch check
-        raw_src = item.get("source") or item.get("sourceName") or ""
-        src = re.sub(r"\s+", " ", str(raw_src)).strip().lower()
-        if src and "watch" not in src:
-            return
-
+    def _sleep(self, item, units=""):
+        # Normalise to IST wall-clock so sleep timing lines up with the IST-based 5-minute records.
         s19 = ist_str(item.get("start") or item.get("startDate")) if (item.get("start") or item.get("startDate")) else ""
         e19 = ist_str(item.get("end") or item.get("endDate")) if (item.get("end") or item.get("endDate")) else ""
         if s19 and e19:
@@ -340,28 +318,16 @@ class Ingestor:
             for ks, ke in (("start", "end"), ("startDate", "endDate")):
                 if item.get(ks): item[ks] = s19
                 if item.get(ke): item[ke] = e19
-        
-        # Deep Fix 13: Prioritize wake date (e19) for database grouping
-        # Deep Fix 37: Anchor all stages in a night to the biological wake date to prevent split-deletions
-        end_dt_val = to_ist(parse_ts(e19 or s19 or item.get("date")))
-        if end_dt_val:
-            # If the stage ends before 14:00 (2 PM), it belongs to the morning's wake date.
-            # If it ends after 14:00, it's a daytime nap and belongs to the current date.
-            if end_dt_val.hour < 14:
-                d = end_dt_val.strftime("%Y-%m-%d")
-            else:
-                d = end_dt_val.strftime("%Y-%m-%d")
-        else:
-            d = (e19 or s19 or "")[:10]
+        d = (s19 or str(item.get("date") or item.get("sleepEnd") or ""))[:10]
         if self.keep_from and d and d < self.keep_from:
             return
-
         if s19 and e19:
             k = f"{s19}|{e19}|{item.get('value') or item.get('stage') or ''}"
         else:
             k = "agg|" + (d or json.dumps(item, sort_keys=True))
-        self.raw[k] = {**item, "k": k, "d": d, "s19": s19, "e19": e19}
+        self.raw[k] = {**item, "k": k, "d": d, "s19": s19, "e19": e19, "source_policy": "apple_watch_only"}
 
+        # Old per-stage format used by the Stress and Energy engines
         if any(x in item for x in ("deep", "rem", "core", "asleep")):
             d_str = str(item.get("date") or item.get("sleepEnd") or "")[:10]
             try:
@@ -372,30 +338,27 @@ class Ingestor:
                 if s_hr < 14.0: s_hr += 24.0
                 e_hr = e_dt.hour + e_dt.minute / 60.0
                 s_ep, e_ep = int(to_epoch(s_raw) // 300), int(to_epoch(e_raw) // 300)
-                
-                # Deep Fix 33: Clamp overlaps
-                seen = self.sleep_intervals.setdefault(d, [])
-                for prev_s, prev_e in seen:
-                    if s_ep >= prev_s and e_ep <= prev_e:
-                        return
-                    if s_ep < prev_e and e_ep > prev_s:
-                        if s_ep < prev_s: e_ep = prev_s
-                        else: s_ep = prev_e
-                if e_ep <= s_ep: return
-                seen.append((s_ep, e_ep))
-
                 for stg_key, stg_label in NIGHT_STAGES:
                     hrs = float(item.get(stg_key) or 0.0)
-                    if hrs > 16.0: hrs /= 60.0
+                    ul = (units or "").strip().lower()
+                    # trust the declared unit; only guess by magnitude when no unit is given
+                    if ul.startswith("min") or (not ul and hrs > 16.0): hrs /= 60.0
                     if hrs > 0:
                         self.legacy[(stg_label, s_ep, e_ep)] = {
                             "date": d_str, "stage": stg_label, "hours": hrs, "onset_hr": s_hr,
+                            "source": item.get("source"), "source_policy": "apple_watch_only",
                             "wake_hr": e_hr, "start_epoch": s_ep, "end_epoch": e_ep}
             except (ValueError, TypeError, AttributeError):
                 pass
         else:
             raw_stage = str(item.get("value") or item.get("stage") or "core").lower()
-            label = next((v for k2, v in STAGE_MAP.items() if k2 in raw_stage), "Core Sleep (Light)")
+            norm_stage = raw_stage.replace(" ", "").replace("_", "").replace("-", "")
+            if norm_stage == "inbed":
+                return   # time-in-bed marker, not a sleep stage (it is still kept in sleep_raw above)
+            label = next((v for k2, v in STAGE_MAP.items() if k2 in norm_stage), None)
+            if label is None:
+                self.skipped_stages += 1   # unknown stage name: skip and count, never default to Core
+                return
             try:
                 s_raw = parse_ts(item.get("startDate") or item.get("date") or "")
                 e_raw = parse_ts(item.get("endDate") or item.get("startDate") or item.get("date") or "")
@@ -407,27 +370,56 @@ class Ingestor:
                     if s_hr < 14.0: s_hr += 24.0
                     e_hr = e_dt.hour + e_dt.minute / 60.0
                     s_ep, e_ep = int(to_epoch(s_raw) // 300), int(to_epoch(e_raw) // 300)
-                    
-                    # Deep Fix 33: Clamp overlaps
-                    seen = self.sleep_intervals.setdefault(d, [])
-                    for prev_s, prev_e in seen:
-                        if s_ep >= prev_s and e_ep <= prev_e:
-                            return
-                        if s_ep < prev_e and e_ep > prev_s:
-                            if s_ep < prev_s: e_ep = prev_s
-                            else: s_ep = prev_e
-                    if e_ep <= s_ep: return
-                    seen.append((s_ep, e_ep))
-
                     self.legacy[(label, s_ep, e_ep)] = {
                         "date": e_dt.strftime("%Y-%m-%d"), "stage": label, "hours": dur, "onset_hr": s_hr,
+                        "source": item.get("source"), "source_policy": "apple_watch_only",
                         "wake_hr": e_hr, "start_epoch": s_ep, "end_epoch": e_ep}
                     self.legacy_win.append((s_ep, e_ep))
             except (ValueError, TypeError, AttributeError):
                 pass
 
 
+def detect_file_format(path):
+    """Return xml for native Apple Health exports, otherwise json (HAE format)."""
+    with open(path, "rb") as f:
+        prefix = f.read(512).lstrip(b"\xef\xbb\xbf \t\r\n")
+    return "xml" if prefix.startswith(b"<") else "json"
+
+
+def ingest_xml_file(path, ing):
+    """Stream native Apple Health export.xml and retain only individually Watch-sourced records."""
+    for _, elem in ET.iterparse(path, events=("end",)):
+        if elem.tag == "Record":
+            attrs = elem.attrib
+            rec_type = attrs.get("type", "")
+            source = attrs.get("sourceName", "")
+            if rec_type in XML_METRIC_MAP:
+                name = XML_METRIC_MAP[rec_type]
+                item = {
+                    "date": attrs.get("startDate", ""),
+                    "end": attrs.get("endDate", ""),
+                    "qty": attrs.get("value"),
+                    "source": source,
+                }
+                ing.add(name, attrs.get("unit", ""), item)
+            elif rec_type == "HKCategoryTypeIdentifierSleepAnalysis":
+                stage = SLEEP_XML_STAGES.get(attrs.get("value", ""))
+                if stage:
+                    ing.add("sleep_analysis", "hr", {
+                        "value": stage,
+                        "startDate": attrs.get("startDate", ""),
+                        "endDate": attrs.get("endDate", ""),
+                        "source": source,
+                    })
+            elem.clear()
+        elif elem.tag == "Workout":
+            elem.clear()
+    return ing
+
+
 def ingest_file(path, ing):
+    if detect_file_format(path) == "xml":
+        return ingest_xml_file(path, ing)
     with open(path, "rb") as f:
         for name, units, item in iter_items(f):
             ing.add(name, units, item)
@@ -452,118 +444,83 @@ def _bulk(coll, ops):
         coll.bulk_write(ops, ordered=False)
 
 
+def _naive_ts(s):
+    """'YYYY-MM-DD HH:MM:SS' -> seconds. No timezone maths: only used to order spans and measure gaps."""
+    return calendar.timegm(datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").timetuple())
+
+
+def _fmt_naive(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _merge_spans(spans, gap):
+    """Merge (start, end) spans that are closer together than `gap`; returns [[lo, hi], ...]."""
+    out = []
+    for s, e in sorted(spans):
+        if out and s - out[-1][1] <= gap:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
 def write(db, ing, chunk=2000):
-    """Upsert everything the Ingestor collected. Safe to repeat: same data = same rows."""
-    from pymongo import UpdateOne
+    """Write Watch-only rows, refusing to silently replace conflicting overlapping bins."""
+    docs = list(ing.record_docs())
+
+    # A later partial export can otherwise replace a complete 5-minute aggregate with only
+    # the subset present in that upload. Identical re-uploads remain idempotent; conflicts
+    # require a complete re-import (normally backfill.py --wipe) so we never guess at a merge.
+    dates = sorted({doc["date"] for doc in docs})
+    existing = {}
+    if dates:
+        for row in db.records.find(
+            {"source_policy": "apple_watch_only", "date": {"$in": dates}},
+            {"_id": 0, "metric": 1, "epoch_5m": 1, "value": 1, "sources": 1},
+        ):
+            existing[(row.get("metric"), row.get("epoch_5m"))] = row
+    conflicts = []
+    for doc in docs:
+        old = existing.get((doc["metric"], doc["epoch_5m"]))
+        if old is not None and (
+            old.get("value") != doc["value"]
+            or sorted(old.get("sources") or []) != doc["sources"]
+        ):
+            conflicts.append((doc["metric"], doc["timestamp"]))
+    if conflicts:
+        preview = ", ".join(f"{metric}@{stamp}" for metric, stamp in conflicts[:5])
+        raise RuntimeError(
+            f"Upload conflicts with {len(conflicts)} existing Watch-only 5-minute bins "
+            f"({preview}). No sensor rows were written. Rebuild using complete exports "
+            "and backfill.py --wipe, or resolve the conflicting date range first."
+        )
 
     ops, n_rec = [], 0
-    for (m, ep), (tot, cnt, u, min_s, max_s) in ing.bins.items():
-        is_sum = m in SUM_METRICS
-        val = round(tot if is_sum else (tot / cnt), 4)
-        dt_ist = datetime.fromtimestamp(ep * 300, tz=IST)
-        d_str = dt_ist.strftime("%Y-%m-%d")
-        ts_str = dt_ist.strftime("%Y-%m-%d %H:%M:%S")
-        hr_val = round(dt_ist.hour + dt_ist.minute / 60.0, 2)
+    for doc in docs:
+        ops.append(UpdateOne({"metric": doc["metric"], "epoch_5m": doc["epoch_5m"]}, {"$set": doc}, upsert=True))
+        if len(ops) >= chunk:
+            _bulk(db.records, ops); n_rec += len(ops); ops = []
+    _bulk(db.records, ops); n_rec += len(ops)
 
-        is_disjoint = {
-            "$or": [
-                {"$gt": [min_s, {"$ifNull": ["$max_sec", -1]}]},
-                {"$lt": [max_s, {"$ifNull": ["$min_sec", 99999999999]}]},
-            ]
-        }
-        is_empty = {"$eq": [{"$ifNull": ["$count", 0]}, 0]}
-        is_superset = {"$gte": [cnt, {"$ifNull": ["$count", 0]}]}
+    # Replace-in-place, never date-wide: remove only stored sleep rows that OVERLAP a time span this
+    # payload actually contains, so a partial/windowed upload cannot erase the rest of a night.
+    leg_spans = _merge_spans([(d["start_epoch"], d["end_epoch"]) for d in ing.legacy.values()], 36)  # 36 bins = 3 h
+    for lo, hi in leg_spans:
+        db.sleep.delete_many({"start_epoch": {"$lt": hi}, "end_epoch": {"$gt": lo}})
+    raw_iv = []
+    for d in ing.raw.values():
+        if d.get("s19") and d.get("e19"):
+            try: raw_iv.append((_naive_ts(d["s19"]), _naive_ts(d["e19"])))
+            except ValueError: pass
+    for lo, hi in _merge_spans(raw_iv, 3 * 3600):
+        db.sleep_raw.delete_many({"s19": {"$lt": _fmt_naive(hi)}, "e19": {"$gt": _fmt_naive(lo)}})
 
-        if is_sum:
-            merged_val = {"$round": [{"$add": [{"$ifNull": ["$value", 0.0]}, val]}, 4]}
-        else:
-            merged_val = {
-                "$round": [
-                    {
-                        "$divide": [
-                            {"$add": [{"$multiply": [{"$ifNull": ["$value", 0.0]}, {"$ifNull": ["$count", 0]}]}, tot]},
-                            {"$add": [{"$ifNull": ["$count", 0]}, cnt]},
-                        ]
-                    },
-                    4,
-                ]
-            }
-
-        pipeline_update = [
-            {
-                "$set": {
-                    "metric": m,
-                    "epoch_5m": ep,
-                    "date": d_str,
-                    "timestamp": ts_str,
-                    "hour": hr_val,
-                    "unit": u,
-                    "units": u,
-                    "value": {"$cond": [is_empty, val, {"$cond": [is_disjoint, merged_val, {"$cond": [is_superset, val, "$value"]}]}]},
-                    "count": {"$cond": [is_empty, cnt, {"$cond": [is_disjoint, {"$add": ["$count", cnt]}, {"$cond": [is_superset, cnt, "$count"]}]}]},
-                    "min_sec": {"$cond": [is_empty, min_s, {"$min": [{"$ifNull": ["$min_sec", min_s]}, min_s]}]},
-                    "max_sec": {"$cond": [is_empty, max_s, {"$max": [{"$ifNull": ["$max_sec", max_s]}, max_s]}]},
-                }
-            }
-        ]
-        ops.append(UpdateOne({"metric": m, "epoch_5m": ep}, pipeline_update, upsert=True))
-
-        # Disjoint check: new chunk is strictly after or strictly before existing chunk
-        is_disjoint = {
-            "$or": [
-                {"$gt": [min_s, {"$ifNull": ["$max_sec", -1]}]},
-                {"$lt": [max_s, {"$ifNull": ["$min_sec", 99999999999]}]},
-            ]
-        }
-        is_empty = {"$eq": [{"$ifNull": ["$count", 0]}, 0]}
-        is_superset = {"$gte": [cnt, {"$ifNull": ["$count", 0]}]}
-
-        if is_sum:
-            merged_val = {"$round": [{"$add": [{"$ifNull": ["$value", 0.0]}, val]}, 4]}
-        else:
-            merged_val = {
-                "$round": [
-                    {
-                        "$divide": [
-                            {"$add": [{"$multiply": [{"$ifNull": ["$value", 0.0]}, {"$ifNull": ["$count", 0]}]}, tot]},
-                            {"$add": [{"$ifNull": ["$count", 0]}, cnt]},
-                        ]
-                    },
-                    4,
-                ]
-            }
-
-        pipeline_update = [
-            {
-                "$set": {
-                    "metric": m,
-                    "epoch_5m": ep,
-                    "date": d_str,
-                    "timestamp": ts_str,
-                    "units": u,
-                    "value": {"$cond": [is_empty, val, {"$cond": [is_disjoint, merged_val, {"$cond": [is_superset, val, "$value"]}]}]},
-                    "count": {"$cond": [is_empty, cnt, {"$cond": [is_disjoint, {"$add": ["$count", cnt]}, {"$cond": [is_superset, cnt, "$count"]}]}]},
-                    "min_sec": {"$cond": [is_empty, min_s, {"$min": [{"$ifNull": ["$min_sec", min_s]}, min_s]}]},
-                    "max_sec": {"$cond": [is_empty, max_s, {"$max": [{"$ifNull": ["$max_sec", max_s]}, max_s]}]},
-                }
-            }
-        ]
-        ops.append(UpdateOne({"metric": m, "epoch_5m": ep}, pipeline_update, upsert=True))
-
-    # Send updates to MongoDB in fast, unordered batches
-    for i in range(0, len(ops), chunk):
-        _bulk(db.records, ops[i : i + chunk])
-        n_rec += len(ops[i : i + chunk])
-
-    # Deep Fix 38: The Giant Eraser. Sweep the entire upload horizon to purge Ghost Sleep stages
-    if ing.file_min_date <= ing.file_max_date:
-        db.sleep_raw.delete_many({"d": {"$gte": ing.file_min_date, "$lte": ing.file_max_date}})
-        db.sleep.delete_many({"date": {"$gte": ing.file_min_date, "$lte": ing.file_max_date}})
-        
     raw_ops = [UpdateOne({"k": d["k"]}, {"$set": d}, upsert=True) for d in ing.raw.values()]
     leg_ops = [UpdateOne({"stage": d["stage"], "start_epoch": d["start_epoch"], "end_epoch": d["end_epoch"]}, {"$set": d}, upsert=True)
                for d in ing.legacy.values()]
     for i in range(0, len(raw_ops), chunk): _bulk(db.sleep_raw, raw_ops[i:i + chunk])
     for i in range(0, len(leg_ops), chunk): _bulk(db.sleep, leg_ops[i:i + chunk])
     
-    return {"items_read": ing.items, "bins_written": n_rec, "sleep_segments": len(ing.raw), "unnamed_skipped": ing.unnamed}
+    return {"items_read": ing.items, "bins_written": n_rec, "sleep_segments": len(ing.raw), "unnamed_skipped": ing.unnamed,
+            "source_included": ing.source_included, "source_excluded": dict(ing.source_excluded),
+            "unknown_sleep_stages_skipped": ing.skipped_stages, "source_policy": "apple_watch_only"}
