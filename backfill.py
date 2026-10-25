@@ -7,7 +7,7 @@ limit is never involved.
     export MONGO_URI="mongodb+srv://..."          (Windows PowerShell: $env:MONGO_URI="mongodb+srv://...")
     python backfill.py path/to/export.json --days 120 --wipe
 
-  paths   one or more .json files, or a folder that contains them (unzip first if you got a .zip)
+  paths   one or more .json or .xml files, or a folder that contains them (unzip Apple export first)
   --days  only keep the last N days (default 120; this keeps MongoDB's free 512 MB safe)
   --wipe  empty the old collections first. Needed once, because the old rows were raw samples
           and the new ones are 5-minute bins.
@@ -39,7 +39,7 @@ def main():
 
     files = []
     for p in a.paths:
-        files += sorted(glob.glob(os.path.join(p, "*.json"))) if os.path.isdir(p) else [p]
+        files += (sorted(glob.glob(os.path.join(p, "*.json"))) + sorted(glob.glob(os.path.join(p, "*.xml")))) if os.path.isdir(p) else [p]
     if not files:
         sys.exit("No .json files found.")
 
